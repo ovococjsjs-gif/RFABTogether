@@ -2,8 +2,13 @@
 
 #include <Services/SessionResyncService.h>
 
+#include <Actor.h>
+#include <Components.h>
 #include <Events/UpdateEvent.h>
+#include <Forms/ActorValueInfo.h>
 #include <Forms/TESObjectCELL.h>
+#include <Games/ActorExtension.h>
+#include <Messages/ClientEntityDigest.h>
 #include <Messages/NotifyResyncComplete.h>
 #include <Messages/RequestResync.h>
 #include <PlayerCharacter.h>
@@ -16,7 +21,36 @@
 namespace
 {
 constexpr double kPollIntervalSec = 0.25;
+// The server confirms a difference when two reports at least four seconds apart show it.
+constexpr double kDigestIntervalSec = 5.0;
+
+// What this screen shows of a character that has a live actor here.
+void DescribeLiveActor(Actor& aActor, Session::EntityDigest::Facts& aFacts) noexcept
+{
+    using namespace Session::EntityDigest;
+
+    aFacts.Flags |= kFlagLive;
+    if (aActor.IsDead())
+        aFacts.Flags |= kFlagDead;
+    aFacts.HealthPct = HealthPercent(aActor.GetActorValue(ActorValueInfo::kHealth), aActor.GetActorPermanentValue(ActorValueInfo::kHealth));
+
+    // Equipment is compared for other players only: an NPC's outfit is put on by the engine here.
+    const ActorExtension* pExtension = aActor.GetExtension();
+    if (pExtension && pExtension->IsRemotePlayer())
+    {
+        aFacts.Flags |= kFlagPlayer;
+        EquipmentHasher hasher;
+        const Inventory worn = aActor.GetEquipment();
+        for (const auto& entry : worn.Entries)
+        {
+            if (entry.IsWorn())
+                hasher.Add(entry.BaseId.ModId, entry.BaseId.BaseId);
+        }
+        aFacts.EquipmentHash = hasher.Finish();
+        aFacts.Flags |= kFlagHasEquipment;
+    }
 }
+} // namespace
 
 SessionResyncService::SessionResyncService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept
     : m_world(aWorld)
@@ -99,6 +133,11 @@ bool SessionResyncService::CanSendNow() const noexcept
     if (!m_transport.IsOnline() || !World::IsFeatureEnabled(Session::Feature::kSelfHealingResync))
         return false;
 
+    return IsWorldSettled();
+}
+
+bool SessionResyncService::IsWorldSettled() const noexcept
+{
     const auto& characters = m_world.GetCharacterService();
     if (characters.IsEngineWorldLoading() || characters.IsSavePurgeActive())
         return false;
@@ -109,8 +148,65 @@ bool SessionResyncService::CanSendNow() const noexcept
     return pPlayer && !pPlayer->IsStillLoading() && pPlayer->parentCell && pPlayer->parentCell->IsAttachedAndLoaded();
 }
 
+void SessionResyncService::SendEntityDigest() noexcept
+{
+    using namespace Session::EntityDigest;
+
+    // While the world loads, what is listed here and what the server expects are both in motion.
+    if (!m_transport.IsOnline() || !World::IsFeatureEnabled(Session::Feature::kDesyncDetector) || !IsWorldSettled())
+        return;
+
+    ClientEntityDigest message{};
+    message.Sequence = ++m_digestSequence;
+
+    const auto remoteView = m_world.view<RemoteComponent>();
+    for (const entt::entity entity : remoteView)
+    {
+        if (message.Entries.size() >= kMaxEntries)
+        {
+            message.Truncated = true;
+            break;
+        }
+
+        Facts facts{};
+        facts.ServerId = remoteView.get<RemoteComponent>(entity).Id;
+        if (const auto* pFormId = m_world.try_get<FormIdComponent>(entity))
+        {
+            if (Actor* pActor = Cast<Actor>(TESForm::GetById(pFormId->Id)))
+                DescribeLiveActor(*pActor, facts);
+        }
+        message.Entries.push_back(facts);
+    }
+
+    // The characters this client simulates: it is the source of their state, so only the fact that
+    // it simulates them is reported.
+    const auto localView = m_world.view<LocalComponent>();
+    for (const entt::entity entity : localView)
+    {
+        if (message.Entries.size() >= kMaxEntries)
+        {
+            message.Truncated = true;
+            break;
+        }
+
+        Facts facts{};
+        facts.ServerId = localView.get<LocalComponent>(entity).Id;
+        facts.Flags |= kFlagOwnedByReporter;
+        message.Entries.push_back(facts);
+    }
+
+    m_transport.Send(message);
+}
+
 void SessionResyncService::OnUpdate(const UpdateEvent& acEvent) noexcept
 {
+    m_digestAccumulatorSec += acEvent.Delta;
+    if (m_digestAccumulatorSec >= kDigestIntervalSec)
+    {
+        m_digestAccumulatorSec = 0.0;
+        SendEntityDigest();
+    }
+
     m_pollAccumulatorSec += acEvent.Delta;
     if (m_pollAccumulatorSec < kPollIntervalSec)
         return;

@@ -52,6 +52,7 @@
 #include <Messages/AssignObjectsResponse.h>
 #include <Messages/AssignObjectsRequest.h>
 #include <Messages/CharacterSpawnRequest.h>
+#include <Messages/ClientEntityDigest.h>
 #include <Messages/ClientMessageFactory.h>
 #include <Messages/ClientReferencesMoveRequest.h>
 #include <Messages/CoordinatedSaveAck.h>
@@ -87,6 +88,7 @@
 #include <Services/CharacterService.h>
 #include <Services/PartyService.h>
 #include <Services/SaveSnapshotService.h>
+#include <Services/SessionResyncService.h>
 #include <Services/WorldItemService.h>
 
 #include "TransportSpy.h"
@@ -111,6 +113,8 @@ extern Console::Setting<bool> bEnableServerOwnedWorldItems;
 extern Console::Setting<bool> bEnableLateJoinCatchUpXp;
 extern Console::Setting<bool> bEnableSharedDragonSouls;
 extern Console::Setting<bool> bEnableMountRideGuard;
+extern Console::Setting<bool> bEnableDesyncDetector;
+extern Console::Setting<bool> bEnableDesyncAutoRepair;
 
 namespace
 {
@@ -2490,6 +2494,185 @@ int main(int argc, char** argv)
               "a later registration cannot put taken items back into the chest");
 
         std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+    }
+
+    // Scene 13: the desync detector (work plan 3.3). A client reports what it believes about every
+    // character; the server compares the report with its own state for that observer. Every report
+    // below is the packet a client sends, through the wire encoding.
+    {
+        std::printf("[scene 13] desync detector: reports, confirmation, bounded resend\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+        auto& resync = world.ctx().at<SessionResyncService>();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xD001u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xD002u;
+        const GameId kCell{0u, 0x000D1001u};
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kGuardBase{0u, 0x000D4001u};
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 10.0f;
+        t0.Day = 3;
+        t0.Month = 3;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+        pHost->SetCellComponent(CellIdComponent{kCell});
+        pGuest->SetCellComponent(CellIdComponent{kCell});
+
+        uint32_t nextCookie = 900u;
+        const auto assign = [&](Player* apOwner, TiltedPhoques::ConnectionId_t aConn, const GameId& acRefId) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            request.ReferenceId = acRefId;
+            if (acRefId != kPlayerRef)
+                request.FormId = kGuardBase;
+            request.CellId = kCell;
+            request.Position = glm::vec3{100.0f, 100.0f, 0.0f};
+            request.CurrentActorData.BaseId = request.FormId;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[24] = 300.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 300.0f;
+            (void)DeliverWire(world, request, apOwner);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+
+        const uint32_t hostChar = assign(pHost, kHostConn, kPlayerRef);
+        const uint32_t guestChar = assign(pGuest, kGuestConn, kPlayerRef);
+        Harness::ClearOutbox();
+        const uint32_t guard = assign(pHost, kHostConn, GameId{0u, 0x000D2001u});
+        Check(hostChar != 0xFFFFFFFFu && guestChar != 0xFFFFFFFFu && guard != 0xFFFFFFFFu,
+              "two player characters and a guard simulated by the host are registered");
+        Check(world.GetCharacterService().GetInterestRegistry().IsMarkedInRange(pGuest->GetId(), guard),
+              "the server considers the guard delivered to the guest");
+
+        using Session::EntityDigest::Facts;
+        const auto row = [](uint32_t aServerId, uint8_t aFlags, uint8_t aHealth = Session::EntityDigest::kNoHealth) {
+            Facts facts{};
+            facts.ServerId = aServerId;
+            facts.Flags = aFlags;
+            facts.HealthPct = aHealth;
+            return facts;
+        };
+        using Session::EntityDigest::kFlagDead;
+        using Session::EntityDigest::kFlagLive;
+        using Session::EntityDigest::kFlagOwnedByReporter;
+
+        uint32_t sequence = 0;
+        // One report from the guest, five seconds after the previous one.
+        const auto report = [&](std::initializer_list<Facts> aRows) {
+            resync.SkewClockForTesting(5000);
+            Harness::ClearOutbox();
+            ClientEntityDigest digest{};
+            digest.Sequence = ++sequence;
+            for (const Facts& facts : aRows)
+                digest.Entries.push_back(facts);
+            return DeliverWire(world, digest, pGuest);
+        };
+        const auto resentToGuest = [&](uint32_t aServerId) {
+            for (const auto& spawn : DecodeOutboxMessagesFor<CharacterSpawnRequest>(kGuestConn))
+                if (spawn.ServerId == aServerId)
+                    return true;
+            return false;
+        };
+        const auto removedForGuest = [&](uint32_t aServerId) {
+            for (const auto& removal : DecodeOutboxMessagesFor<NotifyRemoveCharacter>(kGuestConn))
+                if (removal.ServerId == aServerId)
+                    return true;
+            return false;
+        };
+        const auto totals = [&]() { return resync.GetDesyncTotals(); };
+
+        const Facts mine = row(guestChar, kFlagOwnedByReporter);
+        const Facts hostSeen = row(hostChar, kFlagLive, 100);
+        const Facts guardAlive = row(guard, kFlagLive, 100);
+        const Facts guardDead = row(guard, kFlagLive | kFlagDead, 0);
+
+        // --- In sync: nothing is said, however often it is reported.
+        Check(report({mine, hostSeen, guardAlive}) && report({mine, hostSeen, guardAlive}) && report({mine, hostSeen, guardAlive}),
+              "the guest's reports are accepted");
+        Check(totals().Reports == 3 && totals().Confirmed == 0 && totals().Repaired == 0,
+              "a client that agrees with the server produces no finding");
+
+        // --- The guest never got the guard. Seen once it is a suspicion; seen again it is a finding.
+        (void)report({mine, hostSeen});
+        Check(totals().Confirmed == 0, "a difference reported once is not a finding yet (the spawn may be in flight)");
+        (void)report({mine, hostSeen});
+        Check(totals().Confirmed == 1, "the same difference in the next report is confirmed and logged");
+        Check(!resentToGuest(guard) && totals().Repaired == 0,
+              "with Gameplay:bEnableDesyncAutoRepair off (the default) the detector only writes to the log");
+
+        bEnableDesyncAutoRepair = true;
+        (void)report({mine, hostSeen});
+        Check(resentToGuest(guard) && totals().Repaired == 1, "switched on, the missing guard is resent to that client");
+        (void)report({mine, hostSeen, guardAlive});
+        Check(totals().Healed == 1 && !resentToGuest(guard), "the next report has the guard: the repair is recorded, nothing more is sent");
+
+        // --- The host kills the guard; the guest's screen still shows it alive.
+        RequestDeathStateChange death{};
+        death.Id = guard;
+        death.IsDead = true;
+        Check(DeliverWire(world, death, pHost) && world.get<CharacterComponent>(static_cast<entt::entity>(guard)).IsDead(),
+              "the host reports the guard's death");
+        const uint64_t confirmedBeforeDeath = totals().Confirmed;
+        (void)report({mine, hostSeen, guardAlive});
+        Check(!resentToGuest(guard), "one report with the guard alive may be the death still in flight");
+        (void)report({mine, hostSeen, guardAlive});
+        bool resentAsDead = false;
+        for (const auto& spawn : DecodeOutboxMessagesFor<CharacterSpawnRequest>(kGuestConn))
+            resentAsDead = resentAsDead || (spawn.ServerId == guard && spawn.IsDead);
+        Check(totals().Confirmed == confirmedBeforeDeath + 1 && resentAsDead,
+              "the second one is a life-state desync: logged, and the guard is resent as dead");
+        (void)report({mine, hostSeen, guardDead});
+        Check(totals().Healed == 2, "the guest agrees after the resend");
+
+        // --- A resend that changes nothing is not repeated forever.
+        const uint64_t repairedBefore = totals().Repaired;
+        for (int i = 0; i < 12; ++i)
+            (void)report({mine, hostSeen, guardAlive});
+        Check(totals().Repaired == repairedBefore + 1,
+              "a client that keeps showing the guard alive gets one more resend in the window, not one per report");
+
+        // --- A character the guest still shows and the server does not have at all.
+        const uint32_t kGhost = 0x000ABCDEu;
+        (void)report({mine, hostSeen, guardDead, row(kGhost, kFlagLive, 100)});
+        Check(!removedForGuest(kGhost), "an unknown character reported once may be a removal in flight");
+        (void)report({mine, hostSeen, guardDead, row(kGhost, kFlagLive, 100)});
+        Check(removedForGuest(kGhost), "reported again, the guest is told to remove it");
+
+        // --- Who simulates it: said, never "repaired" with a second copy.
+        const uint64_t confirmedBeforeOwner = totals().Confirmed;
+        (void)report({mine, hostSeen, row(guard, kFlagOwnedByReporter)});
+        (void)report({mine, hostSeen, row(guard, kFlagOwnedByReporter)});
+        Check(totals().Confirmed == confirmedBeforeOwner + 1 && !resentToGuest(guard),
+              "a guest that believes it simulates the host's guard is logged and not sent a copy of it");
+
+        // --- Whatever a client reports, the server's work for it is bounded.
+        ClientEntityDigest flood{};
+        for (uint32_t id = 0; id < 400; ++id)
+            flood.Entries.push_back(row(0x00F00000u + id, kFlagLive, 100));
+        resync.SkewClockForTesting(5000);
+        (void)DeliverWire(world, flood, pGuest);
+        resync.SkewClockForTesting(5000);
+        Harness::ClearOutbox();
+        (void)DeliverWire(world, flood, pGuest);
+        const size_t removalsForFlood = DecodeOutboxMessagesFor<NotifyRemoveCharacter>(kGuestConn).size();
+        Check(removalsForFlood > 0 && removalsForFlood <= 24,
+              "a report full of unknown characters costs the server at most its per-player resend budget");
+
+        // --- The detector's own switch.
+        bEnableDesyncDetector = false;
+        const uint64_t reportsBefore = totals().Reports;
+        (void)report({mine, hostSeen});
+        Check(totals().Reports == reportsBefore, "with Gameplay:bEnableDesyncDetector off reports are ignored");
+        bEnableDesyncDetector = true;
+        bEnableDesyncAutoRepair = false;
     }
 
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures,

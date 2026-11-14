@@ -67,6 +67,16 @@ Console::Setting bEnableServerOwnedWorldItems{"Gameplay:bEnableServerOwnedWorldI
 // under 800 HP, not a dragon) keep their normal health.
 Console::Setting bEnablePeacefulNpcsUnscaled{"Gameplay:bEnablePeacefulNpcsUnscaled",
                                              "Enemy health scaling skips peaceful NPCs and animals", false};
+// The desync detector (common/Session/EntityDigest.h). On: clients report what they believe about
+// each character, the server compares it with its own state and writes every confirmed difference
+// to the log as "[RFAB Desync] ...". That alone changes nothing in the game.
+Console::Setting bEnableDesyncDetector{"Gameplay:bEnableDesyncDetector",
+                                       "Clients report what they see of each character; the server logs every confirmed difference", true};
+// Off by default, which leaves the game exactly as 4.1.0 plays it. Switched on, a confirmed
+// difference in presence or life state is also repaired by resending the character to that client
+// (at most twice per character in two minutes). Owner, health and equipment are only logged.
+Console::Setting bEnableDesyncAutoRepair{"Gameplay:bEnableDesyncAutoRepair",
+                                         "The desync detector also resends a character whose state differs on a client", false};
 extern Console::Setting<bool> bEnableItemDrops;
 extern Console::Setting<bool> bEnableXpSync;
 extern Console::Setting<bool> bEnableRfabXpSync;
@@ -226,6 +236,7 @@ uint32_t GetDisabledCoopFeatureMask() noexcept
     // Without Gameplay:bEnableItemDrops no dropped item is synced at all, server-owned or not.
     mask = Session::WithFeature(mask, Feature::kServerOwnedWorldItems, bEnableServerOwnedWorldItems && bEnableItemDrops);
     mask = Session::WithFeature(mask, Feature::kPeacefulNpcsUnscaled, bEnablePeacefulNpcsUnscaled);
+    mask = Session::WithFeature(mask, Feature::kDesyncDetector, bEnableDesyncDetector);
     return mask;
 }
 

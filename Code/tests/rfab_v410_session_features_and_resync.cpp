@@ -271,7 +271,9 @@ TEST_CASE("v4.1.0 resync messages round-trip and sanitize corrupted enums", "[rf
     {
         // Step 4 appended the world-item opcodes right after the resync ones.
         CHECK(static_cast<uint32_t>(kRequestResync) + 1 == static_cast<uint32_t>(kRequestWorldItemDrop));
-        CHECK(static_cast<uint32_t>(kRequestWorldItemPickup) + 1 == static_cast<uint32_t>(kClientOpcodeMax));
+        CHECK(static_cast<uint32_t>(kRequestWorldItemPickup) + 1 == static_cast<uint32_t>(kClientEntityDigest));
+        // 4.1.1 appended the desync detector's report after them.
+        CHECK(static_cast<uint32_t>(kClientEntityDigest) + 1 == static_cast<uint32_t>(kClientOpcodeMax));
         CHECK(static_cast<uint32_t>(kNotifyResyncComplete) + 1 == static_cast<uint32_t>(kNotifyWorldItemSpawn));
         CHECK(static_cast<uint32_t>(kNotifyWorldItemSnapshot) + 1 == static_cast<uint32_t>(kServerOpcodeMax));
         CHECK(CoopWorldStabilizer::ClassifyPausedInboundPacket(kNotifyResyncComplete) ==
