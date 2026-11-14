@@ -505,9 +505,6 @@ void RfabAdapterService::OnNotifyProgressionEvent(const NotifyRfabProgressionEve
         m_xpAndBookSync.ApplyGlobalValueSyncEvent(m_formResolver, acMessage);
         break;
 
-    case NotifyRfabProgressionEvent::EventKind::FullLedgerResync:
-        break;
-
     case NotifyRfabProgressionEvent::EventKind::AllyProtectionSync:
     {
         if (!IsCombatRulesFeatureEnabled())
@@ -565,19 +562,6 @@ void RfabAdapterService::OnNotifyProgressionEvent(const NotifyRfabProgressionEve
         break;
     }
 
-    case NotifyRfabProgressionEvent::EventKind::WordWallSync:
-    {
-        if (!acMessage.BookId)
-            break;
-        const uint32_t wordFormId = m_world.GetModSystem().GetGameId(acMessage.BookId);
-        if (wordFormId != 0)
-        {
-            spdlog::info("[RFAB Progression] Party discovered Word of Power {:X}", wordFormId);
-            Utils::ShowHudMessage(String("RFAB Co-Op: союзник открыл новое Слово Силы"));
-        }
-        break;
-    }
-
     case NotifyRfabProgressionEvent::EventKind::DifficultyHandshakeSync:
     {
         if (acMessage.EditorId == "mismatch" && !acMessage.SourceKey.empty())
@@ -607,6 +591,10 @@ void RfabAdapterService::OnNotifyProgressionEvent(const NotifyRfabProgressionEve
         }
         break;
     }
+
+    default:
+        // Reserved kinds (FullLedgerResync, WordWallSync) and kinds of a newer server: nothing to do.
+        break;
     }
 }
 

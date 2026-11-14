@@ -9,8 +9,6 @@
  *  2. PersonalBlessingCrimePolicy: isolates personal Divine Shrine blessings, Requiem SaveBlessing
  *     flags, and CrimeGold / bounty globals so one player's theft or shrine visit never strips a
  *     teammate's Divine Blessing or corrupts their crime state.
- *  3. TrueHudSynergyPolicy: defines TrueHUD.esl boss-bar eligibility and floating-bar actor value
- *     consistency rules so remote enemy bars and boss bars stay rock-solid across clients.
  */
 
 #include <common/Authority/ActorValues.h>
@@ -198,50 +196,6 @@ namespace Detail
             return true;
     }
     return false;
-}
-
-// Personal Shrine / Altar / Standing Stone activators in RFAB & vanilla Skyrim whose blessing
-// must apply strictly to the activating player without overwriting party members' blessings.
-[[nodiscard]] inline bool IsPersonalShrineOrDoomstoneActivator(std::string_view aEditorId) noexcept
-{
-    if (aEditorId.empty())
-        return false;
-
-    const std::string lower = Detail::ToLowerAscii(aEditorId);
-    return lower.rfind("rfab_shrine_", 0) == 0 ||
-           lower == "rfab_ba_universalaltar" ||
-           lower.find("templeblessing") != std::string::npos ||
-           lower.find("shrineof") != std::string::npos ||
-           lower.find("doomstone") != std::string::npos ||
-           lower.find("standingstone") != std::string::npos;
-}
-
-// ---------------------------------------------------------------------------
-// 3. TrueHUD.esl Synergy Policy
-// ---------------------------------------------------------------------------
-
-// TrueHUD floating resource bars display Health (24), Magicka (25), Stamina (26), and WardPower (82).
-[[nodiscard]] constexpr bool IsTrueHudResourceBarActorValue(uint32_t aActorValueId) noexcept
-{
-    return aActorValueId == Authority::kAvHealth ||
-           aActorValueId == Authority::kAvMagicka ||
-           aActorValueId == Authority::kAvStamina ||
-           aActorValueId == 82u; // kWardPower
-}
-
-// Determines whether a creature should receive TrueHUD boss-bar treatment in co-op parity
-// with RFAB's BossList.json / Dragon / high-HP boss thresholds.
-[[nodiscard]] inline bool IsTrueHudBossBarEligible(
-    bool aIsDragon,
-    bool aIsKnownRfabBoss,
-    float aMaxHealth,
-    bool aIsPlayer) noexcept
-{
-    if (aIsPlayer)
-        return false;
-    if (aIsDragon || aIsKnownRfabBoss)
-        return true;
-    return std::isfinite(aMaxHealth) && aMaxHealth >= 800.0f;
 }
 
 } // namespace RfabWorldImmersion

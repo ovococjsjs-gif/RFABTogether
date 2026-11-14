@@ -24,6 +24,9 @@ What is checked (sources only, comments stripped; tests and the harness do not c
       default (this is how SyncRfabProgressionEvent::LedgerXpGrant went unnoticed).
       An enumerator handled by a final `else` or `default:` is invisible to this rule and has to
       be listed in the baseline with that reason.
+      A RESERVED enumerator (the "reserved" list of the baseline) keeps its number on the wire and
+      must be referenced by neither side: the moment one side starts using it again, the check
+      fails until it is taken off the list and both ends exist.
 
 What is NOT checked: field values. A harness that sends a real message type with a field value no
 client ever produces (MountRequest{MountId = 0}, M3) passes this check; that needs a behavioural test.
@@ -300,6 +303,13 @@ def load_baseline(path: Path) -> dict[str, str]:
     return {f"{e['rule']} {e['subject']} | {e['detail']}": e.get("reason", "") for e in data.get("known", [])}
 
 
+def load_reserved(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return {e["subject"]: e.get("reason", "") for e in data.get("reserved", [])}
+
+
 def check(root: Path, baseline_path: Path, list_only: bool, quiet: bool = False) -> int:
     def say(line: str) -> None:
         if not quiet:
@@ -313,11 +323,28 @@ def check(root: Path, baseline_path: Path, list_only: bool, quiet: bool = False)
         return 0
 
     baseline = load_baseline(baseline_path)
+    reserved = load_reserved(baseline_path)
+
+    # A reserved enumerator is expected to be unreferenced by BOTH sides: exactly two W3 findings.
+    reserved_hits: dict[str, int] = {subject: 0 for subject in reserved}
+    kept = []
+    for violation in violations:
+        if violation["rule"] == "W3" and violation["subject"] in reserved:
+            reserved_hits[violation["subject"]] += 1
+            continue
+        kept.append(violation)
+    reserved_in_use = sorted(subject for subject, hits in reserved_hits.items() if hits != 2)
+    violations = kept
+
     current = {key_of(v) for v in violations}
     unexpected = sorted(current - baseline.keys())
     stale = sorted(baseline.keys() - current)
     missing_reason = sorted(k for k, reason in baseline.items() if not reason.strip())
+    missing_reason += sorted(f"reserved {subject}" for subject, reason in reserved.items() if not reason.strip())
 
+    for subject in reserved_in_use:
+        say(f"[wire-contract] RESERVED {subject} is referenced by at least one side (or does not exist): "
+            f"a reserved enumerator must be unused by both; take it off the reserved list of {baseline_path.name}")
     for key in unexpected:
         say(f"[wire-contract] NEW      {key}")
     for key in stale:
@@ -326,10 +353,11 @@ def check(root: Path, baseline_path: Path, list_only: bool, quiet: bool = False)
         say(f"[wire-contract] NOREASON {key}")
 
     known = len(current & baseline.keys())
-    failed = bool(unexpected or stale or missing_reason)
+    failed = bool(unexpected or stale or missing_reason or reserved_in_use)
     say(
         f"wire contract: {len(unexpected)} new violation(s), {len(stale)} stale baseline "
-        f"entr{'y' if len(stale) == 1 else 'ies'}, {known} known and listed in {baseline_path.name}"
+        f"entr{'y' if len(stale) == 1 else 'ies'}, {known} known and listed in {baseline_path.name}, "
+        f"{len(reserved) - len(reserved_in_use)} reserved enumerator(s) unused by both sides"
     )
     return 1 if failed else 0
 
@@ -501,6 +529,29 @@ def self_test() -> int:
         )
         if check(root, baseline, list_only=False, quiet=True) != 1:
             failures.append("baseline: an entry without a reason must fail the check")
+
+    reserved_h = (
+        "struct Event final : ClientMessage {\n"
+        "    enum class Kind : uint8_t { A = 1, Gone = 2 };\n"
+        "    Kind Kind{};\n};\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write(root, "Code/encoding/Messages/Event.h", reserved_h)
+        _write(root, "Code/client/A.cpp", "void F() { Event e; e.Kind = Event::Kind::A; m_transport.Send(e); }\n")
+        server = "void H() { aDispatcher.sink<PacketEvent<Event>>().connect<&S::On>(this); }\nvoid On(const PacketEvent<Event>& m) { if (m.Packet.Kind == Event::Kind::A) {} }\n"
+        _write(root, "Code/server/B.cpp", server)
+        baseline = root / "baseline.json"
+        baseline.write_text(json.dumps({"known": [], "reserved": [{"subject": "Event::Kind::Gone", "reason": "kept for the wire"}]}), encoding="utf-8")
+        if check(root, baseline, list_only=False, quiet=True) != 0:
+            failures.append("reserved: an enumerator unused by both sides and listed as reserved must pass")
+        _write(root, "Code/server/B.cpp", server + "void J(const PacketEvent<Event>& m) { if (m.Packet.Kind == Event::Kind::Gone) {} }\n")
+        if check(root, baseline, list_only=False, quiet=True) != 1:
+            failures.append("reserved: an enumerator one side references again must fail")
+        _write(root, "Code/server/B.cpp", server)
+        baseline.write_text(json.dumps({"known": [], "reserved": [{"subject": "Event::Kind::Gone", "reason": ""}]}), encoding="utf-8")
+        if check(root, baseline, list_only=False, quiet=True) != 1:
+            failures.append("reserved: an entry without a reason must fail")
 
     if failures:
         print("wire contract self-test FAILED:")

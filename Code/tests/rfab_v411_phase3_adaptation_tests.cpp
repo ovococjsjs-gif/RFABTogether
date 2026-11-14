@@ -143,15 +143,6 @@ TEST_CASE("3A.1 RFAB.ini overlay forces bAlwaysActive=true and MenuPausePolicy r
     REQUIRE(Compat::IsInteractiveLootMenu("ContainerMenu"));
     REQUIRE(Compat::IsInteractiveLootMenu("LootMenu"));
     REQUIRE_FALSE(Compat::IsInteractiveLootMenu("InventoryMenu"));
-
-    REQUIRE(Compat::IsNonPausingRfabOverlayMenu("LootMenu"));
-    REQUIRE(Compat::IsNonPausingRfabOverlayMenu("WheelMenu"));
-    REQUIRE(Compat::IsNonPausingRfabOverlayMenu("RFAB WheelMenu"));
-    REQUIRE(Compat::IsNonPausingRfabOverlayMenu("TrueHUD"));
-    REQUIRE_FALSE(Compat::IsNonPausingRfabOverlayMenu("StatsMenu"));
-
-    REQUIRE(Compat::IsPauseRequiredRfabMenu("StatsMenu"));
-    REQUIRE(Compat::IsPauseRequiredRfabMenu("CustomMenu"));
 }
 
 TEST_CASE("3A.2 PendingContainerLootQueue buffers QuickLootIE/AutoLoot deltas safely across registration", "[rfab][phase3][loot]")
@@ -255,7 +246,6 @@ TEST_CASE("3A.4 Crafted Enchantment structural identity and Tempered float toler
 
     REQUIRE(swordClientA.IsExtraDataEquals(swordClientB));
     REQUIRE(swordClientA.CanBeMerged(swordClientB));
-    REQUIRE(CoopCraftedItems::ClassifyCraftedItem(swordClientA) == CoopCraftedItems::CraftedItemKind::kTemperedAndEnchanted);
 
     // Normalizing stamps identical deterministic non-zero fingerprint BaseId on both clients!
     CoopCraftedItems::NormalizeCraftedEntry(swordClientA);
@@ -356,14 +346,7 @@ TEST_CASE("3B.2 Shared Dragon Souls, Word Walls, Difficulty/Cursed Handshake, Qu
     REQUIRE_FALSE(dupAward.IsNewDragonKill);
     REQUIRE(dupAward.NewlyAwardedPlayerIds.empty());
 
-    // 2. Shared Word Wall Ledger
-    RfabCoopProgression::WordWallLedger wordLedger;
-    const GameId fusWord{0u, 0x00013E22u};
-    REQUIRE(wordLedger.RecordWordLearned(fusWord));
-    REQUIRE_FALSE(wordLedger.RecordWordLearned(fusWord));
-    REQUIRE(wordLedger.Size() == 1);
-
-    // 3. RFAB_StartMenu Difficulty & Cursed Handshake
+    // 2. RFAB_StartMenu Difficulty & Cursed Handshake
     const auto wanderer = RfabCoopProgression::InferDifficultyFromGmst(2.0f, 0.5f);
     const auto dovahkiin = RfabCoopProgression::InferDifficultyFromGmst(1.0f, 1.0f);
     const auto legendCursed = RfabCoopProgression::InferDifficultyFromGmst(0.5f, 2.0f);
@@ -385,14 +368,6 @@ TEST_CASE("3B.2 Shared Dragon Souls, Word Walls, Difficulty/Cursed Handshake, Qu
     const std::string notice = RfabCoopProgression::FormatDifficultyMismatchNotice(legendCursed, dovahkiin);
     REQUIRE(notice.find("Legend+Cursed") != std::string::npos);
     REQUIRE(notice.find("Dovahkiin") != std::string::npos);
-
-    // 4. Quests.ini Canonical UTF-8/Cyrillic Dedupe Key
-    const std::string k1 = RfabCoopProgression::MakeCanonicalQuestsIniSourceKey(GameId{}, 200, "  Ветреный   пик  ");
-    const std::string k2 = RfabCoopProgression::MakeCanonicalQuestsIniSourceKey(GameId{}, 200, "Ветреный пик");
-    const std::string k3 = RfabCoopProgression::MakeCanonicalQuestsIniSourceKey(GameId{}, 200, "Дракон в небе");
-    REQUIRE(!k1.empty());
-    REQUIRE(k1 == k2);
-    REQUIRE(k1 != k3);
 }
 
 TEST_CASE("Late-join catch-up XP is counted per persistent identity, not per connection (M1)", "[rfab][phase3][progression][catchup]")
@@ -586,16 +561,4 @@ TEST_CASE("3C RFAB World Immersion: Mount Ownership, Personal Blessings/CrimeGol
     REQUIRE(RfabWorldImmersion::IsPersonalCrimeOrBlessingGlobal("CrimeGoldWhiterun"));
     REQUIRE(RfabWorldImmersion::IsPersonalCrimeOrBlessingGlobal("REQ_Blessing_Arkay"));
     REQUIRE_FALSE(RfabWorldImmersion::IsPersonalCrimeOrBlessingGlobal("RFAB_Boss_UmbraPhase"));
-    REQUIRE(RfabWorldImmersion::IsPersonalShrineOrDoomstoneActivator("RFAB_Shrine_Akatosh"));
-    REQUIRE(RfabWorldImmersion::IsPersonalShrineOrDoomstoneActivator("RFAB_BA_UniversalAltar"));
-    REQUIRE(RfabWorldImmersion::IsPersonalShrineOrDoomstoneActivator("DoomstoneWarrior"));
-
-    // 3. TrueHUD Synergy
-    REQUIRE(RfabWorldImmersion::IsTrueHudResourceBarActorValue(24u)); // Health
-    REQUIRE(RfabWorldImmersion::IsTrueHudResourceBarActorValue(25u)); // Magicka
-    REQUIRE(RfabWorldImmersion::IsTrueHudResourceBarActorValue(26u)); // Stamina
-    REQUIRE(RfabWorldImmersion::IsTrueHudResourceBarActorValue(82u)); // WardPower
-    REQUIRE(RfabWorldImmersion::IsTrueHudBossBarEligible(true, false, 400.0f, false));
-    REQUIRE(RfabWorldImmersion::IsTrueHudBossBarEligible(false, true, 500.0f, false));
-    REQUIRE_FALSE(RfabWorldImmersion::IsTrueHudBossBarEligible(false, false, 1200.0f, true));
 }

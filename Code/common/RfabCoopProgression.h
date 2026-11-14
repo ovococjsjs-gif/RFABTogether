@@ -2,12 +2,10 @@
 
 /**
  * Pure, deterministic RFAB co-op progression & session-parity helpers (zero Skyrim engine deps):
- *  1. DragonSoulLedger: shares slain dragon souls 1-for-1 across all party members without double-grants.
- *  2. WordWallLedger: shares learned Words of Power (TESWordOfPower GameId) across party & late joiners.
- *  3. DifficultyHandshake: validates RFAB_StartMenu Difficulty (Странник / Довакин / Легенда) &
+ *  1. DragonSoulLedger: the dragons the party has slain (the server decides who is sent a soul).
+ *  2. DifficultyHandshake: validates RFAB_StartMenu Difficulty (Странник / Довакин / Легенда) &
  *     Cursed (Проклятый) parity between Host and Guest with localized mismatch warnings.
- *  4. QuestsIniDedupe: canonical UTF-8 / Cyrillic-safe keys for RFAB Quests.ini XP deduplication.
- *  5. LateJoinerCatchUp: bounded, idempotent catch-up XP calculation for friends joining mid-session.
+ *  3. SharedXpCreditLedger: who already holds how much of the party's shared XP (late-join catch-up).
  */
 
 #include <TiltedCore/Buffer.hpp>
@@ -128,42 +126,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// 2. Shared Word Walls Ledger (TESWordOfPower GameId)
-// ---------------------------------------------------------------------------
-
-class WordWallLedger
-{
-public:
-    void Clear() noexcept { m_learnedWords.clear(); }
-    [[nodiscard]] size_t Size() const noexcept { return m_learnedWords.size(); }
-    [[nodiscard]] const std::vector<GameId>& GetLearnedWords() const noexcept { return m_learnedWords; }
-
-    bool RecordWordLearned(const GameId& acWordId)
-    {
-        if (!acWordId || acWordId.ModId == 0xFFFFFFFFu)
-            return false;
-        for (const auto& existing : m_learnedWords)
-        {
-            if (existing == acWordId)
-                return false;
-        }
-        m_learnedWords.push_back(acWordId);
-        return true;
-    }
-
-    void RestoreWords(const std::vector<GameId>& acWords)
-    {
-        Clear();
-        for (const auto& w : acWords)
-            (void)RecordWordLearned(w);
-    }
-
-private:
-    std::vector<GameId> m_learnedWords{};
-};
-
-// ---------------------------------------------------------------------------
-// 3. RFAB_StartMenu Difficulty & Cursed Handshake
+// 2. RFAB_StartMenu Difficulty & Cursed Handshake
 // ---------------------------------------------------------------------------
 
 enum class RfabDifficultyTier : uint8_t
@@ -292,66 +255,7 @@ enum class DifficultyParityOutcome : uint8_t
 }
 
 // ---------------------------------------------------------------------------
-// 4. Quests.ini Canonical Deduplication Key
-// ---------------------------------------------------------------------------
-
-// Normalizes quest names (including UTF-8 Cyrillic titles from RFAB `Quests.ini`) into a
-// whitespace-collapsed, ASCII-lowercased canonical source key (`quest_ini:<hash64>`), so
-// two players completing the same RFAB quest >4s apart still hit the exact same server XP key!
-[[nodiscard]] inline std::string MakeCanonicalQuestsIniSourceKey(
-    const GameId& acQuestId,
-    uint16_t aStage,
-    std::string_view aQuestEditorOrTitle = {})
-{
-    if (acQuestId && acQuestId.ModId != 0xFFFFFFFFu)
-    {
-        char buf[64]{};
-        std::snprintf(buf, sizeof(buf), "quest:%08X:%08X:%u", acQuestId.ModId, acQuestId.BaseId, static_cast<unsigned>(aStage));
-        return std::string(buf);
-    }
-
-    // Fallback: canonical FNV-1a 64-bit hash of trimmed, whitespace-collapsed title/editorId.
-    std::string canonical;
-    canonical.reserve(aQuestEditorOrTitle.size());
-    bool prevSpace = true;
-    for (unsigned char ch : aQuestEditorOrTitle)
-    {
-        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n')
-        {
-            if (!prevSpace)
-            {
-                canonical.push_back(' ');
-                prevSpace = true;
-            }
-        }
-        else
-        {
-            if (ch >= 'A' && ch <= 'Z')
-                ch = static_cast<unsigned char>(ch - 'A' + 'a');
-            canonical.push_back(static_cast<char>(ch));
-            prevSpace = false;
-        }
-    }
-    while (!canonical.empty() && canonical.back() == ' ')
-        canonical.pop_back();
-
-    if (canonical.empty())
-        return {};
-
-    uint64_t h = 14695981039346656037ULL;
-    for (unsigned char c : canonical)
-    {
-        h ^= static_cast<uint64_t>(c);
-        h *= 1099511628211ULL;
-    }
-
-    char buf[64]{};
-    std::snprintf(buf, sizeof(buf), "quest_ini:%016llX:%u", static_cast<unsigned long long>(h), static_cast<unsigned>(aStage));
-    return std::string(buf);
-}
-
-// ---------------------------------------------------------------------------
-// 5. Late-joiner catch-up XP: who already holds how much of the party's shared XP
+// 3. Late-joiner catch-up XP: who already holds how much of the party's shared XP
 // ---------------------------------------------------------------------------
 //
 // Shared XP reaches a player while they are connected: they earn it, or they receive the

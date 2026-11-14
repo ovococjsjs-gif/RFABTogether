@@ -48,7 +48,6 @@ public:
         std::unordered_map<uint32_t, bool> BossGhostStates{};
         std::unordered_set<uint32_t> LockedBossEntities{};
         std::vector<std::string> SlainDragonKeys{};
-        std::vector<GameId> LearnedWordWalls{};
         // Shared XP already held per persistent player identity (late-join catch-up, M1). Part of
         // the snapshot so that a rollback restores it together with TotalSharedXp.
         std::unordered_map<std::string, int64_t> SharedXpCredits{};
@@ -267,8 +266,6 @@ public:
 
     [[nodiscard]] RfabCoopProgression::DragonSoulLedger& GetDragonSoulLedger() noexcept { return m_dragonSouls; }
     [[nodiscard]] const RfabCoopProgression::DragonSoulLedger& GetDragonSoulLedger() const noexcept { return m_dragonSouls; }
-    [[nodiscard]] RfabCoopProgression::WordWallLedger& GetWordWallLedger() noexcept { return m_wordWalls; }
-    [[nodiscard]] const RfabCoopProgression::WordWallLedger& GetWordWallLedger() const noexcept { return m_wordWalls; }
 
     [[nodiscard]] Snapshot CaptureSnapshot() const
     {
@@ -281,7 +278,6 @@ public:
             m_bossGhostStates,
             m_lockedBossEntities,
             m_dragonSouls.GetOrderedDragonKeys(),
-            m_wordWalls.GetLearnedWords(),
             m_xpCredits.GetCredits(),
             m_xpCredits.GetBaselineXp(),
         };
@@ -297,7 +293,6 @@ public:
         m_bossGhostStates = acSnapshot.BossGhostStates;
         m_lockedBossEntities = acSnapshot.LockedBossEntities;
         m_dragonSouls.RestoreDragonKeys(acSnapshot.SlainDragonKeys);
-        m_wordWalls.RestoreWords(acSnapshot.LearnedWordWalls);
         m_xpCredits.Restore(acSnapshot.SharedXpCredits, acSnapshot.SharedXpCreditBaseline);
     }
 
@@ -327,7 +322,6 @@ private:
     std::unordered_map<uint32_t, bool> m_bossGhostStates{};
     std::unordered_set<uint32_t> m_lockedBossEntities{};
     RfabCoopProgression::DragonSoulLedger m_dragonSouls{};
-    RfabCoopProgression::WordWallLedger m_wordWalls{};
     RfabCoopProgression::SharedXpCreditLedger m_xpCredits{};
 };
 

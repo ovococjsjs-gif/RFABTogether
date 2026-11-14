@@ -1,18 +1,6 @@
 {
-  "_comment": "Known wire-contract violations (Tools/rfab/check_wire_contract.py). Every entry needs a reason. The check fails on a violation that is not listed here and on an entry that no longer occurs, so this list can only shrink.",
+  "_comment": "Known wire-contract violations (Tools/rfab/check_wire_contract.py). Every entry needs a reason. The check fails on a violation that is not listed here and on an entry that no longer occurs, so this list can only shrink. The \"reserved\" list names enumerators that keep their number on the wire and must be referenced by neither side.",
   "known": [
-    {
-      "rule": "W3",
-      "subject": "SyncRfabProgressionEvent::EventKind::WordWallSync",
-      "detail": "never referenced by the sender (Code/client)",
-      "reason": "DEFECT_REGISTRY M4: shared Word Walls have a server handler, a checkpoint chunk and a client receiver, but no client code sends the event. Wired or removed in WORK_PLAN package 2.4."
-    },
-    {
-      "rule": "W3",
-      "subject": "NotifyRfabProgressionEvent::EventKind::FullLedgerResync",
-      "detail": "never referenced by the sender (Code/server)",
-      "reason": "Declared for a full ledger resend that was never implemented; the client case is an empty break. Implemented or removed together with M4/M5 (WORK_PLAN package 2.4)."
-    },
     {
       "rule": "W3",
       "subject": "RequestCoordinatedSaveLoad::ActionType::LoadPreviousCheckpoint",
@@ -72,18 +60,28 @@
       "subject": "RequestObjectInventoryChanges",
       "detail": "ClientMessage has no handler under Code/server",
       "reason": "Dead type inherited from TiltedEvolution: only forward declarations remain on both sides. Removed in WORK_PLAN package 2.4."
-    },
+    }
+  ],
+  "reserved": [
     {
-      "rule": "W3",
-      "subject": "SyncRfabProgressionEvent::EventKind::DragonSoulSync",
-      "detail": "never referenced by the sender (Code/client)",
-      "reason": "Reserved, not a defect (DEFECT_REGISTRY M2): a 4.1.0 client reports dead dragons with this kind and the server ignores it, because the server now takes a dragon's death from its own alive-to-dead transition (RfabProgressionService::OnDragonSlain). The 4.1.1 client no longer sends it. The enumerator keeps its number so that 4.1.x peers still decode each other; it goes away with the next protocol version."
-    },
-    {
-      "rule": "W3",
       "subject": "SyncRfabProgressionEvent::EventKind::LedgerXpGrant",
-      "detail": "never referenced by the sender (Code/client)",
-      "reason": "Reserved, not a defect (DEFECT_REGISTRY M17): no client has ever sent a keyed XP grant - every construction of the message assigns another kind. RFAB XP is shared by SyncRfabExperienceRequest, which now feeds the party total. The server names the kind and ignores it; it is the default (zero) of the message and keeps its number."
+      "reason": "The zero default of the message. No client has ever sent a keyed XP grant (DEFECT_REGISTRY M17): RFAB XP is shared by SyncRfabExperienceRequest."
+    },
+    {
+      "subject": "SyncRfabProgressionEvent::EventKind::DragonSoulSync",
+      "reason": "A 4.1.0 client reports dead dragons with it; since M2 the server takes a dragon's death from its own alive-to-dead transition and the 4.1.1 client sends nothing."
+    },
+    {
+      "subject": "SyncRfabProgressionEvent::EventKind::WordWallSync",
+      "reason": "Shared Words of Power were never wired to a client (DEFECT_REGISTRY M4); removed in WORK_PLAN package 2.4. If the mechanic is built in stage 6 it gets both ends at once."
+    },
+    {
+      "subject": "NotifyRfabProgressionEvent::EventKind::WordWallSync",
+      "reason": "The server-to-client half of the same mechanic (M4)."
+    },
+    {
+      "subject": "NotifyRfabProgressionEvent::EventKind::FullLedgerResync",
+      "reason": "Declared for a full ledger resend that was never implemented on either side."
     }
   ]
 }

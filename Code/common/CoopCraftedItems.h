@@ -24,15 +24,6 @@ inline constexpr float kFloatMatchEpsilon = 1e-3f;
 inline constexpr float kMaxExtraHealth = 100000.0f;
 inline constexpr float kMaxExtraCharge = 100000.0f;
 
-enum class CraftedItemKind : uint8_t
-{
-    kStandard = 0,
-    kTempered = 1,
-    kCraftedEnchanted = 2,
-    kTemperedAndEnchanted = 3,
-    kDynamicAlchemyOrTempBase = 4,
-};
-
 [[nodiscard]] inline bool AreFloatsClose(float aLhs, float aRhs, float aEps = kFloatMatchEpsilon) noexcept
 {
     if (!std::isfinite(aLhs) && !std::isfinite(aRhs))
@@ -185,24 +176,6 @@ inline void NormalizeCraftedEntry(TEntry& aEntry) noexcept
         // while distinct crafted enchantments never collide!
         aEntry.ExtraEnchantId.BaseId = ComputeCraftedEnchantFingerprint(aEntry.EnchantData);
     }
-}
-
-template <class TEntry>
-[[nodiscard]] inline CraftedItemKind ClassifyCraftedItem(const TEntry& acEntry) noexcept
-{
-    if (acEntry.BaseId.ModId == kTempModId)
-        return CraftedItemKind::kDynamicAlchemyOrTempBase;
-
-    const bool tempered = std::isfinite(acEntry.ExtraHealth) && acEntry.ExtraHealth > 1.0f + kFloatMatchEpsilon;
-    const bool craftedEnchant = IsDynamicTempEnchantment(acEntry);
-
-    if (tempered && craftedEnchant)
-        return CraftedItemKind::kTemperedAndEnchanted;
-    if (craftedEnchant)
-        return CraftedItemKind::kCraftedEnchanted;
-    if (tempered)
-        return CraftedItemKind::kTempered;
-    return CraftedItemKind::kStandard;
 }
 
 } // namespace CoopCraftedItems

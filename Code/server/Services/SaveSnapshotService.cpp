@@ -505,7 +505,9 @@ bool SaveSnapshotService::SaveCheckpointsToDisk(const std::filesystem::path& acP
                 worldItemsWriter.Size(),
                 kWorldItemsChunkVersion);
 
-            // v4.1.1 Phase 3B: shared Dragon Soul kills & Word Wall discoveries. Older builds skip unknown tag.
+            // The dragons the party has slain. The chunk also has a list of Words of Power, kept
+            // empty: sharing them was never wired to a client (M4), but the layout stays so that a
+            // checkpoint written by either build is read by the other.
             TiltedPhoques::Buffer drgWordBuf(32 * 1024);
             TiltedPhoques::Buffer::Writer drgWordWriter(&drgWordBuf);
             Serialization::WriteVarInt(drgWordWriter, m_snapshots.size());
@@ -514,9 +516,7 @@ bool SaveSnapshotService::SaveCheckpointsToDisk(const std::filesystem::path& acP
                 Serialization::WriteVarInt(drgWordWriter, snap.Progression.SlainDragonKeys.size());
                 for (const auto& key : snap.Progression.SlainDragonKeys)
                     WriteStdString(drgWordWriter, key);
-                Serialization::WriteVarInt(drgWordWriter, snap.Progression.LearnedWordWalls.size());
-                for (const auto& wordId : snap.Progression.LearnedWordWalls)
-                    wordId.Serialize(drgWordWriter);
+                Serialization::WriteVarInt(drgWordWriter, 0u); // Words of Power: always empty
             }
             tlvBuilder.AppendChunk(
                 CoopCheckpoint::TlvTag::kDragonSoulsAndWordWalls,
@@ -834,14 +834,12 @@ bool SaveSnapshotService::LoadCheckpointsFromDisk(const std::filesystem::path& a
                                         for (uint64_t d = 0; d < dragonCount && !dwReader.Eof(); ++d)
                                             prog.SlainDragonKeys.push_back(ReadStdString(dwReader));
 
+                                        // Words of Power from a checkpoint of an earlier build: read past them.
                                         const uint64_t wordCount = std::min<uint64_t>(Serialization::ReadVarInt(dwReader), 4096ULL);
-                                        prog.LearnedWordWalls.clear();
-                                        prog.LearnedWordWalls.reserve(static_cast<size_t>(wordCount));
                                         for (uint64_t w = 0; w < wordCount && !dwReader.Eof(); ++w)
                                         {
-                                            GameId wid{};
-                                            wid.Deserialize(dwReader);
-                                            prog.LearnedWordWalls.push_back(wid);
+                                            GameId skippedWord{};
+                                            skippedWord.Deserialize(dwReader);
                                         }
                                     }
                                     continue;

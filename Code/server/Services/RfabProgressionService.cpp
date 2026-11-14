@@ -112,12 +112,6 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
         break;
     }
 
-    case SyncRfabProgressionEvent::EventKind::LedgerXpGrant:
-        // No client has ever sent a keyed XP grant: RFAB XP is shared by the wallet relay
-        // (SyncRfabExperienceRequest), which feeds the party total through OnSharedRfabXpRelayed.
-        // The kind is also the default of this message, so it is named here and ignored.
-        break;
-
     case SyncRfabProgressionEvent::EventKind::GlobalValueSync:
     {
         // Isolate personal Divine Shrine blessings, RFAB SaveBlessing flags, and CrimeGold/bounty
@@ -229,29 +223,6 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
         break;
     }
 
-    case SyncRfabProgressionEvent::EventKind::DragonSoulSync:
-        // Not a trigger any more. A 4.1.0 client reports every dead dragon it simulates, including
-        // a corpse it merely walked up to, under a key of its own choosing. The server now sees the
-        // death itself (OnDragonSlain), exactly once per death.
-        break;
-
-    case SyncRfabProgressionEvent::EventKind::WordWallSync:
-    {
-        if (!m_ledger.GetWordWallLedger().RecordWordLearned(pkt.BookId))
-            break;
-
-        NotifyRfabProgressionEvent wordBroadcast{};
-        wordBroadcast.Kind = NotifyRfabProgressionEvent::EventKind::WordWallSync;
-        wordBroadcast.EpochId = currentEpoch;
-        wordBroadcast.SourceKey = pkt.SourceKey;
-        wordBroadcast.EditorId = pkt.EditorId;
-        wordBroadcast.BookId = pkt.BookId;
-        wordBroadcast.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
-        if (GameServer::Get())
-            GameServer::Get()->SendToPlayers(wordBroadcast, pSender);
-        break;
-    }
-
     case SyncRfabProgressionEvent::EventKind::DifficultyHandshakeSync:
     {
         const auto reported = RfabCoopProgression::UnpackDifficultyHandshake(pkt.XpDelta, pkt.GlobalValue);
@@ -341,6 +312,15 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
         }
         break;
     }
+
+    default:
+        // Reserved kinds and anything a newer client may send. Nothing here is acted on:
+        //  - LedgerXpGrant (the zero default of the message): no client has ever sent a keyed XP
+        //    grant; RFAB XP is shared by SyncRfabExperienceRequest (OnSharedRfabXpRelayed).
+        //  - DragonSoulSync: a 4.1.0 client reports every dead dragon it simulates, a corpse it
+        //    walked up to included; the server sees the death itself (OnDragonSlain).
+        //  - WordWallSync: sharing Words of Power was never wired to a client (M4).
+        break;
     }
 }
 
@@ -447,17 +427,6 @@ void RfabProgressionService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexce
         bossSync.GlobalValue = 1.0f;
         bossSync.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
         pNewPlayer->Send(bossSync);
-    }
-
-    // Sync already-discovered Words of Power so late joiners stay synchronized on shouts.
-    for (const auto& wordId : m_ledger.GetWordWallLedger().GetLearnedWords())
-    {
-        NotifyRfabProgressionEvent wordSync{};
-        wordSync.Kind = NotifyRfabProgressionEvent::EventKind::WordWallSync;
-        wordSync.EpochId = currentEpoch;
-        wordSync.BookId = wordId;
-        wordSync.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
-        pNewPlayer->Send(wordSync);
     }
 
     // Send Host's RFAB_StartMenu Difficulty & Cursed state for handshake validation.

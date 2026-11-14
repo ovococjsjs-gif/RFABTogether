@@ -1824,21 +1824,8 @@ int main(int argc, char** argv)
             world.destroy(boss);
         }
 
-        // 8.2 Word Walls + deduplication. Shared dragon souls have their own scene (10): the server
-        //     takes a dragon's death from its own death transition, not from a client report.
-        {
-            // Word Wall sync + dedupe
-            Harness::ClearOutbox();
-            SyncRfabProgressionEvent wordLearn{};
-            wordLearn.Kind = SyncRfabProgressionEvent::EventKind::WordWallSync;
-            wordLearn.EpochId = epoch;
-            wordLearn.BookId = GameId{0u, 0x00013E22u};
-            Check(DeliverWire(world, wordLearn, pHost), "WordWallSync delivered");
-            const auto guestWords = DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kGuestConn);
-            Check(guestWords.size() == 1 && guestWords[0].Kind == NotifyRfabProgressionEvent::EventKind::WordWallSync &&
-                      guestWords[0].BookId == GameId{0u, 0x00013E22u},
-                  "peer receives newly discovered Word Wall");
-        }
+        // 8.2 Shared dragon souls have their own scene (10). Shared Words of Power were removed: no
+        //     client ever sent them (M4).
 
         // 8.3 RFAB_StartMenu Difficulty & Cursed Handshake mismatch detection
         {
