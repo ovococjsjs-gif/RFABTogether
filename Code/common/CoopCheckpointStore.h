@@ -269,6 +269,9 @@ namespace CoopCheckpoint
         kWorldItems = 0x0005u,
         // v4.1.1 Phase 3B: deduplicated party slain dragon keys & discovered Words of Power.
         kDragonSoulsAndWordWalls = 0x0006u,
+        // Shared XP already held per persistent player identity (RfabCoopProgression::SharedXpCreditLedger),
+        // one map and one baseline per snapshot.
+        kSharedXpCredits = 0x0007u,
     };
 
     struct TlvChunkHeader

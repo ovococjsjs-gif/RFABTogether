@@ -49,6 +49,10 @@ public:
         std::unordered_set<uint32_t> LockedBossEntities{};
         std::vector<std::string> SlainDragonKeys{};
         std::vector<GameId> LearnedWordWalls{};
+        // Shared XP already held per persistent player identity (late-join catch-up, M1). Part of
+        // the snapshot so that a rollback restores it together with TotalSharedXp.
+        std::unordered_map<std::string, int64_t> SharedXpCredits{};
+        int64_t SharedXpCreditBaseline{};
     };
 
     struct XpGrantOutcome
@@ -278,6 +282,8 @@ public:
             m_lockedBossEntities,
             m_dragonSouls.GetOrderedDragonKeys(),
             m_wordWalls.GetLearnedWords(),
+            m_xpCredits.GetCredits(),
+            m_xpCredits.GetBaselineXp(),
         };
     }
 
@@ -292,9 +298,12 @@ public:
         m_lockedBossEntities = acSnapshot.LockedBossEntities;
         m_dragonSouls.RestoreDragonKeys(acSnapshot.SlainDragonKeys);
         m_wordWalls.RestoreWords(acSnapshot.LearnedWordWalls);
+        m_xpCredits.Restore(acSnapshot.SharedXpCredits, acSnapshot.SharedXpCreditBaseline);
     }
 
     [[nodiscard]] int64_t GetTotalSharedXp() const noexcept { return m_totalSharedXp; }
+    [[nodiscard]] RfabCoopProgression::SharedXpCreditLedger& GetXpCredits() noexcept { return m_xpCredits; }
+    [[nodiscard]] const RfabCoopProgression::SharedXpCreditLedger& GetXpCredits() const noexcept { return m_xpCredits; }
     [[nodiscard]] const std::vector<GameId>& GetReadBooks() const noexcept { return m_readBooks; }
     [[nodiscard]] const std::unordered_map<std::string, float>& GetSyncedGlobals() const noexcept { return m_syncedGlobals; }
     [[nodiscard]] const std::unordered_map<uint32_t, bool>& GetBossGhostStates() const noexcept { return m_bossGhostStates; }
@@ -319,6 +328,7 @@ private:
     std::unordered_set<uint32_t> m_lockedBossEntities{};
     RfabCoopProgression::DragonSoulLedger m_dragonSouls{};
     RfabCoopProgression::WordWallLedger m_wordWalls{};
+    RfabCoopProgression::SharedXpCreditLedger m_xpCredits{};
 };
 
 class RfabProgressionService
@@ -339,12 +349,13 @@ private:
     void OnSyncProgressionEvent(const PacketEvent<SyncRfabProgressionEvent>& acMessage) noexcept;
     void OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept;
     void OnPlayerLeave(const PlayerLeaveEvent& acEvent) noexcept;
+    // Records that every connected player now holds `aXpDelta` more shared XP.
+    void CreditConnectedPlayers(int32_t aXpDelta, int64_t aTotalAfterGrant) noexcept;
 
     World& m_world;
     RfabProgressionLedger m_ledger;
     bool m_allyProtectionEnabled{true};
     RfabCoopProgression::DifficultyHandshakeState m_hostDifficultyState{};
-    RfabCoopProgression::LateJoinCatchUpTracker m_lateJoinCatchUp{};
 
     struct PingRateBucket
     {

@@ -17,12 +17,14 @@ namespace
 constexpr int32_t kMaxSingleXpGrant = 1'000'000;
 constexpr uint64_t kTacticalPingRateWindowMs = 2500;
 constexpr uint32_t kMaxTacticalPingsPerWindow = 6;
+}
 
+// Off by default: the feature hands out XP, and it has not been through a playtest. The accounting
+// below runs either way, so switching it on later never pays for the time it was off.
 Console::Setting bEnableLateJoinCatchUpXp{
     "Gameplay:bEnableLateJoinCatchUpXp",
-    "Grants bounded catch-up XP to players joining an ongoing RFAB co-op session",
-    true};
-}
+    "Pays a (re)joining player the shared RFAB XP the party earned while they were away, up to 25000",
+    false};
 
 RfabProgressionService::RfabProgressionService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
     : m_world(aWorld)
@@ -87,6 +89,8 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
             broadcast.XpDelta = outcome.AppliedDelta;
             broadcast.AuthoritativeTotalXp = outcome.AuthoritativeTotalXp;
             GameServer::Get()->SendToPlayers(broadcast, pSender);
+            // A book is read once per world: a late joiner gets it marked as read without its XP.
+            CreditConnectedPlayers(outcome.AppliedDelta, outcome.AuthoritativeTotalXp);
         }
         else if (outcome.DuplicateRebateDelta < 0)
         {
@@ -118,6 +122,7 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
             broadcast.XpDelta = outcome.AppliedDelta;
             broadcast.AuthoritativeTotalXp = outcome.AuthoritativeTotalXp;
             GameServer::Get()->SendToPlayers(broadcast, pSender);
+            CreditConnectedPlayers(outcome.AppliedDelta, outcome.AuthoritativeTotalXp);
         }
         else if (outcome.DuplicateRebateDelta < 0)
         {
@@ -529,15 +534,13 @@ void RfabProgressionService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexce
         pNewPlayer->Send(diffSync);
     }
 
-    // Bounded one-time catch-up XP for friends joining an ongoing session that already earned shared XP.
-    if (m_ledger.GetTotalSharedXp() == 0)
+    // Catch-up XP: what the party earned while this player was away, counted per persistent
+    // identity. A reconnect, a second join event or a server restart finds the identity level with
+    // the party and pays nothing (the tracker this replaces was keyed by the connection id).
     {
-        m_lateJoinCatchUp.MarkAlreadySyncedAtSessionStart(pNewPlayer->GetId());
-    }
-    else
-    {
-        const auto catchUp = m_lateJoinCatchUp.EvaluateAndMark(
-            pNewPlayer->GetId(), m_ledger.GetTotalSharedXp(), bEnableLateJoinCatchUpXp);
+        const std::string identityKey = SaveSnapshotService::GetPlayerIdentityKey(pNewPlayer);
+        const auto catchUp = m_ledger.GetXpCredits().EvaluateJoin(
+            identityKey, m_ledger.GetTotalSharedXp(), bEnableLateJoinCatchUpXp);
         if (catchUp.ShouldGrant)
         {
             NotifyRfabProgressionEvent catchUpPkt{};
@@ -547,11 +550,27 @@ void RfabProgressionService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexce
             catchUpPkt.XpDelta = catchUp.GrantXpDelta;
             catchUpPkt.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
             pNewPlayer->Send(catchUpPkt);
+            spdlog::info(
+                "[RFAB Progression] Catch-up XP +{} for '{}' ({} forfeited above the cap)",
+                catchUp.GrantXpDelta, identityKey, catchUp.ForfeitedXp);
         }
     }
 
     // Sync authoritative Host-controlled Co-Op Ally Protection («Единство в битве») state & Host ID.
     SendAllyProtectionStateToPlayer(pNewPlayer, false);
+}
+
+void RfabProgressionService::CreditConnectedPlayers(int32_t aXpDelta, int64_t aTotalAfterGrant) noexcept
+{
+    if (aXpDelta <= 0)
+        return;
+
+    // The sender granted the XP locally and everyone else receives the broadcast, so every
+    // connected player holds it now. Only players who are away are owed it later.
+    m_world.GetPlayerManager().ForEach([&](const Player* apConnected) {
+        m_ledger.GetXpCredits().CreditConnected(
+            SaveSnapshotService::GetPlayerIdentityKey(apConnected), aXpDelta, aTotalAfterGrant);
+    });
 }
 
 void RfabProgressionService::OnPlayerLeave(const PlayerLeaveEvent& acEvent) noexcept

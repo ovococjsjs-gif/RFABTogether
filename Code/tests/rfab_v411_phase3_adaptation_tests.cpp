@@ -387,19 +387,142 @@ TEST_CASE("3B.2 Shared Dragon Souls, Word Walls, Difficulty/Cursed Handshake, Qu
     REQUIRE(!k1.empty());
     REQUIRE(k1 == k2);
     REQUIRE(k1 != k3);
+}
 
-    // 5. Late-Joiner Catch-Up XP
-    RfabCoopProgression::LateJoinCatchUpTracker catchUp;
-    catchUp.MarkAlreadySyncedAtSessionStart(1u);
-    REQUIRE_FALSE(catchUp.EvaluateAndMark(1u, 12000, true).ShouldGrant);
+TEST_CASE("Late-join catch-up XP is counted per persistent identity, not per connection (M1)", "[rfab][phase3][progression][catchup]")
+{
+    using Credits = RfabCoopProgression::SharedXpCreditLedger;
 
-    const auto grant = catchUp.EvaluateAndMark(2u, 40000, true, 25000);
-    REQUIRE(grant.ShouldGrant);
-    REQUIRE(grant.GrantXpDelta == 25000); // Bounded!
-    // Reconnecting peer never double-receives catch-up XP!
-    REQUIRE_FALSE(catchUp.EvaluateAndMark(2u, 40000, true, 25000).ShouldGrant);
-    // Disabled setting grants nothing
-    REQUIRE_FALSE(catchUp.EvaluateAndMark(3u, 15000, false, 25000).ShouldGrant);
+    SECTION("players who were there are never paid; a player who was away is paid what was missed, once")
+    {
+        Credits credits;
+        int64_t total = 0;
+
+        // Two friends start a new world.
+        REQUIRE_FALSE(credits.EvaluateJoin("name:host", total, true).ShouldGrant);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:guest", total, true).ShouldGrant);
+
+        // 12000 XP while both are connected.
+        total += 12000;
+        credits.CreditConnected("name:host", 12000, total);
+        credits.CreditConnected("name:guest", 12000, total);
+
+        // A reconnect is a new connection id with the same identity: nothing is owed. The tracker
+        // this replaces paid up to the cap here, every time.
+        REQUIRE_FALSE(credits.EvaluateJoin("name:guest", total, true).ShouldGrant);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:host", total, true).ShouldGrant);
+
+        // The guest is away while the host earns 500.
+        total += 500;
+        credits.CreditConnected("name:host", 500, total);
+        const auto missed = credits.EvaluateJoin("name:guest", total, true);
+        REQUIRE(missed.ShouldGrant);
+        CHECK(missed.GrantXpDelta == 500);
+        CHECK(missed.ForfeitedXp == 0);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:guest", total, true).ShouldGrant);
+        CHECK(credits.GetCreditedXp("name:guest") == total);
+        CHECK(credits.GetCreditedXp("name:host") == total);
+    }
+
+    SECTION("a late joiner is paid the party total up to the cap, and the rest is forfeited")
+    {
+        Credits credits;
+        const auto late = credits.EvaluateJoin("name:late", 40000, true, 25000);
+        REQUIRE(late.ShouldGrant);
+        CHECK(late.GrantXpDelta == 25000);
+        CHECK(late.ForfeitedXp == 15000);
+        // Joining again cannot collect the forfeited part.
+        REQUIRE_FALSE(credits.EvaluateJoin("name:late", 40000, true, 25000).ShouldGrant);
+    }
+
+    SECTION("switched off nothing is paid, and switching it on later does not pay for that time")
+    {
+        Credits credits;
+        const auto off = credits.EvaluateJoin("name:other", 15000, false);
+        REQUIRE_FALSE(off.ShouldGrant);
+        CHECK(off.GrantXpDelta == 0);
+        CHECK(off.ForfeitedXp == 15000);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:other", 15000, true).ShouldGrant);
+    }
+
+    SECTION("a connection without a persistent identity is never owed anything")
+    {
+        Credits credits;
+        REQUIRE_FALSE(Credits::IsPersistentIdentity("pid:7"));
+        REQUIRE_FALSE(Credits::IsPersistentIdentity(""));
+        REQUIRE(Credits::IsPersistentIdentity("name:someone"));
+        REQUIRE(Credits::IsPersistentIdentity("discord:42"));
+        REQUIRE_FALSE(credits.EvaluateJoin("pid:7", 40000, true).ShouldGrant);
+        REQUIRE_FALSE(credits.EvaluateJoin("", 40000, true).ShouldGrant);
+        credits.CreditConnected("pid:7", 100, 40100);
+        CHECK(credits.GetCredits().empty());
+    }
+
+    SECTION("credits travel with the snapshot: a restart or a rollback changes nothing")
+    {
+        Credits credits;
+        (void)credits.EvaluateJoin("name:host", 0, true);
+        credits.CreditConnected("name:host", 9000, 9000);
+
+        Credits restored;
+        restored.Restore(credits.GetCredits(), credits.GetBaselineXp());
+        REQUIRE_FALSE(restored.EvaluateJoin("name:host", 9000, true).ShouldGrant);
+        const auto friendAfterRestart = restored.EvaluateJoin("name:friend", 9000, true);
+        CHECK(friendAfterRestart.GrantXpDelta == 9000);
+    }
+
+    SECTION("a checkpoint from before credits were tracked owes nobody the old total")
+    {
+        Credits legacy;
+        legacy.SetBaselineXp(30000); // the loader sets the baseline to the total it found
+        REQUIRE_FALSE(legacy.EvaluateJoin("name:host", 30000, true).ShouldGrant);
+        REQUIRE_FALSE(legacy.EvaluateJoin("name:guest", 30000, true).ShouldGrant);
+
+        // What is earned from now on is tracked normally.
+        legacy.CreditConnected("name:host", 1000, 31000);
+        const auto newcomer = legacy.EvaluateJoin("name:newcomer", 31000, true);
+        CHECK(newcomer.GrantXpDelta == 1000);
+    }
+
+    SECTION("a connected player that was never seen joining is level with the party")
+    {
+        Credits credits;
+        credits.CreditConnected("name:host", 700, 5700);
+        CHECK(credits.GetCreditedXp("name:host") == 5700);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:host", 5700, true).ShouldGrant);
+    }
+
+    SECTION("after a rollback a connected player missing from the restored credits is owed nothing")
+    {
+        Credits credits;
+        (void)credits.EvaluateJoin("name:host", 0, true);
+        credits.CreditConnected("name:host", 4000, 4000);
+        const auto atCheckpoint = credits.GetCredits();
+
+        // The guest joins after the checkpoint and is paid the 4000.
+        CHECK(credits.EvaluateJoin("name:guest", 4000, true).GrantXpDelta == 4000);
+
+        // Rollback to the checkpoint while both are connected.
+        credits.Restore(atCheckpoint, 0);
+        credits.LevelWithParty("name:host", 4000);
+        credits.LevelWithParty("name:guest", 4000);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:guest", 4000, true).ShouldGrant);
+
+        // It never lowers a credit and ignores connections without an identity.
+        credits.LevelWithParty("name:host", 100);
+        CHECK(credits.GetCreditedXp("name:host") == 4000);
+        credits.LevelWithParty("pid:9", 4000);
+        CHECK(credits.GetCredits().count("pid:9") == 0);
+    }
+
+    SECTION("a total that went backwards pays nothing and does not lower a credit")
+    {
+        Credits credits;
+        (void)credits.EvaluateJoin("name:host", 0, true);
+        credits.CreditConnected("name:host", 8000, 8000);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:host", 5000, true).ShouldGrant);
+        CHECK(credits.GetCreditedXp("name:host") == 8000);
+    }
 }
 
 TEST_CASE("3C RFAB World Immersion: Mount Ownership, Personal Blessings/CrimeGold, and TrueHUD Synergy", "[rfab][phase3][immersion]")

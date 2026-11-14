@@ -104,6 +104,7 @@
 // v4.1.0: the self-healing switch lives in GameServer.cpp; the harness flips it like an operator would.
 extern Console::Setting<bool> bEnableSelfHealingResync;
 extern Console::Setting<bool> bEnableServerOwnedWorldItems;
+extern Console::Setting<bool> bEnableLateJoinCatchUpXp;
 
 namespace
 {
@@ -1967,6 +1968,133 @@ int main(int argc, char** argv)
             Check(!coord.IsEncounterActiveWithLivingParticipants(),
                   "RemovePlayer clears active encounter state when last participant disconnects");
         }
+    }
+
+    // Scene 9: catch-up XP is counted per persistent player identity, never per connection (M1).
+    // Every step goes through the real join path and the real XP packet; the amounts are read from
+    // what the server actually sent to the joining connection.
+    {
+        std::printf("[scene 9] late-join catch-up XP: per identity, never per connection\n");
+        const auto storePath = SaveSnapshotService::GetDefaultCheckpointStorePath();
+        std::filesystem::remove(storePath, removeEc);
+
+        const auto joinAs = [](World& aWorld, TiltedPhoques::ConnectionId_t aConn, const char* acName) {
+            Player* pPlayer = aWorld.GetPlayerManager().Create(aConn);
+            if (acName != nullptr)
+                pPlayer->SetUsername(acName);
+            TimeModel joinTime{};
+            joinTime.Time = 8.0f;
+            joinTime.Day = 1;
+            joinTime.Month = 1;
+            joinTime.Year = 201;
+            Harness::ClearOutbox();
+            aWorld.GetDispatcher().trigger(PlayerJoinEvent{pPlayer, {}, {}, DateTime{joinTime}});
+            return pPlayer;
+        };
+        const auto leave = [](World& aWorld, Player* apPlayer) {
+            aWorld.GetDispatcher().trigger(PlayerLeaveEvent{apPlayer});
+            aWorld.GetPlayerManager().Remove(apPlayer);
+        };
+        const auto earn = [](World& aWorld, Player* apPlayer, const char* acSource, int32_t aXp) {
+            SyncRfabProgressionEvent grant{};
+            grant.Kind = SyncRfabProgressionEvent::EventKind::LedgerXpGrant;
+            grant.EpochId = aWorld.GetSaveSnapshotService().GetCurrentWorldEpoch();
+            grant.SourceKey = acSource;
+            grant.XpDelta = aXp;
+            return DeliverWire(aWorld, grant, apPlayer);
+        };
+        // Catch-up XP the server sent to this connection since the outbox was last cleared.
+        const auto catchUpSentTo = [](TiltedPhoques::ConnectionId_t aConn) {
+            int64_t total = 0;
+            for (const auto& message : DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(aConn))
+                if (message.Kind == NotifyRfabProgressionEvent::EventKind::LateJoinCatchUpXp)
+                    total += message.XpDelta;
+            return total;
+        };
+
+        bEnableLateJoinCatchUpXp = true;
+        {
+            GameServer server{registry};
+            World& world = server.GetWorld();
+            auto& ledger = world.GetRfabProgressionService().GetLedger();
+
+            Player* pHost = joinAs(world, 0x9001u, "HostS9");
+            Check(catchUpSentTo(0x9001u) == 0, "the first player of a new world is owed nothing");
+            Player* pGuest = joinAs(world, 0x9002u, "GuestS9");
+            Check(catchUpSentTo(0x9002u) == 0, "a player who joins before any XP is earned is owed nothing");
+
+            Check(earn(world, pHost, "s9-kill-1", 1000) && ledger.GetTotalSharedXp() == 1000, "the party earns 1000 XP while both are connected");
+
+            // The defect: Player::GetId() is new on every connection, so this paid 1000 again.
+            leave(world, pGuest);
+            pGuest = joinAs(world, 0x9003u, "GuestS9");
+            Check(catchUpSentTo(0x9003u) == 0, "a reconnect pays nothing to a player who was there when the XP was earned");
+
+            leave(world, pGuest);
+            Check(earn(world, pHost, "s9-kill-2", 500) && ledger.GetTotalSharedXp() == 1500, "the host earns 500 XP while the guest is away");
+            pGuest = joinAs(world, 0x9004u, "  guests9 ");
+            Check(catchUpSentTo(0x9004u) == 500, "the returning guest is paid exactly what was earned while away (name compared without case and padding)");
+            leave(world, pGuest);
+            pGuest = joinAs(world, 0x9005u, "GuestS9");
+            Check(catchUpSentTo(0x9005u) == 0, "and is not paid for it a second time");
+
+            Player* pLate = joinAs(world, 0x9006u, "LateS9");
+            Check(catchUpSentTo(0x9006u) == 1500, "a friend who joins the campaign late is paid the party total");
+            Harness::ClearOutbox();
+            world.GetDispatcher().trigger(PlayerJoinEvent{pLate});
+            Check(catchUpSentTo(0x9006u) == 0, "a second join event for the same connection pays nothing");
+
+            joinAs(world, 0x9007u, nullptr);
+            Check(catchUpSentTo(0x9007u) == 0, "a connection without a name or Discord id has no persistent identity and is owed nothing");
+
+            // A checkpoint carries the credits together with the total.
+            auto& saves = world.GetSaveSnapshotService();
+            auto& coordinator = saves.GetCoordinator();
+            Check(saves.TriggerCoordinatedSave(true, nullptr), "a checkpoint starts");
+            if (const auto pending = coordinator.GetPendingBarrier(); pending.has_value())
+            {
+                std::vector<Player*> connected;
+                world.GetPlayerManager().ForEach([&](Player* apPlayer) { connected.push_back(apPlayer); });
+                for (Player* pPlayer : connected)
+                {
+                    CoordinatedSaveAck ack{};
+                    ack.EpochId = pending->EpochId;
+                    ack.SlotName = String(pending->SlotName.c_str());
+                    ack.Success = true;
+                    Deliver(world, ack, pPlayer);
+                }
+            }
+            Check(!coordinator.HasPendingBarrier() && saves.GetSnapshotCount() == 1, "the checkpoint is committed");
+            Check(saves.SaveCheckpointsToDisk(storePath), "the checkpoint is written");
+        }
+
+        // The other half of the defect: after a restart the tracker was empty, so every player who
+        // had been there all along was paid up to the cap on the first join.
+        {
+            GameServer restarted{registry};
+            World& world = restarted.GetWorld();
+            const auto& ledger = world.GetRfabProgressionService().GetLedger();
+            Check(ledger.GetTotalSharedXp() == 1500, "the restarted server restores the party total");
+            Check(ledger.GetXpCredits().GetCreditedXp("name:hosts9") == 1500 && ledger.GetXpCredits().GetCreditedXp("name:guests9") == 1500,
+                  "the restarted server restores who already holds the shared XP");
+
+            joinAs(world, 0x9101u, "HostS9");
+            Check(catchUpSentTo(0x9101u) == 0, "a server restart pays nothing to a player who was there all along");
+            joinAs(world, 0x9102u, "NewAfterRestartS9");
+            Check(catchUpSentTo(0x9102u) == 1500, "a new friend joining after the restart is paid the party total once");
+
+            // Switched off, nothing is paid - and switching it on later does not pay for that time.
+            bEnableLateJoinCatchUpXp = false;
+            Player* pOff = joinAs(world, 0x9103u, "OffS9");
+            Check(catchUpSentTo(0x9103u) == 0, "with Gameplay:bEnableLateJoinCatchUpXp off a late joiner is paid nothing");
+            leave(world, pOff);
+            bEnableLateJoinCatchUpXp = true;
+            joinAs(world, 0x9104u, "OffS9");
+            Check(catchUpSentTo(0x9104u) == 0, "switching the setting on later does not pay for the time it was off");
+        }
+
+        bEnableLateJoinCatchUpXp = false;
+        std::filesystem::remove(storePath, removeEc);
     }
 
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures,
