@@ -74,6 +74,12 @@ Decision Claim(const Lease& acCurrent, const Subject& acSubject, const OwnerStat
     if (acChallenger.IsDowned)
         return Unchanged(acCurrent, Outcome::kDeniedChallengerDowned);
 
+    // Active RFAB boss / dragon phase lock: while the current owner is alive, in range,
+    // and its lease has not expired, never rip authority away (even for a party leader)
+    // so SetGhost / arena barrier / multi-phase boss scripts cannot stall mid-transition.
+    if (acSubject.IsBossEncounterLocked)
+        return Unchanged(acCurrent, Outcome::kDeniedBossEncounterLocked);
+
     if (!acChallenger.IsPartyLeader && acCurrent.HeldForMs(aNowMs) < acPolicy.MinHoldMs)
         return Unchanged(acCurrent, Outcome::kDeniedHoldWindow);
 

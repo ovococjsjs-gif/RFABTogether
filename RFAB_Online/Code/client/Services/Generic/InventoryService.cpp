@@ -135,7 +135,10 @@ void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEven
             if (pExt->IsRemote() && !pTargetActor->IsDead())
             {
                 auto* pUi = UI::Get();
-                if (!pUi || !pUi->GetMenuOpen(BSFixedString("ContainerMenu")))
+                const bool interactiveLootOpen =
+                    pUi && (pUi->GetMenuOpen(BSFixedString("ContainerMenu")) ||
+                            pUi->GetMenuOpen(BSFixedString("LootMenu")));
+                if (!interactiveLootOpen)
                     return;
             }
         }
@@ -143,7 +146,18 @@ void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEven
 
     const entt::entity targetEntity = m_world.GetCharacterService().FindAnyEntityByFormId(acEvent.FormId);
     if (targetEntity == entt::null)
+    {
+        // QuickLootIE (`LootMenu`) and RFAB AutoLoot (`RFAB_MCM_Settings.json`) remove items from
+        // world containers directly without calling `TESObjectREFR::Activate`. Register the chest
+        // on demand and buffer the delta so server anti-dupe & peer sync still execute cleanly!
+        if (TESObjectREFR* pContainer = Cast<TESObjectREFR>(TESForm::GetById(acEvent.FormId));
+            pContainer && pContainer->baseForm && pContainer->baseForm->formType == FormType::Container)
+        {
+            m_world.GetObjectService().RequestContainerSyncForLoot(
+                pContainer, acEvent.Item, acEvent.Drop, acEvent.UpdateClients);
+        }
         return;
+    }
 
     const bool isLeader = m_world.GetPartyService().IsLeader(); // Helps distinguish in 2-party logs
     if (auto* pWaitingAssign = m_world.try_get<WaitingForAssignmentComponent>(targetEntity))

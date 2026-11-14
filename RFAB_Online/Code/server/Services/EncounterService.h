@@ -174,6 +174,19 @@ public:
                 ++it;
             }
         }
+
+        if (m_players.empty())
+        {
+            m_encounterActive = false;
+            m_bossDefeatedInCurrentEncounter = false;
+            m_combatClearSinceMs.reset();
+            m_wipeStartedAtMs.reset();
+        }
+        else if (CountDownedPlayers() == 0)
+        {
+            m_wipeStartedAtMs.reset();
+        }
+
         return cancelledTargets;
     }
 
@@ -192,6 +205,22 @@ public:
 
         if (DistanceMeters(reviverIt->second, targetIt->second) > m_config.ReviveMaxDistanceMeters)
             return false;
+
+        // Preserve an in-flight revive channel if another standing ally is already actively reviving
+        // the same target within range — prevents a second ally pressing E from resetting the 4s timer!
+        if (const auto existingIt = m_channelsByTarget.find(aTargetId); existingIt != m_channelsByTarget.end())
+        {
+            const uint32_t existingReviverId = existingIt->second.ReviverPlayerId;
+            if (existingReviverId == aReviverId)
+                return true;
+            const auto existingReviverIt = m_players.find(existingReviverId);
+            if (existingReviverIt != m_players.end() &&
+                !existingReviverIt->second.IsDowned &&
+                DistanceMeters(existingReviverIt->second, targetIt->second) <= m_config.ReviveMaxDistanceMeters)
+            {
+                return false;
+            }
+        }
 
         const uint64_t durationMs = static_cast<uint64_t>(std::max(0.25f, m_config.ReviveDurationSec) * 1000.0f);
         m_channelsByTarget[aTargetId] = ActiveReviveChannel{

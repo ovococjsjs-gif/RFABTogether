@@ -305,6 +305,13 @@ inline std::string Po3Tweaks(std::string_view aOriginal)
 {
     return SetIniValue(aOriginal, "Fixes", "Load EditorIDs", "true");
 }
+
+inline std::string RfabPluginIni(std::string_view aOriginal)
+{
+    // Stock RFAB.ini ships with `bAlwaysActive=false`, which freezes the game loop on Alt-Tab,
+    // causing stale simulation keepalives, NPC lease revocations, and coordinated save timeouts.
+    return SetIniValue(aOriginal, "General", "bAlwaysActive", "true");
+}
 } // namespace Transforms
 
 inline constexpr std::string_view kEngineFixesKeys[] = {
@@ -322,6 +329,7 @@ inline constexpr std::string_view kSkyrimSoulsKeys[] = {
 inline constexpr std::string_view kRfabAutosaveKeys[] = {
     "enabled", "enable autosave", "save in combat", "save after combat", "save on location change", "save on sleep/wait"};
 inline constexpr std::string_view kPo3TweaksKeys[] = {"load editorids"};
+inline constexpr std::string_view kRfabPluginIniKeys[] = {"balwaysactive"};
 
 inline bool Rule::IsManagedKey(std::string_view aKey) const noexcept
 {
@@ -342,7 +350,7 @@ inline bool Rule::IsManagedKey(std::string_view aKey) const noexcept
     return false;
 }
 
-inline constexpr size_t kRuleCount = 5;
+inline constexpr size_t kRuleCount = 6;
 
 inline const std::array<Rule, kRuleCount>& GetRules() noexcept
 {
@@ -359,6 +367,9 @@ inline const std::array<Rule, kRuleCount>& GetRules() noexcept
          std::size(kRfabAutosaveKeys)},
         {"po3-tweaks", "SKSE/Plugins/po3_Tweaks.ini", RuleKind::kOverlay, &Transforms::Po3Tweaks,
          "the client matches items and spells by editor id", kPo3TweaksKeys, std::size(kPo3TweaksKeys)},
+        {"rfab-ini", "RFAB.ini", RuleKind::kOverlay, &Transforms::RfabPluginIni,
+         "keeps the game loop active while Alt-Tabbed so network keepalives, NPC leases, and coordinated saves do not stall",
+         kRfabPluginIniKeys, std::size(kRfabPluginIniKeys)},
         {"betterstealing", "NetScriptFramework/Plugins/BetterStealing.dll", RuleKind::kHide, nullptr,
          ".NET plugin patches the add-item prologues (SE 36525/19282) the client hooks; NetScriptFramework logs and "
          "skips a plugin it cannot open"},

@@ -3,6 +3,7 @@
 #include <Events/PacketEvent.h>
 #include <Structs/ActorData.h>
 #include <CoopWorldView.h>
+#include <common/RfabWorldImmersion.h>
 #include <common/Session/Resync.h>
 #include <unordered_set>
 
@@ -65,6 +66,8 @@ struct CharacterService
         float aCurrentHealth = 0.0f,
         float aMaxHealth = 0.0f) const noexcept;
     [[nodiscard]] const CoopWorldView::ServerInterestRegistry& GetInterestRegistry() const noexcept { return m_interestRegistry; }
+    [[nodiscard]] const RfabWorldImmersion::MountOwnershipGuard& GetMountGuard() const noexcept { return m_mountGuard; }
+    [[nodiscard]] RfabWorldImmersion::MountOwnershipGuard& GetMountGuard() noexcept { return m_mountGuard; }
     void NotePlayerSimulationActivity(Player* apPlayer, uint64_t aNowMs) const noexcept;
     void SweepExpiredWorldNpcLeases(uint64_t aNowMs) const noexcept;
 
@@ -109,6 +112,7 @@ private:
     mutable CoopWorldView::ServerInterestRegistry m_interestRegistry{};
     mutable std::unordered_map<uint64_t, entt::entity> m_characterByFormKey{};
     mutable std::unordered_map<uint32_t, uint64_t> m_lastPlayerSimulationActivityMs{};
+    mutable RfabWorldImmersion::MountOwnershipGuard m_mountGuard{};
     mutable uint64_t m_lastWakeSweepMs{0};
     mutable uint64_t m_lastExpiredLeaseSweepMs{0};
 

@@ -53,13 +53,16 @@
 #include <Messages/ClientMessageFactory.h>
 #include <Messages/ClientReferencesMoveRequest.h>
 #include <Messages/CoordinatedSaveAck.h>
+#include <Messages/MountRequest.h>
 #include <Messages/NotifyActorValueChanges.h>
 #include <Messages/NotifyDeathStateChange.h>
 #include <Messages/NotifyHealthChangeBroadcast.h>
+#include <Messages/NotifyMount.h>
 #include <Messages/NotifyOwnershipTransfer.h>
 #include <Messages/NotifyRelinquishControl.h>
 #include <Messages/NotifyRemoveCharacter.h>
 #include <Messages/NotifyResyncComplete.h>
+#include <Messages/NotifyRfabProgressionEvent.h>
 #include <Messages/NotifySpawnData.h>
 #include <Messages/RequestActorValueChanges.h>
 #include <Messages/RequestDeathStateChange.h>
@@ -68,6 +71,7 @@
 #include <Messages/RequestOwnershipClaim.h>
 #include <Messages/RequestOwnershipTransfer.h>
 #include <Messages/RequestResync.h>
+#include <Messages/SyncRfabProgressionEvent.h>
 #include <Messages/NotifyInventoryChanges.h>
 #include <Messages/NotifyWorldItemDespawn.h>
 #include <Messages/NotifyWorldItemSnapshot.h>
@@ -1743,6 +1747,225 @@ int main(int argc, char** argv)
             bossGhostLive.GlobalValue = 1.0f;
             Check(DeliverWire(world, bossGhostLive, pPlayer), "P1.1 boss_ghost with valid non-zero bossServerId delivers cleanly");
             world.destroy(bossEntity);
+        }
+    }
+
+    // Scene 8: Phase 3 RFAB Deep Adaptation end-to-end server verification
+    // (Boss Lease Lock, Shared Dragon Souls, Word Walls, Difficulty/Cursed Handshake,
+    //  Personal Blessing/CrimeGold Isolation, and Mount Hijack / Saddlebag Anti-Dupe).
+    {
+        std::printf("[scene 8] Phase 3 RFAB Deep Adaptation (Boss Lock, Souls, WordWalls, Difficulty, Blessings, Mounts)\n");
+        Harness::ClearOutbox();
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0x8001u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0x8002u;
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        pHost->SetUsername("HostP3");
+        pGuest->SetUsername("GuestP3");
+
+        const CellIdComponent kCell{GameId{0u, 0x000165A8u}, GameId{0u, 0x0000003Cu}, GridCellCoords{0, 0}};
+        pHost->SetCellComponent(kCell);
+        pGuest->SetCellComponent(kCell);
+
+        const entt::entity hostChar = world.create();
+        pHost->SetCharacter(hostChar);
+        world.emplace<OwnerComponent>(hostChar, pHost);
+        world.emplace<CellIdComponent>(hostChar, kCell);
+        auto& hostComp = world.emplace<CharacterComponent>(hostChar);
+        hostComp.SetPlayer(true);
+
+        const entt::entity guestChar = world.create();
+        pGuest->SetCharacter(guestChar);
+        world.emplace<OwnerComponent>(guestChar, pGuest);
+        world.emplace<CellIdComponent>(guestChar, kCell);
+        auto& guestComp = world.emplace<CharacterComponent>(guestChar);
+        guestComp.SetPlayer(true);
+
+        const uint64_t epoch = world.GetSaveSnapshotService().GetCurrentWorldEpoch();
+
+        // 8.1 Boss Lease Lock: Host locks a boss -> Guest claim is rejected until unlocked!
+        {
+            const entt::entity boss = world.create();
+            const uint32_t bossId = World::ToInteger(boss);
+            world.emplace<OwnerComponent>(boss, pHost);
+            world.emplace<CellIdComponent>(boss, kCell);
+            world.emplace<CharacterComponent>(boss);
+
+            SyncRfabProgressionEvent lockReq{};
+            lockReq.Kind = SyncRfabProgressionEvent::EventKind::BossEncounterSync;
+            lockReq.EpochId = epoch;
+            lockReq.SourceKey = "boss_lock";
+            lockReq.XpDelta = static_cast<int32_t>(bossId);
+            lockReq.GlobalValue = 1.0f;
+            Check(DeliverWire(world, lockReq, pHost), "boss_lock packet accepted by server");
+            Check(world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(bossId),
+                  "boss entity is marked locked in progression ledger");
+
+            Harness::ClearOutbox();
+            RequestOwnershipClaim steal{};
+            steal.ServerId = bossId;
+            Check(DeliverWire(world, steal, pGuest), "guest claim on locked boss processed");
+            Check(world.get<OwnerComponent>(boss).GetOwner() == pHost,
+                  "locked boss stays owned by simulating Host");
+            Check(!DecodeOutboxMessagesFor<NotifyRelinquishControl>(kGuestConn).empty(),
+                  "guest receives NotifyRelinquishControl rejecting locked boss claim");
+
+            world.GetRfabProgressionService().GetLedger().ClearBossGhostState(bossId);
+            Check(!world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(bossId),
+                  "ClearBossGhostState releases boss encounter lock on boss death");
+            world.destroy(boss);
+        }
+
+        // 8.2 Shared Dragon Souls & Word Walls + deduplication
+        {
+            Harness::ClearOutbox();
+            SyncRfabProgressionEvent dragonKill{};
+            dragonKill.Kind = SyncRfabProgressionEvent::EventKind::DragonSoulSync;
+            dragonKill.EpochId = epoch;
+            dragonKill.BookId = GameId{0u, 0x0001CA03u};
+            dragonKill.XpDelta = 777;
+            Check(DeliverWire(world, dragonKill, pHost), "DragonSoulSync packet delivered");
+            const auto guestSouls = DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kGuestConn);
+            Check(guestSouls.size() == 1 && guestSouls[0].Kind == NotifyRfabProgressionEvent::EventKind::DragonSoulSync &&
+                      guestSouls[0].XpDelta == 1,
+                  "peer receives +1 shared Dragon Soul on unique dragon kill");
+
+            // Duplicate dragon kill report must NOT grant a 2nd soul!
+            Harness::ClearOutbox();
+            Check(DeliverWire(world, dragonKill, pGuest), "duplicate DragonSoulSync delivered");
+            Check(DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kHostConn).empty() &&
+                      DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kGuestConn).empty(),
+                  "duplicate DragonSoulSync does not double-grant souls");
+
+            // Word Wall sync + dedupe
+            Harness::ClearOutbox();
+            SyncRfabProgressionEvent wordLearn{};
+            wordLearn.Kind = SyncRfabProgressionEvent::EventKind::WordWallSync;
+            wordLearn.EpochId = epoch;
+            wordLearn.BookId = GameId{0u, 0x00013E22u};
+            Check(DeliverWire(world, wordLearn, pHost), "WordWallSync delivered");
+            const auto guestWords = DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kGuestConn);
+            Check(guestWords.size() == 1 && guestWords[0].Kind == NotifyRfabProgressionEvent::EventKind::WordWallSync &&
+                      guestWords[0].BookId == GameId{0u, 0x00013E22u},
+                  "peer receives newly discovered Word Wall");
+        }
+
+        // 8.3 RFAB_StartMenu Difficulty & Cursed Handshake mismatch detection
+        {
+            Harness::ClearOutbox();
+            SyncRfabProgressionEvent hostDiff{};
+            hostDiff.Kind = SyncRfabProgressionEvent::EventKind::DifficultyHandshakeSync;
+            hostDiff.EpochId = epoch;
+            hostDiff.XpDelta = RfabCoopProgression::PackDifficultyHandshake(
+                RfabCoopProgression::RfabDifficultyTier::kLegend, true); // Legend + Cursed
+            hostDiff.GlobalValue = 2.0f;
+            Check(DeliverWire(world, hostDiff, pHost), "Host DifficultyHandshakeSync delivered");
+
+            Harness::ClearOutbox();
+            SyncRfabProgressionEvent guestDiff{};
+            guestDiff.Kind = SyncRfabProgressionEvent::EventKind::DifficultyHandshakeSync;
+            guestDiff.EpochId = epoch;
+            guestDiff.XpDelta = RfabCoopProgression::PackDifficultyHandshake(
+                RfabCoopProgression::RfabDifficultyTier::kDovahkiin, false); // Dovahkiin, not cursed
+            guestDiff.GlobalValue = 1.0f;
+            Check(DeliverWire(world, guestDiff, pGuest), "Guest DifficultyHandshakeSync delivered");
+
+            const auto warnings = DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kGuestConn);
+            Check(warnings.size() == 1 && warnings[0].EditorId == "mismatch",
+                  "Guest with mismatched RFAB Difficulty/Cursed receives mismatch warning");
+        }
+
+        // 8.4 Personal Blessing & CrimeGold Global isolation
+        {
+            Harness::ClearOutbox();
+            SyncRfabProgressionEvent crimeGlobal{};
+            crimeGlobal.Kind = SyncRfabProgressionEvent::EventKind::GlobalValueSync;
+            crimeGlobal.EpochId = epoch;
+            crimeGlobal.EditorId = "RFAB_SaveBlessing";
+            crimeGlobal.GlobalValue = 1.0f;
+            Check(DeliverWire(world, crimeGlobal, pHost), "personal SaveBlessing global packet processed");
+            Check(DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kGuestConn).empty(),
+                  "personal SaveBlessing/CrimeGold global is NEVER replicated to teammates");
+        }
+
+        // 8.5 Mount Hijack & Saddlebag Anti-Dupe protection
+        {
+            const entt::entity horse = world.create();
+            const uint32_t horseId = World::ToInteger(horse);
+            world.emplace<OwnerComponent>(horse, pHost);
+            world.emplace<CellIdComponent>(horse, kCell);
+            auto& horseChar = world.emplace<CharacterComponent>(horse);
+            horseChar.SetMount(true);
+            world.emplace<InventoryComponent>(horse);
+
+            Inventory::Entry apple{};
+            apple.BaseId = GameId{0u, 0x00064B2Eu};
+            apple.Count = 5;
+            world.get<InventoryComponent>(horse).Content.AddOrRemoveEntry(apple);
+
+            // Host mounts the horse
+            MountRequest hostMount{};
+            hostMount.RiderId = World::ToInteger(hostChar);
+            hostMount.MountId = horseId;
+            Check(DeliverWire(world, hostMount, pHost), "Host mounts horse cleanly");
+            Check(world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseId) == pHost->GetId(),
+                  "MountGuard binds horse to Host while mounted");
+
+            // Guest tries to hijack the horse mid-ride -> rejected!
+            Harness::ClearOutbox();
+            MountRequest guestHijack{};
+            guestHijack.RiderId = World::ToInteger(guestChar);
+            guestHijack.MountId = horseId;
+            Check(DeliverWire(world, guestHijack, pGuest), "Guest hijack attempt processed");
+            Check(world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseId) == pHost->GetId(),
+                  "Guest cannot hijack an actively ridden horse");
+            Check(world.get<OwnerComponent>(horse).GetOwner() == pHost,
+                  "Horse ownership remains with Host rider");
+
+            // Guest tries to steal from Host's horse saddlebag -> rejected!
+            Inventory::Entry stealApple{};
+            stealApple.BaseId = apple.BaseId;
+            stealApple.Count = -1;
+            Check(!world.GetInventoryService().ApplyInventoryDelta(pGuest, horseId, stealApple, false, false, true),
+                  "Bystander saddlebag mutation is blocked while Host owns/rides horse");
+
+            // Host dismounts -> Guest can now mount cleanly!
+            MountRequest hostDismount{};
+            hostDismount.RiderId = World::ToInteger(hostChar);
+            hostDismount.MountId = 0;
+            Check(DeliverWire(world, hostDismount, pHost), "Host dismounts cleanly");
+            Check(world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseId) == 0u,
+                  "MountGuard releases horse immediately upon dismount");
+
+            Check(DeliverWire(world, guestHijack, pGuest), "Guest can mount horse after Host dismounts");
+            Check(world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseId) == pGuest->GetId(),
+                  "MountGuard transfers active rider to Guest after dismount");
+        }
+
+        // 8.6 EncounterCoordinator edge-case hardening (duplicate revive anti-reset + last-player disconnect cleanup)
+        {
+            EncounterCoordinator coord{};
+            coord.UpdatePlayerCombatReport(1, true, 1, 5.0f, false, 0.f, 0.f, 0.f, 1000ULL);
+            coord.UpdatePlayerCombatReport(2, true, 1, 5.0f, false, 1.f, 0.f, 0.f, 1000ULL);
+            coord.UpdatePlayerCombatReport(3, true, 1, 5.0f, false, 1.5f, 0.f, 0.f, 1000ULL);
+
+            Check(coord.SetPlayerDowned(1, true, 0.f, 0.f, 0.f, 1, 1100ULL), "Player 1 downed");
+            Check(coord.TryStartAllyRevive(2, 1, 2000ULL), "Ally 2 starts reviving Player 1");
+            // Ally 3 pressing E at 4500ms MUST NOT reset Ally 2's 4000ms timer!
+            Check(!coord.TryStartAllyRevive(3, 1, 4500ULL), "Second ally cannot reset an active in-progress revive channel");
+            const auto tickDone = coord.Tick(6100ULL);
+            Check(tickDone.CompletedAllyRevives.size() == 1 && tickDone.CompletedAllyRevives[0].first == 2u,
+                  "Ally 2's revive completes on original schedule without timer reset");
+
+            // All players leave -> encounter state fully resets cleanly
+            (void)coord.RemovePlayer(1);
+            (void)coord.RemovePlayer(2);
+            (void)coord.RemovePlayer(3);
+            Check(!coord.IsEncounterActiveWithLivingParticipants(),
+                  "RemovePlayer clears active encounter state when last participant disconnects");
         }
     }
 

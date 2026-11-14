@@ -454,7 +454,16 @@ bool BGSSaveLoadManager::VerifySavedSlotOnDisk(const char* acpFileName) noexcept
         if (resolved.empty())
             return false;
 
-        return RfabCompat::Detail::IsValidEssFileOnDisk(resolved);
+        const auto pairCheck = RfabCompat::Detail::ValidateSaveSlotPairOnDisk(resolved, false);
+        if (pairCheck != RfabCompat::Detail::SavePairValidationResult::kOk)
+        {
+            spdlog::warn(
+                "[RFAB SaveLoad] Slot '{}' failed atomic .ess+.skse validation (status={})",
+                acpFileName, static_cast<int>(pairCheck));
+            return false;
+        }
+
+        return true;
     }
     catch (...)
     {

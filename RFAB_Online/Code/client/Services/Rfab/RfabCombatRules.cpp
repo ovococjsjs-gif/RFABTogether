@@ -443,14 +443,53 @@ void RfabCombatRules::PollBossEncounterState(
             continue;
 
         Actor* pActor = Cast<Actor>(TESForm::GetById(formIdComp.Id));
-        if (!pActor || pActor->IsDead())
+        if (!pActor)
             continue;
 
         const uint32_t serverId = localComp.Id;
+        if (pActor->IsDead())
+        {
+            if (m_lockedBossServerIds.erase(serverId) > 0)
+            {
+                SyncRfabProgressionEvent unlockEv{};
+                unlockEv.Kind = SyncRfabProgressionEvent::EventKind::BossEncounterSync;
+                unlockEv.EpochId = aWorldEpoch;
+                unlockEv.SourceKey = String("boss_lock");
+                unlockEv.XpDelta = static_cast<int32_t>(serverId);
+                unlockEv.GlobalValue = 0.0f;
+                aTransport.Send(unlockEv);
+            }
+
+            if (pActor->IsDragon() && m_reportedDragonSoulServerIds.insert(serverId).second)
+            {
+                GameId dragonFormId{};
+                aWorld.GetModSystem().GetServerModId(formIdComp.Id, dragonFormId);
+                SyncRfabProgressionEvent soulEv{};
+                soulEv.Kind = SyncRfabProgressionEvent::EventKind::DragonSoulSync;
+                soulEv.EpochId = aWorldEpoch;
+                soulEv.BookId = dragonFormId;
+                soulEv.XpDelta = static_cast<int32_t>(serverId);
+                aTransport.Send(soulEv);
+            }
+            continue;
+        }
+
         const auto prevIt = m_lastBossGhostByServerId.find(serverId);
         const bool wasTracked = (prevIt != m_lastBossGhostByServerId.end());
+        const bool isBoss = wasTracked || IsBossActor(pActor, acResolver);
 
-        if (!wasTracked && !IsBossActor(pActor, acResolver) && !pActor->IsGhost())
+        if (isBoss && pActor->IsInCombat() && m_lockedBossServerIds.insert(serverId).second)
+        {
+            SyncRfabProgressionEvent lockEv{};
+            lockEv.Kind = SyncRfabProgressionEvent::EventKind::BossEncounterSync;
+            lockEv.EpochId = aWorldEpoch;
+            lockEv.SourceKey = String("boss_lock");
+            lockEv.XpDelta = static_cast<int32_t>(serverId);
+            lockEv.GlobalValue = 1.0f;
+            aTransport.Send(lockEv);
+        }
+
+        if (!isBoss && !pActor->IsGhost())
             continue;
 
         const bool isGhost = pActor->IsGhost();

@@ -650,6 +650,8 @@ void TESObjectREFR::GetItemFromExtraData(Inventory::Entry& arEntry, ExtraDataLis
     arEntry.ExtraWornLeft = apExtraDataList->Contains(ExtraDataType::WornLeft);
 
     arEntry.IsQuestItem = apExtraDataList->HasQuestObjectAlias();
+
+    CoopCraftedItems::NormalizeCraftedEntry(arEntry);
 }
 
 void TESObjectREFR::ApplyItemExtraData(ExtraDataList* apExtraDataList, const Inventory::Entry& arEntry, bool aIncludeWorn) noexcept

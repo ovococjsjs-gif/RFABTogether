@@ -89,11 +89,18 @@ public:
         World& aWorld,
         const NotifyRfabProgressionEvent& acMessage) noexcept;
 
-    void ResetBossTracking() noexcept { m_lastBossGhostByServerId.clear(); }
+    void ResetBossTracking() noexcept
+    {
+        m_lastBossGhostByServerId.clear();
+        m_lockedBossServerIds.clear();
+        m_reportedDragonSoulServerIds.clear();
+    }
 
 private:
     int32_t m_savedAllyHitNonCombatAllowed{3};
     int32_t m_savedAllyHitCombatAllowed{1000};
     bool m_hasSavedAllyHitSettings{false};
     std::unordered_map<uint32_t, bool> m_lastBossGhostByServerId{};
+    std::unordered_set<uint32_t> m_lockedBossServerIds{};
+    std::unordered_set<uint32_t> m_reportedDragonSoulServerIds{};
 };

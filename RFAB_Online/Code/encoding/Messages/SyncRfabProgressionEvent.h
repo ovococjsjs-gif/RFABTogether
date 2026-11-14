@@ -15,6 +15,9 @@ struct SyncRfabProgressionEvent final : ClientMessage
         AllyProtectionSync = 3,
         BossEncounterSync = 4,
         TacticalPingSync = 5,
+        DragonSoulSync = 6,
+        WordWallSync = 7,
+        DifficultyHandshakeSync = 8,
     };
 
     SyncRfabProgressionEvent()

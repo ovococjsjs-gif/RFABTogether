@@ -665,6 +665,111 @@ inline bool IsValidEssFileOnDisk(const std::filesystem::path& acEssPath) noexcep
     return true;
 }
 
+enum class SavePairValidationResult : uint8_t
+{
+    kOk = 0,
+    kMissingEss = 1,
+    kCorruptEss = 2,
+    kMissingSkse = 3,
+    kCorruptSkse = 4,
+};
+
+[[nodiscard]] inline std::filesystem::path DeriveSkseCosavePath(const std::filesystem::path& acEssPath)
+{
+    if (acEssPath.empty())
+        return {};
+    std::filesystem::path cosave = acEssPath;
+    cosave.replace_extension(".skse");
+    return cosave;
+}
+
+// Validates an SKSE64 co-save file header (".skse" companion to ".ess").
+// SKSE64 binary layout (skse64/Serialization.cpp):
+//   [0..3]   "SKSE" (0x45534B53 LE — stored as ASCII bytes 'S','K','S','E')
+//   [4..7]   uint32_t formatVersion (>= 1)
+//   [8..11]  uint32_t skseVersion   (non-zero, e.g. 0x02001400 for 2.0.20)
+//   [12..15] uint32_t runtimeVersion (non-zero, e.g. 0x01050610 for 1.5.97)
+//   [16..19] uint32_t numPlugins    (<= 4096)
+// Rejects 0-byte, truncated, or corrupted co-saves so CustomSkills / StorageUtil / JContainers
+// / MCMHelper never silently deserialize partial state after a mid-write crash.
+[[nodiscard]] inline bool IsValidSkseCosaveOnDisk(const std::filesystem::path& acSksePath) noexcept
+{
+    std::error_code ec;
+    if (acSksePath.empty() || !std::filesystem::exists(acSksePath, ec) || !std::filesystem::is_regular_file(acSksePath, ec))
+        return false;
+
+    const auto fileSize = std::filesystem::file_size(acSksePath, ec);
+    if (ec || fileSize < 20ULL)
+        return false;
+
+    std::ifstream ifs(acSksePath, std::ios::binary);
+    if (!ifs.is_open())
+        return false;
+
+    uint8_t header[20]{};
+    ifs.read(reinterpret_cast<char*>(header), static_cast<std::streamsize>(sizeof(header)));
+    if (ifs.gcount() != static_cast<std::streamsize>(sizeof(header)))
+        return false;
+
+    if (std::memcmp(header, "SKSE", 4) != 0)
+        return false;
+
+    auto readU32Le = [](const uint8_t* p) noexcept -> uint32_t
+    {
+        return static_cast<uint32_t>(p[0]) |
+               (static_cast<uint32_t>(p[1]) << 8) |
+               (static_cast<uint32_t>(p[2]) << 16) |
+               (static_cast<uint32_t>(p[3]) << 24);
+    };
+
+    const uint32_t formatVersion = readU32Le(header + 4);
+    const uint32_t skseVersion = readU32Le(header + 8);
+    const uint32_t runtimeVersion = readU32Le(header + 12);
+    const uint32_t numPlugins = readU32Le(header + 16);
+
+    if (formatVersion == 0 || formatVersion > 16)
+        return false;
+    if (skseVersion == 0 || runtimeVersion == 0)
+        return false;
+    if (numPlugins > 4096)
+        return false;
+
+    // Each plugin entry has at least 12 bytes (signature, numChunks, length).
+    const uint64_t minExpectedBytes = 20ULL + static_cast<uint64_t>(numPlugins) * 12ULL;
+    if (fileSize < minExpectedBytes)
+        return false;
+
+    return true;
+}
+
+// Atomic `.ess + .skse` save slot pair validation for coordinated saves and rollbacks.
+// - Always rejects missing or corrupt `.ess`.
+// - If a companion `.skse` exists on disk, ALWAYS verifies its integrity (a truncated `.skse`
+//   would silently wipe RFAB CustomSkills / StorageUtil / JContainers state on reload).
+// - When `aRequireSkseCosave` is true (RFAB modpack sessions with SKSE loaded), also rejects
+//   missing `.skse` co-saves.
+[[nodiscard]] inline SavePairValidationResult ValidateSaveSlotPairOnDisk(
+    const std::filesystem::path& acEssPath,
+    bool aRequireSkseCosave = false) noexcept
+{
+    std::error_code ec;
+    if (acEssPath.empty() || !std::filesystem::exists(acEssPath, ec) || !std::filesystem::is_regular_file(acEssPath, ec))
+        return SavePairValidationResult::kMissingEss;
+
+    if (!IsValidEssFileOnDisk(acEssPath))
+        return SavePairValidationResult::kCorruptEss;
+
+    const std::filesystem::path sksePath = DeriveSkseCosavePath(acEssPath);
+    const bool skseExists = !sksePath.empty() && std::filesystem::exists(sksePath, ec) && !ec;
+    if (!skseExists)
+        return aRequireSkseCosave ? SavePairValidationResult::kMissingSkse : SavePairValidationResult::kOk;
+
+    if (!IsValidSkseCosaveOnDisk(sksePath))
+        return SavePairValidationResult::kCorruptSkse;
+
+    return SavePairValidationResult::kOk;
+}
+
 // Safely moves truncated / headerless / ScrapHeap-aborted `.ess` files into `_RFAB_CorruptQuarantine/`
 // alongside any matching `.skse` or `.ess.tmp` companion files (never deleting user files without backup).
 inline size_t QuarantineCorruptEssFilesInDirectory(const std::filesystem::path& acSavesDir) noexcept
@@ -674,6 +779,7 @@ inline size_t QuarantineCorruptEssFilesInDirectory(const std::filesystem::path& 
         return 0;
 
     std::vector<std::filesystem::path> corruptEssFiles;
+    std::vector<std::filesystem::path> corruptSkseFiles;
     for (const auto& entry : std::filesystem::directory_iterator(acSavesDir, ec))
     {
         if (ec || !entry.is_regular_file(ec))
@@ -688,9 +794,13 @@ inline size_t QuarantineCorruptEssFilesInDirectory(const std::filesystem::path& 
         {
             corruptEssFiles.push_back(entry.path());
         }
+        else if (EndsWithIgnoreCase(fname, ".skse") && !IsValidSkseCosaveOnDisk(entry.path()))
+        {
+            corruptSkseFiles.push_back(entry.path());
+        }
     }
 
-    if (corruptEssFiles.empty())
+    if (corruptEssFiles.empty() && corruptSkseFiles.empty())
         return 0;
 
     const std::filesystem::path quarantineDir = acSavesDir / "Quarantined_Corrupt_v100";
@@ -714,6 +824,16 @@ inline size_t QuarantineCorruptEssFilesInDirectory(const std::filesystem::path& 
                     std::filesystem::rename(skseCompanion, quarantineDir / skseCompanion.filename(), ec);
             }
         }
+    }
+
+    for (const auto& badSkse : corruptSkseFiles)
+    {
+        std::error_code existsEc;
+        if (!std::filesystem::exists(badSkse, existsEc) || existsEc)
+            continue;
+        std::filesystem::rename(badSkse, quarantineDir / badSkse.filename(), ec);
+        if (!ec)
+            ++movedCount;
     }
 
     return movedCount;
@@ -1829,7 +1949,48 @@ struct CoopAllyActionPolicy
     bool BlockHarmfulAction{false};
     bool AllowPartySparring{false};
     bool AllowBeneficialMagic{false};
+    bool BlockKnockbackAndRagdoll{false};
 };
+
+// Detects Skyrim SE / RFAB crowd-control, knockback, ragdoll, stagger, and banish archetypes
+// (EffectArchetypes::ArchetypeID from MagicSystem.h) so Ally Protection blocks friendly-fire
+// shouts (Unrelenting Force / Cyclone), Requiem bull-rush knockdowns, disarm, paralysis, and
+// summon banishment even when an effect deals 0 direct Health damage.
+[[nodiscard]] inline bool IsKnockbackOrCrowdControlEffect(
+    int32_t aArchetypeId,
+    std::string_view aEditorId = {}) noexcept
+{
+    switch (aArchetypeId)
+    {
+    case 7:  // kDemoralize
+    case 8:  // kFrenzy
+    case 9:  // kDisarm
+    case 21: // kParalysis
+    case 30: // kConcussion (Unrelenting Force / Cyclone ragdoll push)
+    case 33: // kStagger (Requiem/RFAB bull-rush & stagger)
+    case 42: // kBanish (prevents banishing party ally summons)
+    case 45: // kGrabActor (Vampire Lord telekinetic grip)
+        return true;
+    default:
+        break;
+    }
+
+    if (!aEditorId.empty())
+    {
+        const std::string lower = Detail::ToLowerAscii(aEditorId);
+        if (lower.find("pushactoraway") != std::string::npos ||
+            lower.find("knockdown") != std::string::npos ||
+            lower.find("knockback") != std::string::npos ||
+            lower.find("bullrush") != std::string::npos ||
+            lower.find("unrelentingforce") != std::string::npos ||
+            lower.find("ragdoll") != std::string::npos)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 // Mirrors RFAB's Speechcraft 50 «Лидерство» -> «Единство в битве» (RFAB_Power_NoAllyDamage / RFAB_Perk_NoAllyDamage),
 // scoped strictly to distinct Co-Op Party Allies (other players in the same party and their summons/minions),
@@ -1843,12 +2004,12 @@ struct CoopAllyActionPolicy
         return {};
 
     if (aIsBeneficialHealOrBuff)
-        return {false, !aAttackerAllyProtectionEnabled, true};
+        return {false, !aAttackerAllyProtectionEnabled, true, false};
 
     if (aAttackerAllyProtectionEnabled)
-        return {true, false, false};
+        return {true, false, false, true};
 
-    return {false, true, false};
+    return {false, true, false, false};
 }
 
 // Cross-version RFAB & Skyrim Boss EditorID recognizer (supplements BossList.json, Dragon check, and MaxHP threshold).

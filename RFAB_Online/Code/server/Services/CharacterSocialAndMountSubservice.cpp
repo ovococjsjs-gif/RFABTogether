@@ -58,16 +58,42 @@ void CharacterService::OnMountRequest(const PacketEvent<MountRequest>& acMessage
         return;
 
     auto& message = acMessage.Packet;
+    const uint32_t senderPlayerId = acMessage.pPlayer->GetId();
     const entt::entity riderEntity = static_cast<entt::entity>(message.RiderId);
-    const entt::entity mountEntity = static_cast<entt::entity>(message.MountId);
-    if (!m_world.valid(riderEntity) || !m_world.valid(mountEntity))
+    if (!m_world.valid(riderEntity))
         return;
 
-    // Verify that the sender actually owns the rider entity, then atomically transfer mount ownership
-    // to the rider so horse movement updates belong to the player physically riding the mount!
+    // Verify that the sender actually owns the rider entity.
     const auto* pRiderOwner = m_world.try_get<OwnerComponent>(riderEntity);
     if (pRiderOwner && pRiderOwner->GetOwner() != acMessage.pPlayer)
         return;
+
+    // Dismount (MountId == 0): release the rider's active mount lock immediately.
+    if (message.MountId == 0)
+    {
+        m_mountGuard.ReleaseAllForPlayer(senderPlayerId);
+        NotifyMount notify;
+        notify.RiderId = message.RiderId;
+        notify.MountId = 0;
+        if (!GameServer::Get()->SendToPlayersInRange(notify, riderEntity, acMessage.GetSender()))
+            spdlog::error("{}: SendToPlayersInRange failed on dismount", __FUNCTION__);
+        return;
+    }
+
+    const entt::entity mountEntity = static_cast<entt::entity>(message.MountId);
+    if (!m_world.valid(mountEntity))
+        return;
+
+    // Reject hijacking a mount that another player is actively riding.
+    if (!m_mountGuard.TryAcquireRide(message.MountId, senderPlayerId, message.RiderId))
+    {
+        spdlog::warn(
+            "[RFAB Mounts] Rejected mount hijack on {:X} by player {} (currently ridden by player {})",
+            message.MountId,
+            senderPlayerId,
+            m_mountGuard.GetActiveRiderPlayerId(message.MountId));
+        return;
+    }
 
     if (auto* pMountOwner = m_world.try_get<OwnerComponent>(mountEntity))
     {

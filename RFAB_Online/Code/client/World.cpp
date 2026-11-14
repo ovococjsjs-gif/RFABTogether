@@ -264,8 +264,9 @@ void World::PublishThreadSnapshot() noexcept
     if (isConn)
     {
         static const BSFixedString* s_pContainerMenu = new BSFixedString("ContainerMenu");
+        static const BSFixedString* s_pQuickLootMenu = new BSFixedString("LootMenu");
         auto* const pUi = UI::Get();
-        const bool containerOpen = pUi && pUi->GetMenuOpen(*s_pContainerMenu);
+        const bool containerOpen = pUi && (pUi->GetMenuOpen(*s_pContainerMenu) || pUi->GetMenuOpen(*s_pQuickLootMenu));
         s_isContainerMenuOpenCached.store(containerOpen, std::memory_order_release);
         s_currentTickCached.store(m_transport.GetClock().GetCurrentTick(), std::memory_order_release);
     }

@@ -320,4 +320,89 @@ private:
     std::deque<FifoItem> m_fifoOrder{};
     uint64_t m_nextSequence{1};
 };
+
+/**
+ * Bounded, TTL-expiring buffer for container loot deltas fired by QuickLootIE (`LootMenu`) or
+ * RFAB AutoLoot (`RFAB_MCM_Settings.json`) BEFORE `AssignObjectsResponse` has assigned a server id
+ * to a newly streamed container (since QuickLootIE/AutoLoot call RemoveItem without calling Activate).
+ */
+template <class TItemEntry>
+class PendingContainerLootQueue
+{
+public:
+    static constexpr size_t kMaxPendingDeltas = 256;
+    static constexpr uint64_t kDefaultTtlMs = 8000ULL;
+
+    struct PendingDelta
+    {
+        uint32_t ContainerFormId{0};
+        TItemEntry Item{};
+        bool Drop{false};
+        bool UpdateClients{true};
+        uint64_t QueuedAtMs{0};
+    };
+
+    void Clear() noexcept { m_entries.clear(); }
+    [[nodiscard]] size_t Size() const noexcept { return m_entries.size(); }
+    [[nodiscard]] bool Empty() const noexcept { return m_entries.empty(); }
+
+    void PruneExpired(uint64_t aNowMs, uint64_t aTtlMs = kDefaultTtlMs) noexcept
+    {
+        while (!m_entries.empty())
+        {
+            const uint64_t queuedAt = m_entries.front().QueuedAtMs;
+            if (aNowMs >= queuedAt && (aNowMs - queuedAt) > aTtlMs)
+                m_entries.pop_front();
+            else
+                break;
+        }
+    }
+
+    bool Enqueue(
+        uint32_t aContainerFormId,
+        const TItemEntry& acItem,
+        bool aDrop,
+        bool aUpdateClients,
+        uint64_t aNowMs,
+        uint64_t aTtlMs = kDefaultTtlMs)
+    {
+        if (aContainerFormId == 0)
+            return false;
+
+        PruneExpired(aNowMs, aTtlMs);
+        while (m_entries.size() >= kMaxPendingDeltas)
+            m_entries.pop_front();
+
+        m_entries.push_back(PendingDelta{aContainerFormId, acItem, aDrop, aUpdateClients, aNowMs});
+        return true;
+    }
+
+    [[nodiscard]] std::vector<PendingDelta> TakeForContainer(
+        uint32_t aContainerFormId,
+        uint64_t aNowMs,
+        uint64_t aTtlMs = kDefaultTtlMs)
+    {
+        PruneExpired(aNowMs, aTtlMs);
+        std::vector<PendingDelta> out;
+        if (aContainerFormId == 0 || m_entries.empty())
+            return out;
+
+        std::deque<PendingDelta> remaining;
+        while (!m_entries.empty())
+        {
+            PendingDelta entry = std::move(m_entries.front());
+            m_entries.pop_front();
+            if (entry.ContainerFormId == aContainerFormId)
+                out.push_back(std::move(entry));
+            else
+                remaining.push_back(std::move(entry));
+        }
+        m_entries = std::move(remaining);
+        return out;
+    }
+
+private:
+    std::deque<PendingDelta> m_entries{};
+};
+
 } // namespace CoopLootLedger

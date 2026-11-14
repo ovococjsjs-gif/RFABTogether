@@ -496,6 +496,25 @@ bool SaveSnapshotService::SaveCheckpointsToDisk(const std::filesystem::path& acP
                 worldItemsBuf.GetWriteData(),
                 worldItemsWriter.Size(),
                 kWorldItemsChunkVersion);
+
+            // v4.1.1 Phase 3B: shared Dragon Soul kills & Word Wall discoveries. Older builds skip unknown tag.
+            TiltedPhoques::Buffer drgWordBuf(32 * 1024);
+            TiltedPhoques::Buffer::Writer drgWordWriter(&drgWordBuf);
+            Serialization::WriteVarInt(drgWordWriter, m_snapshots.size());
+            for (const auto& snap : m_snapshots)
+            {
+                Serialization::WriteVarInt(drgWordWriter, snap.Progression.SlainDragonKeys.size());
+                for (const auto& key : snap.Progression.SlainDragonKeys)
+                    WriteStdString(drgWordWriter, key);
+                Serialization::WriteVarInt(drgWordWriter, snap.Progression.LearnedWordWalls.size());
+                for (const auto& wordId : snap.Progression.LearnedWordWalls)
+                    wordId.Serialize(drgWordWriter);
+            }
+            tlvBuilder.AppendChunk(
+                CoopCheckpoint::TlvTag::kDragonSoulsAndWordWalls,
+                drgWordBuf.GetWriteData(),
+                drgWordWriter.Size(),
+                1u);
             const std::vector<uint8_t> tlvBytes = tlvBuilder.Bytes();
             if (!tlvBytes.empty())
             {
@@ -734,6 +753,37 @@ bool SaveSnapshotService::LoadCheckpointsFromDisk(const std::filesystem::path& a
                                         loadedSnapshots.size());
                                     for (uint64_t sIdx = 0; sIdx < itemSnapCount && !itemsReader.Eof(); ++sIdx)
                                         loadedSnapshots[static_cast<size_t>(sIdx)].WorldItems = ReadWorldItemRecords(itemsReader);
+                                    continue;
+                                }
+
+                                if (chunk.Tag == static_cast<uint32_t>(CoopCheckpoint::TlvTag::kDragonSoulsAndWordWalls) &&
+                                    chunk.Data && chunk.ByteLength != 0 && chunk.Version == 1u)
+                                {
+                                    TiltedPhoques::Buffer dwBuffer(chunk.ByteLength);
+                                    std::memcpy(dwBuffer.GetWriteData(), chunk.Data, chunk.ByteLength);
+                                    TiltedPhoques::Buffer::Reader dwReader(&dwBuffer);
+                                    const uint64_t dwSnapCount = std::min<uint64_t>(
+                                        Serialization::ReadVarInt(dwReader),
+                                        loadedSnapshots.size());
+                                    for (uint64_t sIdx = 0; sIdx < dwSnapCount && !dwReader.Eof(); ++sIdx)
+                                    {
+                                        auto& prog = loadedSnapshots[static_cast<size_t>(sIdx)].Progression;
+                                        const uint64_t dragonCount = std::min<uint64_t>(Serialization::ReadVarInt(dwReader), 4096ULL);
+                                        prog.SlainDragonKeys.clear();
+                                        prog.SlainDragonKeys.reserve(static_cast<size_t>(dragonCount));
+                                        for (uint64_t d = 0; d < dragonCount && !dwReader.Eof(); ++d)
+                                            prog.SlainDragonKeys.push_back(ReadStdString(dwReader));
+
+                                        const uint64_t wordCount = std::min<uint64_t>(Serialization::ReadVarInt(dwReader), 4096ULL);
+                                        prog.LearnedWordWalls.clear();
+                                        prog.LearnedWordWalls.reserve(static_cast<size_t>(wordCount));
+                                        for (uint64_t w = 0; w < wordCount && !dwReader.Eof(); ++w)
+                                        {
+                                            GameId wid{};
+                                            wid.Deserialize(dwReader);
+                                            prog.LearnedWordWalls.push_back(wid);
+                                        }
+                                    }
                                     continue;
                                 }
 

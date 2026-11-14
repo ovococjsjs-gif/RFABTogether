@@ -1,6 +1,7 @@
 #include <Services/RfabProgressionService.h>
 
 #include <common/RfabModpackCompat.h>
+#include <common/RfabWorldImmersion.h>
 #include <Events/PlayerJoinEvent.h>
 #include <Events/PlayerLeaveEvent.h>
 #include <GameServer.h>
@@ -8,6 +9,7 @@
 #include <Messages/SyncRfabProgressionEvent.h>
 #include <Services/PartyService.h>
 #include <Services/SaveSnapshotService.h>
+#include <Setting.h>
 #include <World.h>
 
 namespace
@@ -15,6 +17,11 @@ namespace
 constexpr int32_t kMaxSingleXpGrant = 1'000'000;
 constexpr uint64_t kTacticalPingRateWindowMs = 2500;
 constexpr uint32_t kMaxTacticalPingsPerWindow = 6;
+
+Console::Setting bEnableLateJoinCatchUpXp{
+    "Gameplay:bEnableLateJoinCatchUpXp",
+    "Grants bounded catch-up XP to players joining an ongoing RFAB co-op session",
+    true};
 }
 
 RfabProgressionService::RfabProgressionService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
@@ -127,6 +134,11 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
 
     case SyncRfabProgressionEvent::EventKind::GlobalValueSync:
     {
+        // Isolate personal Divine Shrine blessings, RFAB SaveBlessing flags, and CrimeGold/bounty
+        // globals so one player's theft or shrine interaction never contaminates teammates!
+        if (RfabWorldImmersion::IsPersonalCrimeOrBlessingGlobal(editorId))
+            return;
+
         if (!m_ledger.UpdateGlobal(editorId, pkt.GlobalValue))
             return;
 
@@ -196,6 +208,20 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
             if (GameServer::Get())
                 GameServer::Get()->SendToPlayersInRange(broadcast, bossEntity, pSender);
         }
+        else if (sourceKey == "boss_lock" && pkt.XpDelta != 0)
+        {
+            const uint32_t bossServerId = static_cast<uint32_t>(pkt.XpDelta);
+            const entt::entity bossEntity = static_cast<entt::entity>(bossServerId);
+            if (!m_world.valid(bossEntity))
+                break;
+
+            const auto* pOwnerComp = m_world.try_get<OwnerComponent>(bossEntity);
+            if (!pOwnerComp || pOwnerComp->GetOwner() != pSender)
+                break;
+
+            const bool locked = (pkt.GlobalValue >= 0.5f);
+            m_ledger.SetBossEncounterLocked(bossServerId, locked);
+        }
         else if (sourceKey == "arena_unlock" && pkt.BookId)
         {
             NotifyRfabProgressionEvent broadcast{};
@@ -212,6 +238,109 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
                     continue;
                 if (pOther->GetCellComponent().IsInRange(pSender->GetCellComponent(), false))
                     pOther->Send(broadcast);
+            }
+        }
+        break;
+    }
+
+    case SyncRfabProgressionEvent::EventKind::DragonSoulSync:
+    {
+        const std::string dragonKey = !sourceKey.empty()
+            ? sourceKey
+            : RfabCoopProgression::DragonSoulLedger::MakeDragonKey(pkt.BookId, static_cast<uint32_t>(pkt.XpDelta));
+        if (dragonKey.empty())
+            break;
+
+        std::vector<uint32_t> eligiblePeers;
+        auto& partyService = m_world.GetPartyService();
+        if (const auto* pParty = partyService.GetPlayerParty(pSender))
+        {
+            for (Player* pMember : pParty->Members)
+            {
+                if (pMember && pMember != pSender)
+                    eligiblePeers.push_back(pMember->GetId());
+            }
+        }
+        else
+        {
+            for (Player* pOther : m_world.GetPlayerManager())
+            {
+                if (pOther && pOther != pSender)
+                    eligiblePeers.push_back(pOther->GetId());
+            }
+        }
+
+        const auto award = m_ledger.GetDragonSoulLedger().RecordDragonKill(
+            dragonKey, pSender->GetId(), eligiblePeers, false);
+        if (award.NewlyAwardedPlayerIds.empty())
+            break;
+
+        NotifyRfabProgressionEvent soulGrant{};
+        soulGrant.Kind = NotifyRfabProgressionEvent::EventKind::DragonSoulSync;
+        soulGrant.EpochId = currentEpoch;
+        soulGrant.SourceKey = String(dragonKey.c_str());
+        soulGrant.BookId = pkt.BookId;
+        soulGrant.XpDelta = 1; // +1 Dragon Soul per unique slain dragon
+        soulGrant.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
+
+        for (uint32_t peerId : award.NewlyAwardedPlayerIds)
+        {
+            if (Player* pPeer = m_world.GetPlayerManager().GetById(peerId))
+                pPeer->Send(soulGrant);
+        }
+        break;
+    }
+
+    case SyncRfabProgressionEvent::EventKind::WordWallSync:
+    {
+        if (!m_ledger.GetWordWallLedger().RecordWordLearned(pkt.BookId))
+            break;
+
+        NotifyRfabProgressionEvent wordBroadcast{};
+        wordBroadcast.Kind = NotifyRfabProgressionEvent::EventKind::WordWallSync;
+        wordBroadcast.EpochId = currentEpoch;
+        wordBroadcast.SourceKey = pkt.SourceKey;
+        wordBroadcast.EditorId = pkt.EditorId;
+        wordBroadcast.BookId = pkt.BookId;
+        wordBroadcast.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
+        if (GameServer::Get())
+            GameServer::Get()->SendToPlayers(wordBroadcast, pSender);
+        break;
+    }
+
+    case SyncRfabProgressionEvent::EventKind::DifficultyHandshakeSync:
+    {
+        const auto reported = RfabCoopProgression::UnpackDifficultyHandshake(pkt.XpDelta, pkt.GlobalValue);
+        if (!reported.IsValid())
+            break;
+
+        if (m_world.GetSaveSnapshotService().IsPlayerAuthorizedHost(pSender) || !m_hostDifficultyState.IsValid())
+        {
+            m_hostDifficultyState = reported;
+            NotifyRfabProgressionEvent hostNotice{};
+            hostNotice.Kind = NotifyRfabProgressionEvent::EventKind::DifficultyHandshakeSync;
+            hostNotice.EpochId = currentEpoch;
+            hostNotice.XpDelta = RfabCoopProgression::PackDifficultyHandshake(m_hostDifficultyState.Tier, m_hostDifficultyState.IsCursed);
+            hostNotice.GlobalValue = m_hostDifficultyState.IncomingMult;
+            hostNotice.EditorId = String("host");
+            hostNotice.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
+            if (GameServer::Get())
+                GameServer::Get()->SendToPlayers(hostNotice, pSender);
+        }
+        else
+        {
+            const std::string mismatch = RfabCoopProgression::FormatDifficultyMismatchNotice(m_hostDifficultyState, reported);
+            if (!mismatch.empty())
+            {
+                NotifyRfabProgressionEvent warnPkt{};
+                warnPkt.Kind = NotifyRfabProgressionEvent::EventKind::DifficultyHandshakeSync;
+                warnPkt.EpochId = currentEpoch;
+                warnPkt.SourceKey = String(mismatch.c_str());
+                warnPkt.EditorId = String("mismatch");
+                warnPkt.XpDelta = RfabCoopProgression::PackDifficultyHandshake(m_hostDifficultyState.Tier, m_hostDifficultyState.IsCursed);
+                warnPkt.GlobalValue = m_hostDifficultyState.IncomingMult;
+                warnPkt.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
+                pSender->Send(warnPkt);
             }
         }
         break;
@@ -374,6 +503,51 @@ void RfabProgressionService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexce
         bossSync.GlobalValue = 1.0f;
         bossSync.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
         pNewPlayer->Send(bossSync);
+    }
+
+    // Sync already-discovered Words of Power so late joiners stay synchronized on shouts.
+    for (const auto& wordId : m_ledger.GetWordWallLedger().GetLearnedWords())
+    {
+        NotifyRfabProgressionEvent wordSync{};
+        wordSync.Kind = NotifyRfabProgressionEvent::EventKind::WordWallSync;
+        wordSync.EpochId = currentEpoch;
+        wordSync.BookId = wordId;
+        wordSync.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
+        pNewPlayer->Send(wordSync);
+    }
+
+    // Send Host's RFAB_StartMenu Difficulty & Cursed state for handshake validation.
+    if (m_hostDifficultyState.IsValid())
+    {
+        NotifyRfabProgressionEvent diffSync{};
+        diffSync.Kind = NotifyRfabProgressionEvent::EventKind::DifficultyHandshakeSync;
+        diffSync.EpochId = currentEpoch;
+        diffSync.EditorId = String("host");
+        diffSync.XpDelta = RfabCoopProgression::PackDifficultyHandshake(m_hostDifficultyState.Tier, m_hostDifficultyState.IsCursed);
+        diffSync.GlobalValue = m_hostDifficultyState.IncomingMult;
+        diffSync.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
+        pNewPlayer->Send(diffSync);
+    }
+
+    // Bounded one-time catch-up XP for friends joining an ongoing session that already earned shared XP.
+    if (m_ledger.GetTotalSharedXp() == 0)
+    {
+        m_lateJoinCatchUp.MarkAlreadySyncedAtSessionStart(pNewPlayer->GetId());
+    }
+    else
+    {
+        const auto catchUp = m_lateJoinCatchUp.EvaluateAndMark(
+            pNewPlayer->GetId(), m_ledger.GetTotalSharedXp(), bEnableLateJoinCatchUpXp);
+        if (catchUp.ShouldGrant)
+        {
+            NotifyRfabProgressionEvent catchUpPkt{};
+            catchUpPkt.Kind = NotifyRfabProgressionEvent::EventKind::LateJoinCatchUpXp;
+            catchUpPkt.EpochId = currentEpoch;
+            catchUpPkt.SourceKey = String("late_join_catchup");
+            catchUpPkt.XpDelta = catchUp.GrantXpDelta;
+            catchUpPkt.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
+            pNewPlayer->Send(catchUpPkt);
+        }
     }
 
     // Sync authoritative Host-controlled Co-Op Ally Protection («Единство в битве») state & Host ID.

@@ -2,6 +2,7 @@
 
 #include <Events/PacketEvent.h>
 #include <Structs/GameId.h>
+#include <common/RfabCoopProgression.h>
 
 #include <cmath>
 #include <cstdint>
@@ -45,6 +46,9 @@ public:
         std::unordered_map<std::string, float> SyncedGlobals{};
         std::vector<AmbushRecord> RecentAmbushes{};
         std::unordered_map<uint32_t, bool> BossGhostStates{};
+        std::unordered_set<uint32_t> LockedBossEntities{};
+        std::vector<std::string> SlainDragonKeys{};
+        std::vector<GameId> LearnedWordWalls{};
     };
 
     struct XpGrantOutcome
@@ -214,6 +218,9 @@ public:
         if (aServerEntityId == 0)
             return false;
 
+        if (aIsGhost)
+            m_lockedBossEntities.insert(aServerEntityId);
+
         const auto it = m_bossGhostStates.find(aServerEntityId);
         const bool current = (it != m_bossGhostStates.end()) ? it->second : false;
         if (current == aIsGhost)
@@ -227,9 +234,25 @@ public:
         return true;
     }
 
+    void SetBossEncounterLocked(uint32_t aServerEntityId, bool aLocked) noexcept
+    {
+        if (aServerEntityId == 0)
+            return;
+        if (aLocked)
+            m_lockedBossEntities.insert(aServerEntityId);
+        else
+            m_lockedBossEntities.erase(aServerEntityId);
+    }
+
+    [[nodiscard]] bool IsBossEncounterLocked(uint32_t aServerEntityId) const noexcept
+    {
+        return m_lockedBossEntities.contains(aServerEntityId) || IsBossGhost(aServerEntityId);
+    }
+
     void ClearBossGhostState(uint32_t aServerEntityId) noexcept
     {
         m_bossGhostStates.erase(aServerEntityId);
+        m_lockedBossEntities.erase(aServerEntityId);
     }
 
     [[nodiscard]] bool IsBossGhost(uint32_t aServerEntityId) const noexcept
@@ -237,6 +260,11 @@ public:
         const auto it = m_bossGhostStates.find(aServerEntityId);
         return it != m_bossGhostStates.end() && it->second;
     }
+
+    [[nodiscard]] RfabCoopProgression::DragonSoulLedger& GetDragonSoulLedger() noexcept { return m_dragonSouls; }
+    [[nodiscard]] const RfabCoopProgression::DragonSoulLedger& GetDragonSoulLedger() const noexcept { return m_dragonSouls; }
+    [[nodiscard]] RfabCoopProgression::WordWallLedger& GetWordWallLedger() noexcept { return m_wordWalls; }
+    [[nodiscard]] const RfabCoopProgression::WordWallLedger& GetWordWallLedger() const noexcept { return m_wordWalls; }
 
     [[nodiscard]] Snapshot CaptureSnapshot() const
     {
@@ -247,6 +275,9 @@ public:
             m_syncedGlobals,
             m_recentAmbushes,
             m_bossGhostStates,
+            m_lockedBossEntities,
+            m_dragonSouls.GetOrderedDragonKeys(),
+            m_wordWalls.GetLearnedWords(),
         };
     }
 
@@ -258,6 +289,9 @@ public:
         m_syncedGlobals = acSnapshot.SyncedGlobals;
         m_recentAmbushes = acSnapshot.RecentAmbushes;
         m_bossGhostStates = acSnapshot.BossGhostStates;
+        m_lockedBossEntities = acSnapshot.LockedBossEntities;
+        m_dragonSouls.RestoreDragonKeys(acSnapshot.SlainDragonKeys);
+        m_wordWalls.RestoreWords(acSnapshot.LearnedWordWalls);
     }
 
     [[nodiscard]] int64_t GetTotalSharedXp() const noexcept { return m_totalSharedXp; }
@@ -282,6 +316,9 @@ private:
     std::unordered_map<std::string, float> m_syncedGlobals{};
     std::vector<AmbushRecord> m_recentAmbushes{};
     std::unordered_map<uint32_t, bool> m_bossGhostStates{};
+    std::unordered_set<uint32_t> m_lockedBossEntities{};
+    RfabCoopProgression::DragonSoulLedger m_dragonSouls{};
+    RfabCoopProgression::WordWallLedger m_wordWalls{};
 };
 
 class RfabProgressionService
@@ -293,6 +330,7 @@ public:
     [[nodiscard]] const RfabProgressionLedger& GetLedger() const noexcept { return m_ledger; }
 
     [[nodiscard]] bool IsAllyProtectionEnabled() const noexcept { return m_allyProtectionEnabled; }
+    [[nodiscard]] const RfabCoopProgression::DifficultyHandshakeState& GetHostDifficultyState() const noexcept { return m_hostDifficultyState; }
     [[nodiscard]] int32_t ResolveAuthorizedHostPlayerId() const noexcept;
     void BroadcastAllyProtectionState(bool aNotifyHudChange = false) const noexcept;
     void SendAllyProtectionStateToPlayer(Player* apTarget, bool aNotifyHudChange = false) const noexcept;
@@ -305,6 +343,8 @@ private:
     World& m_world;
     RfabProgressionLedger m_ledger;
     bool m_allyProtectionEnabled{true};
+    RfabCoopProgression::DifficultyHandshakeState m_hostDifficultyState{};
+    RfabCoopProgression::LateJoinCatchUpTracker m_lateJoinCatchUp{};
 
     struct PingRateBucket
     {

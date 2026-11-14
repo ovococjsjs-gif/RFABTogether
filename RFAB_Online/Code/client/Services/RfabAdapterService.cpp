@@ -7,6 +7,9 @@
 #include <Events/PartyJoinedEvent.h>
 #include <Events/PartyLeftEvent.h>
 #include <Events/UpdateEvent.h>
+#include <Forms/ActorValueInfo.h>
+#include <Games/Overrides.h>
+#include <Games/References.h>
 #include <Messages/NotifyPlayerCellChanged.h>
 #include <Messages/NotifyPlayerHealthUpdate.h>
 #include <Messages/NotifyPlayerJoined.h>
@@ -16,6 +19,7 @@
 #include <Messages/NotifyRfabProgressionEvent.h>
 #include <Messages/SyncRfabProgressionEvent.h>
 #include <OverlayApp.hpp>
+#include <PlayerCharacter.h>
 #include <Services/CharacterService.h>
 #include <Services/ImguiService.h>
 #include <Services/OverlayService.h>
@@ -23,6 +27,7 @@
 #include <Services/TransportService.h>
 #include <Utils.h>
 #include <World.h>
+#include <common/RfabCoopProgression.h>
 #include <imgui.h>
 
 RfabAdapterService::RfabAdapterService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept
@@ -315,6 +320,7 @@ void RfabAdapterService::OnSessionBegin(const Session::Transition& acTransition)
 
     m_xpAndBookSync.ApplySessionNoDeathHandling(m_formResolver);
     m_xpAndBookSync.SeedReadBooksOnConnect(m_formResolver);
+    SendLocalDifficultyHandshake();
 }
 
 void RfabAdapterService::OnSessionEnd(const Session::Transition&) noexcept
@@ -362,6 +368,26 @@ void RfabAdapterService::OnWorldLoadEnd(const Session::Transition& acTransition)
     // closing the 2.0s post-load window where Requiem's death script could trigger a solo reload.
     m_xpAndBookSync.EnforceNoDeathHandlingTick(m_formResolver);
     RefreshCoopCombatSnapshot();
+    SendLocalDifficultyHandshake();
+}
+
+void RfabAdapterService::SendLocalDifficultyHandshake() noexcept
+{
+    if (!m_transport.IsConnected() || !Settings::IsRfabModpackActive())
+        return;
+
+    const auto localDiff = RfabCoopProgression::InferDifficultyFromGmst(
+        Settings::GetRfabOutgoingDamageMult(),
+        Settings::GetRfabIncomingDamageMult());
+    if (!localDiff.IsValid())
+        return;
+
+    SyncRfabProgressionEvent ev{};
+    ev.Kind = SyncRfabProgressionEvent::EventKind::DifficultyHandshakeSync;
+    ev.EpochId = m_xpAndBookSync.GetCurrentWorldEpoch();
+    ev.XpDelta = RfabCoopProgression::PackDifficultyHandshake(localDiff.Tier, localDiff.IsCursed);
+    ev.GlobalValue = localDiff.IncomingMult;
+    m_transport.Send(ev);
 }
 
 void RfabAdapterService::SelfHealFreeRoamMenuControls() noexcept
@@ -518,6 +544,65 @@ void RfabAdapterService::OnNotifyProgressionEvent(const NotifyRfabProgressionEve
         if (IsTacticalHudFeatureEnabled())
             m_hudAndPings.ApplyIncomingPingSyncEvent(acMessage, m_formResolver.GetBindings());
         break;
+
+    case NotifyRfabProgressionEvent::EventKind::DragonSoulSync:
+    {
+        if (acMessage.XpDelta <= 0)
+            break;
+        if (PlayerCharacter* pPlayer = PlayerCharacter::Get())
+        {
+            ScopedActorValueOverride avGuard;
+            pPlayer->ForceActorValue(
+                ActorValueOwner::ForceMode::PERMANENT,
+                ActorValueInfo::kDragonSouls,
+                static_cast<float>(acMessage.XpDelta));
+            Utils::ShowHudMessage(String("RFAB Co-Op: +1 душа дракона (общая награда группы)"));
+        }
+        break;
+    }
+
+    case NotifyRfabProgressionEvent::EventKind::WordWallSync:
+    {
+        if (!acMessage.BookId)
+            break;
+        const uint32_t wordFormId = m_world.GetModSystem().GetGameId(acMessage.BookId);
+        if (wordFormId != 0)
+        {
+            spdlog::info("[RFAB Progression] Party discovered Word of Power {:X}", wordFormId);
+            Utils::ShowHudMessage(String("RFAB Co-Op: союзник открыл новое Слово Силы"));
+        }
+        break;
+    }
+
+    case NotifyRfabProgressionEvent::EventKind::DifficultyHandshakeSync:
+    {
+        if (acMessage.EditorId == "mismatch" && !acMessage.SourceKey.empty())
+        {
+            Utils::ShowHudMessage(acMessage.SourceKey);
+            break;
+        }
+        if (acMessage.EditorId == "host" && Settings::IsRfabModpackActive())
+        {
+            const auto hostDiff = RfabCoopProgression::UnpackDifficultyHandshake(acMessage.XpDelta, acMessage.GlobalValue);
+            const auto localDiff = RfabCoopProgression::InferDifficultyFromGmst(
+                Settings::GetRfabOutgoingDamageMult(),
+                Settings::GetRfabIncomingDamageMult());
+            const std::string notice = RfabCoopProgression::FormatDifficultyMismatchNotice(hostDiff, localDiff);
+            if (!notice.empty())
+                Utils::ShowHudMessage(String(notice.c_str()));
+        }
+        break;
+    }
+
+    case NotifyRfabProgressionEvent::EventKind::LateJoinCatchUpXp:
+    {
+        if (acMessage.XpDelta > 0)
+        {
+            m_world.GetCharacterService().ApplyAuthoritativeRfabXpDelta(acMessage.XpDelta);
+            Utils::ShowHudMessage(String(fmt::format("RFAB Co-Op: начислено +{} XP (догон группы)", acMessage.XpDelta).c_str()));
+        }
+        break;
+    }
     }
 }
 

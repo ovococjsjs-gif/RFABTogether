@@ -17,6 +17,7 @@
 #include <Messages/NotifyActivate.h>
 #include <Messages/LockChangeRequest.h>
 #include <Messages/NotifyLockChange.h>
+#include <Messages/RequestInventoryChanges.h>
 #include <Messages/ScriptAnimationRequest.h>
 #include <Messages/NotifyScriptAnimation.h>
 
@@ -27,6 +28,7 @@
 #include <Forms/TESWorldSpace.h>
 #include <Forms/BGSEncounterZone.h>
 
+#include <chrono>
 #include <inttypes.h>
 
 ObjectService::ObjectService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport)
@@ -138,6 +140,7 @@ void ObjectService::OnWorldLoadBegin(const Session::Transition&) noexcept
 
 void ObjectService::DestroyObjectEntities() noexcept
 {
+    m_pendingContainerLoot.Clear();
     auto view = m_world.view<ObjectComponent>();
     Vector<entt::entity> toDestroy(view.begin(), view.end());
     for (entt::entity entity : toDestroy)
@@ -145,6 +148,61 @@ void ObjectService::DestroyObjectEntities() noexcept
         if (m_world.valid(entity))
             m_world.destroy(entity);
     }
+}
+
+bool ObjectService::RequestContainerSyncForLoot(
+    TESObjectREFR* apContainer,
+    const Inventory::Entry& acItem,
+    bool aDrop,
+    bool aUpdateClients) noexcept
+{
+    if (!m_transport.IsConnected() || !apContainer || !apContainer->baseForm)
+        return false;
+
+    if (apContainer->baseForm->formType != FormType::Container)
+        return false;
+
+    if (!ShouldSyncObject(apContainer))
+        return false;
+
+    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+    TESObjectCELL* pCell = apContainer->parentCell ? apContainer->parentCell : (pPlayer ? pPlayer->parentCell : nullptr);
+    if (!pCell)
+        return false;
+
+    if (!World::Get().GetServerSettings().SyncPlayerHomes && IsPlayerHome(pCell))
+        return false;
+
+    ObjectData objectData{};
+    if (!m_world.GetModSystem().GetServerModId(apContainer->formID, objectData.Id) ||
+        objectData.Id.ModId == 0xFFFFFFFF)
+    {
+        return false;
+    }
+
+    m_world.GetModSystem().GetServerModId(pCell->formID, objectData.CellId);
+    if (TESWorldSpace* pWorldSpace = pPlayer ? pPlayer->GetWorldSpace() : nullptr)
+        m_world.GetModSystem().GetServerModId(pWorldSpace->formID, objectData.WorldSpaceId);
+    objectData.CurrentCoords = GridCellCoords::CalculateGridCellCoords(apContainer->position.x, apContainer->position.y);
+
+    if (Lock* pLock = apContainer->GetLock())
+    {
+        objectData.CurrentLockData.IsLocked = pLock->IsLocked();
+        objectData.CurrentLockData.LockLevel = pLock->lockLevel;
+    }
+
+    objectData.CurrentInventory = apContainer->GetInventory();
+
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    m_pendingContainerLoot.Enqueue(apContainer->formID, acItem, aDrop, aUpdateClients, nowMs);
+
+    AssignObjectsRequest request{};
+    request.Objects.push_back(std::move(objectData));
+    m_transport.Send(request);
+    return true;
 }
 
 void ObjectService::RefreshCurrentCellObjectsAfterRollback() noexcept
@@ -243,8 +301,19 @@ void ObjectService::OnAssignObjectsResponse(const AssignObjectsResponse& acMessa
 
         CreateObjectEntity(pObject->formID, objectData.ServerId);
 
+        const uint64_t nowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        auto pendingDeltas = m_pendingContainerLoot.TakeForContainer(pObject->formID, nowMs);
+
         if (objectData.IsSenderFirst)
+        {
+            // Server initialized its authoritative inventory from our AssignObjectsRequest
+            // (which already reflects the QuickLootIE / AutoLoot mutation), so drop pending deltas
+            // instead of double-applying them!
             continue;
+        }
 
         if (objectData.CurrentLockData.IsLocked)
         {
@@ -279,6 +348,18 @@ void ObjectService::OnAssignObjectsResponse(const AssignObjectsResponse& acMessa
                 pObject->SetInventoryRetainingQuestItems(currentInventory, objectData.CurrentInventory);
             else
                 pObject->SetInventory(objectData.CurrentInventory);
+
+            // Replay any QuickLootIE / RFAB AutoLoot deltas captured while registration was in flight
+            // so the server arbitrates them against its authoritative LootAntiDupeLedger.
+            for (const auto& pending : pendingDeltas)
+            {
+                RequestInventoryChanges req{};
+                req.ServerId = objectData.ServerId;
+                req.Item = pending.Item;
+                req.Drop = pending.Drop;
+                req.UpdateClients = pending.UpdateClients;
+                m_transport.Send(req);
+            }
         }
     }
 }

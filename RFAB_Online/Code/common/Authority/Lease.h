@@ -99,6 +99,8 @@ struct Policy
 // owner pauses its simulation (StatsMenu / InventoryMenu / OS stall) while another
 // standing in-range peer is actively simulating, the expired lease hands off cleanly.
 inline constexpr uint64_t kWorldNpcLeaseDurationMs = 8000ull;
+inline constexpr uint64_t kBossEncounterMinHoldMs = 5000ull;
+inline constexpr uint64_t kBossEncounterLeaseDurationMs = 15000ull;
 inline constexpr uint64_t kActivePeerSimulationWindowMs = 4000ull;
 inline constexpr uint64_t kDefaultDeclineTtlMs = 15000ull;
 
@@ -106,6 +108,16 @@ inline constexpr uint64_t kDefaultDeclineTtlMs = 15000ull;
 {
     Policy policy{};
     policy.LeaseDurationMs = kWorldNpcLeaseDurationMs;
+    return policy;
+}
+
+// Active RFAB boss / dragon encounters pin authority longer so multi-phase boss scripts
+// (SetGhost, arena shields, Umbra/Dragon Priest transitions) cannot be torn away mid-phase.
+[[nodiscard]] constexpr Policy BossEncounterLeasePolicy() noexcept
+{
+    Policy policy{};
+    policy.MinHoldMs = kBossEncounterMinHoldMs;
+    policy.LeaseDurationMs = kBossEncounterLeaseDurationMs;
     return policy;
 }
 
@@ -141,6 +153,7 @@ struct Subject
 {
     bool IsPlayerAvatar{false};
     bool IsSummonPinnedToOwner{false};
+    bool IsBossEncounterLocked{false};
 };
 
 // What the server currently knows about the peer holding the lease.
@@ -173,6 +186,7 @@ enum class Outcome : uint8_t
     kDeniedPinnedEntity,       // player avatar or bound summon
     kDeniedChallengerDowned,   // a downed peer may not take over a live owner
     kDeniedHoldWindow,         // owner is fresh, in range and connected
+    kDeniedBossEncounterLocked,// active RFAB boss/dragon phase locked to simulating owner
     kDeniedNotOwner,           // handoff/release from a peer that does not hold the lease
     kDeniedStaleEpoch,         // request describes an older world state
     kDeniedNoCandidate,        // nobody is eligible to take the entity

@@ -112,6 +112,7 @@ private:
     void PollReadXpBooks() noexcept;
     void PollSyncedGlobals() noexcept;
     void PollBossEncounterState() noexcept;
+    void SendLocalDifficultyHandshake() noexcept;
     void RefreshTacticalHudSnapshot() noexcept;
     void ClearTacticalHudSnapshot() noexcept;
     void SelfHealFreeRoamMenuControls() noexcept;

@@ -99,4 +99,26 @@ struct MenuPausePolicy
     policy.PatchStatsMenuInput = !acEnvironment.PerkTreeModsPresent;
     return policy;
 }
+
+// Interactive container/loot menus in RFAB (vanilla ContainerMenu + QuickLootIE's LootMenu).
+[[nodiscard]] constexpr bool IsInteractiveLootMenu(std::string_view aMenuName) noexcept
+{
+    return aMenuName == "ContainerMenu" || aMenuName == "LootMenu";
+}
+
+// Real-time RFAB HUD overlays (QuickLootIE, RFAB WheelMenu, TrueHUD) that never pause simulation
+// and must never block coordinated saves or be unpause-patched.
+[[nodiscard]] constexpr bool IsNonPausingRfabOverlayMenu(std::string_view aMenuName) noexcept
+{
+    return aMenuName == "LootMenu" ||
+           aMenuName == "WheelMenu" ||
+           aMenuName == "RFAB WheelMenu" ||
+           aMenuName == "TrueHUD";
+}
+
+// RFAB perk / custom-skill menus that must remain paused to avoid CustomSkills skydome races.
+[[nodiscard]] constexpr bool IsPauseRequiredRfabMenu(std::string_view aMenuName) noexcept
+{
+    return aMenuName == "StatsMenu" || aMenuName == "CustomMenu";
+}
 } // namespace Compat

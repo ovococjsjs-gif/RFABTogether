@@ -106,6 +106,22 @@ bool InventoryService::ApplyInventoryDelta(Player* apSender, uint32_t aServerId,
     }
     else if (pChar && pOwner && (!apSender || pOwner->GetOwner() != apSender))
     {
+        // RFAB mount saddlebag guard: block bystanders from mutating a mount's saddlebag while
+        // another player owns or is actively riding that horse (prevents saddlebag dupes/theft).
+        if (pChar->IsMount())
+        {
+            const uint32_t senderId = apSender ? apSender->GetId() : 0u;
+            const uint32_t ownerId = pOwner->GetOwner() ? pOwner->GetOwner()->GetId() : 0u;
+            if (!m_world.GetCharacterService().GetMountGuard().CanMutateMountSaddlebag(aServerId, senderId, ownerId))
+            {
+                spdlog::warn(
+                    "[RFAB Mounts] Rejected bystander saddlebag mutation on mount {:X} from player {}",
+                    aServerId,
+                    senderId);
+                return false;
+            }
+        }
+
         // A different peer may interact with an owned NPC (pickpocket or loot it) only while the
         // entity is in that peer's replicated cell range. Never let a stale/out-of-range server id
         // authorize an inventory mutation. Broadcast this interaction even when the engine marked
@@ -122,8 +138,7 @@ bool InventoryService::ApplyInventoryDelta(Player* apSender, uint32_t aServerId,
 
     Inventory::Entry sanitizedItem = acItem;
     sanitizedItem.Count = CoopPacketSafety::SanitizeItemCountDelta(sanitizedItem.Count);
-    sanitizedItem.ExtraCharge = CoopPacketSafety::SanitizeFiniteFloat(sanitizedItem.ExtraCharge, 0.0f, 100000.0f, 0.0f);
-    sanitizedItem.ExtraHealth = CoopPacketSafety::SanitizeFiniteFloat(sanitizedItem.ExtraHealth, 0.0f, 100000.0f, 0.0f);
+    CoopCraftedItems::NormalizeCraftedEntry(sanitizedItem);
 
     auto view = m_world.view<InventoryComponent>();
 

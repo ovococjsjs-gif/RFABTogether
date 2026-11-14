@@ -2,6 +2,8 @@
 
 #include <Events/EventDispatcher.h>
 #include <Games/Events.h>
+#include <Structs/Inventory.h>
+#include <common/CoopLootLedger.h>
 #include <common/Session/Lifecycle.h>
 
 struct ServerTimeSettings;
@@ -15,6 +17,7 @@ struct CellChangeEvent;
 struct ScriptAnimationEvent;
 struct AssignObjectsResponse;
 struct NotifyScriptAnimation;
+struct TESObjectREFR;
 
 /**
  * @brief Handles objects in the environment.
@@ -25,6 +28,13 @@ public:
     ObjectService(World&, entt::dispatcher&, TransportService&);
     [[nodiscard]] static bool IsFactionCrimeContainer(uint32_t aFormId) noexcept;
     void RefreshCurrentCellObjectsAfterRollback() noexcept;
+    // On-demand registration for containers looted via QuickLootIE (`LootMenu`) or RFAB AutoLoot
+    // before `Activate` or initial cell scan registered them with the server.
+    bool RequestContainerSyncForLoot(
+        TESObjectREFR* apContainer,
+        const Inventory::Entry& acItem,
+        bool aDrop,
+        bool aUpdateClients) noexcept;
 
     // Session::ParticipantId::kObjects: object entities are server assignments for one world.
     void OnSessionEnd(const Session::Transition& acTransition) noexcept override;
@@ -56,4 +66,5 @@ private:
     entt::scoped_connection m_assignObjectConnection;
     entt::scoped_connection m_scriptAnimationConnection;
     entt::scoped_connection m_scriptAnimationNotifyConnection;
+    CoopLootLedger::PendingContainerLootQueue<Inventory::Entry> m_pendingContainerLoot{};
 };

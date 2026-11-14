@@ -17,6 +17,10 @@ struct NotifyRfabProgressionEvent final : ServerMessage
         AllyProtectionSync = 5,
         BossEncounterSync = 6,
         TacticalPingSync = 7,
+        DragonSoulSync = 8,
+        WordWallSync = 9,
+        DifficultyHandshakeSync = 10,
+        LateJoinCatchUpXp = 11,
     };
 
     NotifyRfabProgressionEvent()

@@ -63,10 +63,12 @@ uint64_t SteadyClockMs() noexcept
             .count());
 }
 
-Authority::Policy SelectEntityLeasePolicy(const CharacterComponent& acChar) noexcept
+Authority::Policy SelectEntityLeasePolicy(const CharacterComponent& acChar, bool aIsBossLocked = false) noexcept
 {
     if (acChar.IsPlayer() || acChar.IsPlayerSummon() || acChar.IsMount())
         return Authority::Policy{};
+    if (aIsBossLocked || (acChar.IsDragon() && acChar.IsWeaponDrawn()))
+        return Authority::BossEncounterLeasePolicy();
     return Authority::WorldNpcLeasePolicy();
 }
 }
@@ -304,6 +306,7 @@ void CharacterService::OnPlayerLeave(const PlayerLeaveEvent& acEvent) const noex
     const uint32_t leavingPlayerId = acEvent.pPlayer->GetId();
     m_interestRegistry.RemoveObserver(leavingPlayerId);
     m_lastPlayerSimulationActivityMs.erase(leavingPlayerId);
+    m_mountGuard.ReleaseAllForPlayer(leavingPlayerId);
 
     auto ownerView = m_world.view<OwnerComponent>();
     for (auto entity : ownerView)
@@ -882,9 +885,15 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
 
                 if (canChallengeOwnership)
                 {
+                    const uint32_t existingServerId = World::ToInteger(existingEntity);
+                    const bool isBossLocked =
+                        m_world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(existingServerId) ||
+                        (characterComponent.IsDragon() && characterComponent.IsWeaponDrawn());
+
                     Authority::Subject subject{};
                     subject.IsPlayerAvatar = characterComponent.IsPlayer();
                     subject.IsSummonPinnedToOwner = characterComponent.IsPlayerSummon();
+                    subject.IsBossEncounterLocked = isBossLocked;
 
                     Authority::OwnerState ownerState{};
                     ownerState.Connected = pOwningPlayer != nullptr;
@@ -902,7 +911,7 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
                         ownerState,
                         challenger,
                         SteadyClockMs(),
-                        SelectEntityLeasePolicy(characterComponent));
+                        SelectEntityLeasePolicy(characterComponent, isBossLocked));
 
                     // Transfer ownership ONLY if entity is dormant/orphaned, current owner left range/disconnected,
                     // OR party leader is claiming a calm non-combat world NPC after anti-flap hold.
@@ -1335,9 +1344,14 @@ void CharacterService::OnOwnershipClaimRequest(const PacketEvent<RequestOwnershi
         m_world.GetPartyService().IsPlayerLeader(acMessage.pPlayer) && !pCharComp->IsWeaponDrawn();
     const uint64_t nowMs = SteadyClockMs();
 
+    const bool isBossLocked =
+        m_world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(acMessage.Packet.ServerId) ||
+        (pCharComp->IsDragon() && pCharComp->IsWeaponDrawn());
+
     Authority::Subject subject{};
     subject.IsPlayerAvatar = pCharComp->IsPlayer();
     subject.IsSummonPinnedToOwner = pCharComp->IsPlayerSummon();
+    subject.IsBossEncounterLocked = isBossLocked;
 
     Authority::OwnerState ownerState{};
     ownerState.Connected = pCurrentOwner != nullptr;
@@ -1349,7 +1363,7 @@ void CharacterService::OnOwnershipClaimRequest(const PacketEvent<RequestOwnershi
     challenger.InRange = challengerInRange && !holdNonHostClaims;
     challenger.IsPartyLeader = challengerIsCalmPartyLeader;
 
-    const Authority::Policy leasePolicy = SelectEntityLeasePolicy(*pCharComp);
+    const Authority::Policy leasePolicy = SelectEntityLeasePolicy(*pCharComp, isBossLocked);
     auto decision = Authority::Claim(pOwnerComp->GetLease(), subject, ownerState, challenger, nowMs, leasePolicy);
 
     if (decision.Result == Authority::Outcome::kGranted &&
@@ -1359,9 +1373,12 @@ void CharacterService::OnOwnershipClaimRequest(const PacketEvent<RequestOwnershi
         !pOwnerComp->GetLease().IsExpired(nowMs))
     {
         // Simulation Authority != Combat Target: while the current owner is connected, in range, and its lease is live,
-        // only allow mounting a horse (`IsMount()`) or calm non-combat takeover by the party leader.
+        // only allow mounting an un-ridden horse (`IsMount()` && `CanTransferMountOwnership`) or calm non-combat takeover by the party leader.
+        const bool canTakeMount =
+            pCharComp->IsMount() &&
+            m_mountGuard.CanTransferMountOwnership(acMessage.Packet.ServerId, acMessage.pPlayer->GetId());
         const bool allowedVoluntaryTakeover =
-            pCharComp->IsMount() ||
+            canTakeMount ||
             (m_world.GetPartyService().IsPlayerLeader(acMessage.pPlayer) && !pCharComp->IsWeaponDrawn());
         if (!allowedVoluntaryTakeover)
         {

@@ -307,7 +307,12 @@ bool TP_MAKE_THISCALL(HookAddTarget, MagicTarget, MagicTarget::AddTargetData& ar
     if (!pTargetActorEx)
         return TiltedPhoques::ThisCall(RealAddTarget, apThis, arData);
 
-    const bool isFriendlySupport = arData.pSpell->IsHealingSpell() || arData.pSpell->IsBuffSpell();
+    const char* pEffectEditorId = arData.pEffectItem->pEffectSetting->GetFormEditorID();
+    const bool isKnockbackCc = RfabCompat::IsKnockbackOrCrowdControlEffect(
+        static_cast<int32_t>(arData.pEffectItem->pEffectSetting->eArchetype),
+        pEffectEditorId ? std::string_view(pEffectEditorId) : std::string_view{});
+    const bool isFriendlySupport =
+        !isKnockbackCc && (arData.pSpell->IsHealingSpell() || arData.pSpell->IsBuffSpell());
     const bool isConcentration = arData.pSpell->IsConcentrationEffectSpell();
 
     const auto coopPolicy =
@@ -315,9 +320,9 @@ bool TP_MAKE_THISCALL(HookAddTarget, MagicTarget, MagicTarget::AddTargetData& ar
                        : RfabCompat::CoopAllyActionPolicy{};
 
     // RFAB «Единство в битве (Кооп)»: evaluated BEFORE ScopedSpellCastOverride so synchronous AoE / cloak / touch
-    // effects inside CastSpellImmediate are also 100% blocked on co-op allies and their summons, while 100% of
-    // heals & buffs (including RFAB_List_NoAllyDamage_AllowedSpells) continue working!
-    if (coopPolicy.BlockHarmfulAction)
+    // effects inside CastSpellImmediate (including Unrelenting Force / Requiem bull-rush / disarm / summon banish)
+    // are 100% blocked on co-op allies and their summons, while heals & buffs continue working!
+    if (coopPolicy.BlockHarmfulAction || (isKnockbackCc && coopPolicy.BlockKnockbackAndRagdoll))
         return false;
 
     if (arData.pEffectItem->IsWerewolfEffect())

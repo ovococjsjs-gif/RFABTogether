@@ -215,6 +215,7 @@ if overlay_h.is_file() and restore_ps1.is_file():
         ("kSkyrimSoulsKeys", "SkyrimSoulsRE.ini"),
         ("kRfabAutosaveKeys", "[RFAB] Autosave.ini"),
         ("kPo3TweaksKeys", "po3_Tweaks.ini"),
+        ("kRfabPluginIniKeys", "RFAB.ini"),
     ):
         cpp_match = re.search(
             r"inline constexpr std::string_view " + array_name + r"\[\]\s*=\s*\{(.*?)\};", header, re.S
