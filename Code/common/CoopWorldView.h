@@ -245,6 +245,88 @@ enum class ViewDecision : uint8_t
     return ViewDecision::kMaterialize;
 }
 
+// ---- What the client sees of the engine before it asks EvaluateViewDecision (work plan 4.2) ----
+//
+// These three small decisions used to be written inline in CharacterService.cpp, between engine
+// calls. They are here so that the Linux suite can check them; the order of the engine calls around
+// them did not change.
+
+// What the engine says about the actor a remote character is bound to on this client.
+struct LiveViewFacts
+{
+    bool HasFormBinding{false};       // the entity carries a FormIdComponent
+    bool ActorFound{false};           // TESForm::GetById returned an actor for it
+    bool CreatedByNetwork{false};     // the actor is one this client spawned for the network
+    bool IsDragon{false};
+    bool ParentCellAttachedAndLoaded{false};  // actor->parentCell exists and is attached and loaded
+};
+
+// Is the remote character present in this client's game right now?
+//
+// "The form can be found" is not enough. A reference placed by a plugin (a bandit of Skyrim.esm)
+// stays findable after its cell was unloaded or moved to the cell buffer; touching its 3D or its AI
+// there crashes. Such an actor counts only while its cell is attached and loaded. An actor this
+// client created for the network lives in the cell we put it in, and a dragon is kept across cells.
+[[nodiscard]] constexpr bool IsRemoteViewMaterialized(const LiveViewFacts& acFacts) noexcept
+{
+    if (!acFacts.HasFormBinding || !acFacts.ActorFound)
+        return false;
+    const bool requiresLoadedParentCell = !acFacts.CreatedByNetwork && !acFacts.IsDragon;
+    return !requiresLoadedParentCell || acFacts.ParentCellAttachedAndLoaded;
+}
+
+// A binding that no longer leads to a usable actor has to be dropped before anything else looks at
+// the character (the engine unloaded the form or its cell without telling us).
+[[nodiscard]] constexpr bool HasStaleFormBinding(const LiveViewFacts& acFacts) noexcept
+{
+    return acFacts.HasFormBinding && !IsRemoteViewMaterialized(acFacts);
+}
+
+// Creating an actor is the most expensive thing the client does in a frame, and a cell full of
+// remote NPCs arrives at once. Players, dragons and characters whose ownership is being handed to
+// this client are created at once; everything else at most kMaxOrdinaryPerFrame per frame, the rest
+// on the following frames (the reconcile loop runs every frame).
+class MaterializeBudget
+{
+public:
+    static constexpr uint32_t kMaxOrdinaryPerFrame = 4;
+
+    [[nodiscard]] static constexpr bool IsHighPriority(bool aIsPlayer, bool aIsDragon, bool aOwnershipPending) noexcept
+    {
+        return aIsPlayer || aIsDragon || aOwnershipPending;
+    }
+
+    // May a character of this priority be created now? Does not count it: creating can fail.
+    [[nodiscard]] constexpr bool CanCreate(bool aHighPriority) const noexcept
+    {
+        return aHighPriority || m_ordinaryCreated < kMaxOrdinaryPerFrame;
+    }
+
+    // An actor was created.
+    constexpr void NoteCreated(bool aHighPriority) noexcept
+    {
+        if (!aHighPriority)
+            ++m_ordinaryCreated;
+    }
+
+    [[nodiscard]] constexpr uint32_t OrdinaryCreated() const noexcept { return m_ordinaryCreated; }
+
+private:
+    uint32_t m_ordinaryCreated{0};
+};
+
+// The discovery pass reported that the actor of a remote character left the engine's active lists.
+// That also happens for one frame while its 3D is rebuilt (armor change, face rebuild, crossing a
+// cell seam). May the binding be kept?
+//
+// Only for an actor this client created for the network that the engine still knows, outside a save
+// load or a purge, and only when the world view says the character belongs where it is.
+[[nodiscard]] constexpr bool MayKeepViewOnActorRemoved(bool aCreatedByNetwork, bool aActorFound, bool aSavePurgeActive,
+                                                       bool aEngineWorldLoading) noexcept
+{
+    return aCreatedByNetwork && aActorFound && !aSavePurgeActive && !aEngineWorldLoading;
+}
+
 struct MovementTransition
 {
     bool HasAuthoritativeLocation{false};

@@ -825,7 +825,7 @@ void CharacterService::OnActorRemoved(const ActorRemovedEvent& acEvent) noexcept
         {
             Actor* pLiveActor = Cast<Actor>(TESForm::GetById(acEvent.FormId));
             const bool isNetworkCreated = modelIt->second.SpawnRequest.FormId == GameId{} || IsNetworkCreatedActor(pLiveActor);
-            if (isNetworkCreated && pLiveActor && !m_savePurgeActive && !IsEngineWorldLoading())
+            if (CoopWorldView::MayKeepViewOnActorRemoved(isNetworkCreated, pLiveActor != nullptr, m_savePurgeActive, IsEngineWorldLoading()))
             {
                 const auto obs = BuildLocalObserverState();
                 TESWorldSpace* pTargetWs = nullptr;
@@ -2698,8 +2698,9 @@ void CharacterService::ReconcileRemoteWorldViews() const noexcept
 
     FlushDeferredDialogueDeletes();
 
-    constexpr size_t kMaxRemoteNpcSpawnsPerFrame = 4;
-    size_t nonPrioritySpawnsThisFrame = 0;
+    // The decisions of this loop live in common/CoopWorldView.h (tested on Linux); what is left here
+    // is reading the engine and calling it.
+    CoopWorldView::MaterializeBudget budget;
 
     const CoopWorldView::ObserverState obs = BuildLocalObserverState();
     const uint64_t nowMs = NowSteadyWorldViewMs();
@@ -2723,14 +2724,19 @@ void CharacterService::ReconcileRemoteWorldViews() const noexcept
 
         // Persistent pre-placed world refs (e.g. Skyrim.esm exterior bandits E5F72-E5F77) stay in TESForm::GetById
         // even when their cell unloads or detaches into uExterior Cell Buffer!
-        const bool requiresLoadedParentCell =
-            pLiveActor && !IsNetworkCreatedActor(pLiveActor) && !model.SpawnRequest.IsDragon;
-        const bool cellActuallyLoaded = !requiresLoadedParentCell ||
-            (pLiveActor->parentCell != nullptr && pLiveActor->parentCell->IsAttachedAndLoaded());
-        const bool isMaterialized = (pFormComp != nullptr && pLiveActor != nullptr && cellActuallyLoaded);
+        CoopWorldView::LiveViewFacts facts{};
+        facts.HasFormBinding = pFormComp != nullptr;
+        facts.ActorFound = pLiveActor != nullptr;
+        facts.CreatedByNetwork = IsNetworkCreatedActor(pLiveActor);
+        facts.IsDragon = model.SpawnRequest.IsDragon;
+        // Asked of the engine only when the answer matters, as before: a plugin-placed, non-dragon actor.
+        facts.ParentCellAttachedAndLoaded =
+            pLiveActor != nullptr && !facts.CreatedByNetwork && !facts.IsDragon &&
+            pLiveActor->parentCell != nullptr && pLiveActor->parentCell->IsAttachedAndLoaded();
+        const bool isMaterialized = CoopWorldView::IsRemoteViewMaterialized(facts);
 
         // Clean up stale FormIdComponent if engine natively unloaded the underlying TESForm or cell
-        if (pFormComp != nullptr && !isMaterialized)
+        if (CoopWorldView::HasStaleFormBinding(facts))
             DematerializeRemoteView(entity, &model);
 
         TESWorldSpace* pTargetWs = nullptr;
@@ -2757,15 +2763,13 @@ void CharacterService::ReconcileRemoteWorldViews() const noexcept
             break;
         case CoopWorldView::ViewDecision::kMaterialize:
         {
-            const bool isHighPriority =
-                model.SpawnRequest.IsPlayer ||
-                model.SpawnRequest.IsDragon ||
-                (model.PendingOwnershipEpoch != 0);
-            if (!isHighPriority && nonPrioritySpawnsThisFrame >= kMaxRemoteNpcSpawnsPerFrame)
+            const bool isHighPriority = CoopWorldView::MaterializeBudget::IsHighPriority(
+                model.SpawnRequest.IsPlayer, model.SpawnRequest.IsDragon, model.PendingOwnershipEpoch != 0);
+            if (!budget.CanCreate(isHighPriority))
                 break;
 
-            if (MaterializeRemoteView(entity, model, pTargetCell, pTargetWs) != nullptr && !isHighPriority)
-                ++nonPrioritySpawnsThisFrame;
+            if (MaterializeRemoteView(entity, model, pTargetCell, pTargetWs) != nullptr)
+                budget.NoteCreated(isHighPriority);
             break;
         }
         case CoopWorldView::ViewDecision::kKeepMaterialized:
