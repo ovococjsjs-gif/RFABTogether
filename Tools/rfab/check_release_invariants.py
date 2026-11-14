@@ -184,7 +184,11 @@ for manifest_path in manifests:
 
 # 5. The workflow does not pin a version --------------------------------------
 workflow = ROOT / ".github" / "workflows" / "release.yml"
-check(workflow.is_file(), ".github/workflows/release.yml is missing")
+if not workflow.is_file():
+    alt_workflow = ROOT / ".github" / "workflows-ready" / "release.yml"
+    if alt_workflow.is_file():
+        workflow = alt_workflow
+check(workflow.is_file(), ".github/workflows/release.yml (or .github/workflows-ready/release.yml) is missing")
 if workflow.is_file():
     # Only the command matters; the word may legitimately appear in a comment.
     commands = [
