@@ -26,11 +26,15 @@ run() {
 # The tools first prove that each of their rules still catches the mistake it exists for.
 run "ci diagnostics self-test"    python3 Tools/rfab/ci_diagnostics.py --self-test
 run "hook discipline self-test"   python3 Tools/rfab/check_hook_discipline.py --self-test
+run "actor lifetime self-test"    python3 Tools/rfab/check_actor_lifetime.py --self-test
 run "wire contract self-test"     python3 Tools/rfab/check_wire_contract.py --self-test
 run "crash symbolizer self-test"  python3 Tools/rfab/symbolize_crash.py --self-test
 
 # Engine threads only read snapshots and post work (hooks, script sinks, CEF handlers).
 run "hook discipline"             python3 Tools/rfab/check_hook_discipline.py
+# Nothing outlives the frame it was read in except an id: no engine pointer in posted work, in a
+# service member or in an event; hooks post world-scoped work.
+run "actor lifetime"              python3 Tools/rfab/check_actor_lifetime.py
 # Every message and event kind has a sender and a receiver in shipped code.
 run "wire contract"               python3 Tools/rfab/check_wire_contract.py
 # VERSION agrees everywhere, submodules are pinned, no build output in git, manifests parse.

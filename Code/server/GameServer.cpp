@@ -77,6 +77,11 @@ Console::Setting bEnableDesyncDetector{"Gameplay:bEnableDesyncDetector",
 // (at most twice per character in two minutes). Owner, health and equipment are only logged.
 Console::Setting bEnableDesyncAutoRepair{"Gameplay:bEnableDesyncAutoRepair",
                                          "The desync detector also resends a character whose state differs on a client", false};
+// On: a gameplay event a client's engine hook produced before or during a coordinated reload is
+// dropped instead of being applied to the reloaded world (common/Session/MainThreadQueue.h).
+// Off restores 4.1.0, where such an event ran after the reload.
+Console::Setting bEnableWorldScopedHookEvents{"Gameplay:bEnableWorldScopedHookEvents",
+                                              "Clients drop gameplay events that were produced before or during a coordinated reload", true};
 extern Console::Setting<bool> bEnableItemDrops;
 extern Console::Setting<bool> bEnableXpSync;
 extern Console::Setting<bool> bEnableRfabXpSync;
@@ -237,6 +242,7 @@ uint32_t GetDisabledCoopFeatureMask() noexcept
     mask = Session::WithFeature(mask, Feature::kServerOwnedWorldItems, bEnableServerOwnedWorldItems && bEnableItemDrops);
     mask = Session::WithFeature(mask, Feature::kPeacefulNpcsUnscaled, bEnablePeacefulNpcsUnscaled);
     mask = Session::WithFeature(mask, Feature::kDesyncDetector, bEnableDesyncDetector);
+    mask = Session::WithFeature(mask, Feature::kWorldScopedHookEvents, bEnableWorldScopedHookEvents);
     return mask;
 }
 

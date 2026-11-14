@@ -93,7 +93,7 @@ WORLD_ANY_THREAD_MEMBERS = {
 
 # Getters whose result may be used off-thread with the methods listed (None: see the annotation).
 WORLD_GETTER_POLICY: dict[str, set[str] | None] = {
-    "Runner": {"Queue", "Trigger"},
+    "Runner": {"Queue", "QueueForThisWorld", "Trigger", "TriggerInSession"},
     "Lifecycle": None,  # methods ending in AnyThread, see allowed_call()
 }
 
@@ -103,8 +103,8 @@ MAIN_THREAD_ONLY_CALLS = {
 }
 
 POST_CALLS = [
-    r"\bGetRunner\s*\(\s*\)\s*\.\s*(?:Queue|Trigger)\s*(?:<[^<>()]*>)?\s*\(",
-    r"\bm_runner\s*\.\s*(?:Queue|Trigger)\s*(?:<[^<>()]*>)?\s*\(",
+    r"\bGetRunner\s*\(\s*\)\s*\.\s*(?:Queue|QueueForThisWorld|Trigger|TriggerInSession)\s*(?:<[^<>()]*>)?\s*\(",
+    r"\bm_runner\s*\.\s*(?:Queue|QueueForThisWorld|Trigger|TriggerInSession)\s*(?:<[^<>()]*>)?\s*\(",
     r"\bQueueMainThreadTask\s*\(",
 ]
 

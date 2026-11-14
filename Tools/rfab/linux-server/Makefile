@@ -18,13 +18,31 @@
 #   make -C Tools/rfab/linux-server -j2          # build the harness
 #   make -C Tools/rfab/linux-server -j2 objects  # compile the server only (fast gate)
 #   make -C Tools/rfab/linux-server run          # build and run
+#   make -C Tools/rfab/linux-server SANITIZE=1 run   # the same under ASan + UBSan
 #
 # Scope: Code/server + components + base + encoding + common + TiltedCore + lua.
 # The Skyrim client (hooks, D3D11, CEF) is not part of this target and stays on xmake.
 
 REPO_ROOT ?= $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../../..)
 DEPS_DIR  ?= $(REPO_ROOT)/build/deps
-BUILD_DIR ?= $(REPO_ROOT)/build/linux-server
+
+# SANITIZE=1 builds the same server and harness with AddressSanitizer + UndefinedBehaviorSanitizer
+# into their own object tree. A server that reads an entity it destroyed a tick earlier closes the
+# session for every player; without the sanitizers such a read usually "works" in a test.
+ifeq ($(SANITIZE),1)
+  # -g1: line tables only, enough for file:line in a report at a fraction of the object size.
+  SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -g1
+  BUILD_SUFFIX := -asan
+  # Vendored sources keep AddressSanitizer but drop the UB checks (same reason as in
+  # linux-core/Makefile: upstream code we cannot fix from here would fail every run).
+  VENDOR_SAN := -fno-sanitize=undefined
+  # The server allocates through mimalloc (TiltedCore's allocators), whose blocks AddressSanitizer
+  # does not see on its own. MI_TRACK_ASAN makes mimalloc poison what it frees, so a use after free
+  # of anything held in a TiltedPhoques container is reported like one of a std container.
+  MIMALLOC_SAN := -DMI_TRACK_ASAN=1
+endif
+
+BUILD_DIR ?= $(REPO_ROOT)/build/linux-server$(BUILD_SUFFIX)
 OBJ_DIR   := $(BUILD_DIR)/obj
 BIN       := $(BUILD_DIR)/servertests
 
@@ -74,9 +92,9 @@ INCLUDES := \
 # public list, so the announcer compiles without TLS instead of dropping the file.
 DEFINES := -DNOMINMAX -DRFAB_NO_HTTPLIB_SSL
 
-CXXFLAGS += -std=c++20 $(OPT) -fPIC $(DEFINES) -w
+CXXFLAGS += -std=c++20 $(OPT) -fPIC $(DEFINES) -w $(SAN_FLAGS)
 DEPFLAGS := -MMD -MP
-CFLAGS   += -std=c11 $(OPT) -fPIC
+CFLAGS   += -std=c11 $(OPT) -fPIC $(SAN_FLAGS) $(VENDOR_SAN)
 
 # The server is built with a precompiled header in the Windows pipeline and several headers
 # rely on it (`PacketEvent.h` takes ConnectionId_t from TiltedConnect without including it).
@@ -138,7 +156,7 @@ run: $(BIN)
 $(BIN): $(ALL_OBJS)
 	@mkdir -p $(dir $@)
 	@echo "  LD    $(notdir $@)"
-	@$(CXX) $(ALL_OBJS) -o $@ -lpthread -ldl
+	@$(CXX) $(SAN_FLAGS) $(ALL_OBJS) -o $@ -lpthread -ldl
 
 define c_compile_rule
 $(call obj_of,$(1),$(2)).o: $(2) $(FLAGS_STAMP)
@@ -177,7 +195,7 @@ $(foreach s,$(BASE_SRCS),$(eval $(call compile_rule,base,$(s),)))
 $(foreach s,$(ADMIN_SRCS),$(eval $(call compile_rule,admin,$(s),)))
 $(foreach s,$(ENCODING_SRCS),$(eval $(call compile_rule,encoding,$(s),$(ENCODING_PCH))))
 $(foreach s,$(COMMON_SRCS),$(eval $(call compile_rule,common,$(s),$(ENCODING_PCH))))
-$(foreach s,$(CORE_SRCS),$(eval $(call compile_rule,core,$(s),)))
+$(foreach s,$(CORE_SRCS),$(eval $(call compile_rule,core,$(s),$(VENDOR_SAN))))
 $(foreach s,$(LUA_SRCS),$(eval $(call c_compile_rule,lua,$(s))))
 $(foreach s,$(ZLIB_SRCS),$(eval $(call c_compile_rule,zlib,$(s))))
 $(foreach s,$(HARNESS_SRCS),$(eval $(call compile_rule,harness,$(s),$(SERVER_PCH))))
@@ -186,7 +204,7 @@ $(foreach s,$(CONNECT_SRCS),$(eval $(call compile_rule,connect,$(s),$(SERVER_PCH
 $(MIMALLOC_OBJ): $(MIMALLOC)/src/static.c $(MAKEFILE_LIST)
 	@mkdir -p $(dir $@)
 	@echo "  CC    mimalloc"
-	@$(CC) $(CFLAGS) -w -UMI_MALLOC_OVERRIDE -I$(MIMALLOC)/include -c $< -o $@
+	@$(CC) $(CFLAGS) $(MIMALLOC_SAN) -w -UMI_MALLOC_OVERRIDE -I$(MIMALLOC)/include -c $< -o $@
 
 clean:
 	rm -rf $(BUILD_DIR)

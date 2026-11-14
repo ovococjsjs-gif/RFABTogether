@@ -376,7 +376,7 @@ void DebugService::OnDraw() noexcept
             ConnectionErrorEvent errorEvent{};
             errorEvent.ErrorDetail = "Skyrim Together never crashes ;)  With love, Yamashi, Force, Dragonisser, Cosideci.";
 
-            m_world.GetRunner().Trigger(errorEvent);
+            m_world.GetRunner().TriggerInSession(errorEvent);
 #endif
         }
         ImGui::EndMenu();

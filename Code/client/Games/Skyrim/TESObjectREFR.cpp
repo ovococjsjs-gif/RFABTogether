@@ -1488,7 +1488,7 @@ bool TP_MAKE_THISCALL(HookActivate, TESObjectREFR, TESObjectREFR* apActivator, u
             if (World::IsMainThread())
                 checkUnlockedAndEmit();
             else
-                World::Get().GetRunner().Queue(std::move(checkUnlockedAndEmit));
+                World::Get().GetRunner().QueueForThisWorld(std::move(checkUnlockedAndEmit));
         }
 
         if (CoopWorldStabilizer::ShouldBroadcastObjectActivation(isTargetActor, isTempTarget, isTeleportLoadDoor))

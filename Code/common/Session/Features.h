@@ -44,9 +44,10 @@ enum class Feature : uint32_t
     kServerOwnedWorldItems = 1u << 8,  // dropped items get a server id, claims are arbitrated (step 4)
     kPeacefulNpcsUnscaled = 1u << 9,   // enemy health scaling skips creatures that never start a fight
     kDesyncDetector = 1u << 10,        // clients report what they believe about each character (EntityDigest.h)
+    kWorldScopedHookEvents = 1u << 11, // hook events die with the world they were posted in (MainThreadQueue.h)
 };
 
-inline constexpr uint32_t kAllKnownFeatureBits = 0x7FFu;
+inline constexpr uint32_t kAllKnownFeatureBits = 0xFFFu;
 
 struct FeatureInfo
 {
@@ -54,7 +55,7 @@ struct FeatureInfo
     std::string_view Name;  // stable, used in logs and in the server console listing
 };
 
-inline constexpr std::array<FeatureInfo, 11> kFeatureTable{{
+inline constexpr std::array<FeatureInfo, 12> kFeatureTable{{
     {Feature::kDownedSystem, "DownedSystem"},
     {Feature::kCoordinatedSaves, "CoordinatedSaves"},
     {Feature::kTacticalHud, "TacticalHud"},
@@ -66,6 +67,7 @@ inline constexpr std::array<FeatureInfo, 11> kFeatureTable{{
     {Feature::kServerOwnedWorldItems, "ServerOwnedWorldItems"},
     {Feature::kPeacefulNpcsUnscaled, "PeacefulNpcsUnscaled"},
     {Feature::kDesyncDetector, "DesyncDetector"},
+    {Feature::kWorldScopedHookEvents, "WorldScopedHookEvents"},
 }};
 
 [[nodiscard]] constexpr uint32_t Bit(Feature aFeature) noexcept

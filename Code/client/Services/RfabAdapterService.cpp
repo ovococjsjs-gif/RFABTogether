@@ -470,7 +470,7 @@ void RfabAdapterService::BroadcastArenaBarrierUnlock(const GameId& acObjectId) c
     if (!World::IsMainThread())
     {
         const GameId capturedObjectId = acObjectId;
-        m_world.GetRunner().Queue([this, capturedObjectId]() noexcept {
+        m_world.GetRunner().QueueForThisWorld([this, capturedObjectId]() noexcept {
             BroadcastArenaBarrierUnlock(capturedObjectId);
         });
         return;

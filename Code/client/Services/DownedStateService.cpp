@@ -185,7 +185,7 @@ void DownedStateService::RequestAllySpellReviveOnActor(uint32_t aTargetFormId, f
 
     if (!World::IsMainThread())
     {
-        m_world.GetRunner().Queue([this, aTargetFormId, aHealMagnitude]() noexcept {
+        m_world.GetRunner().QueueForThisWorld([this, aTargetFormId, aHealMagnitude]() noexcept {
             RequestAllySpellReviveOnActor(aTargetFormId, aHealMagnitude);
         });
         return;
@@ -227,7 +227,7 @@ void DownedStateService::NotifyAllyHealingSpellReceivedFromRemote(Actor* apRemot
     if (!World::IsMainThread())
     {
         const uint32_t casterFormId = apRemoteCaster->formID;
-        m_world.GetRunner().Queue([this, casterFormId, aHealMagnitude]() noexcept {
+        m_world.GetRunner().QueueForThisWorld([this, casterFormId, aHealMagnitude]() noexcept {
             if (Actor* pResolvedCaster = Cast<Actor>(TESForm::GetById(casterFormId)))
                 NotifyAllyHealingSpellReceivedFromRemote(pResolvedCaster, aHealMagnitude);
         });

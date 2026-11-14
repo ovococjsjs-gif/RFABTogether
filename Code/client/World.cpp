@@ -314,10 +314,11 @@ void World::LogMainThreadQueueStats(const char* apWhen) const noexcept
         const bool anomalous = stats.DroppedOverflow != 0 || stats.Failed != 0;
         const spdlog::level::level_enum logLevel = anomalous ? spdlog::level::warn : spdlog::level::info;
         spdlog::log(logLevel,
-                    "[RFAB MainThread] {} lane at {}: posted {}, executed {}, dropped stale {}, dropped overflow {}, failed {}, "
-                    "posted during world load {}, pending {}, high water {}",
+                    "[RFAB MainThread] {} lane at {}: posted {}, executed {}, dropped stale {}, dropped with a replaced world {}, "
+                    "dropped overflow {}, failed {}, posted during world load {}, pending {}, high water {}",
                     std::string(Session::ToString(lane)), apWhen, stats.Posted, stats.Executed, stats.DroppedStale,
-                    stats.DroppedOverflow, stats.Failed, stats.PostedDuringWorldLoad, stats.Pending, stats.HighWater);
+                    stats.DroppedStaleWorld, stats.DroppedOverflow, stats.Failed, stats.PostedDuringWorldLoad, stats.Pending,
+                    stats.HighWater);
     }
 }
 

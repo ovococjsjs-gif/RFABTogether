@@ -138,7 +138,7 @@ BSTEventResult QuestService::OnEvent(const TESQuestStartStopEvent* apEvent,
     const bool stopped = pQuest->IsStopped();
     const uint8_t netQuestType = NormalizeNetworkQuestType(pQuest);
 
-    m_world.GetRunner().Queue(
+    m_world.GetRunner().QueueForThisWorld(
         [this, formId, stageId, stopped, netQuestType]()
         {
             if (!m_world.GetPartyService().IsInParty())
@@ -193,7 +193,7 @@ BSTEventResult QuestService::OnEvent(const TESQuestStageEvent* apEvent, const Ev
     const uint16_t stageId = apEvent->stageId;
     const uint8_t netQuestType = NormalizeNetworkQuestType(pQuest);
 
-    m_world.GetRunner().Queue(
+    m_world.GetRunner().QueueForThisWorld(
         [this, formId, stageId, isReset = isResetUpdate, netQuestType]()
         {
             if (!m_world.GetPartyService().IsInParty())
@@ -243,7 +243,7 @@ BSTEventResult QuestService::OnEvent(const TESSceneEvent* apEvent, const EventDi
 
     const uint8_t netQuestType = NormalizeNetworkQuestType(pQuest);
 
-    m_world.GetRunner().Queue(
+    m_world.GetRunner().QueueForThisWorld(
         [this, sceneId = apEvent->sceneFormId, questId = pQuest->formID, stageId = pQuest->currentStage, netQuestType, sceneType = apEvent->sceneType]()
         {
             if (!m_world.GetPartyService().IsInParty() || !m_world.GetPartyService().IsLeader())

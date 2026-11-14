@@ -361,7 +361,8 @@ void DiscoveryService::OnSessionBegin(const Session::Transition&) noexcept
         ConnectionErrorEvent errorEvent{};
         errorEvent.ErrorDetail = "{\"error\": \"bad_uGridsToLoad\"}";
 
-        m_world.GetRunner().Trigger(errorEvent);
+        // Not about the world: it must reach the UI whatever the load that is going on.
+        m_world.GetRunner().TriggerInSession(errorEvent);
     }
 
     // Ensure 0x14 (local PlayerCharacter) and all currently loaded actors have live EnTT entities
@@ -386,7 +387,8 @@ BSTEventResult DiscoveryService::OnEvent(const TESLoadGameEvent*, const EventDis
         ConnectionErrorEvent errorEvent{};
         errorEvent.ErrorDetail = "{\"error\": \"non_default_install\"}";
 
-        m_world.GetRunner().Trigger(errorEvent);
+        // Not about the world: it must reach the UI whatever the load that is going on.
+        m_world.GetRunner().TriggerInSession(errorEvent);
     }
     else
     {
