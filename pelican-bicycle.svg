@@ -181,9 +181,9 @@
     <path d="M336 330c-12-6-14-20 2-24l64-2c16 2 22 16 8 24-18 10-52 10-74 2z" fill="#7a4b36" stroke="#26333d" stroke-width="5" stroke-linejoin="round"/>
 
     <!-- руль -->
-    <path d="M585 370 574 330" fill="none" stroke="#26333d" stroke-width="9" stroke-linecap="round"/>
-    <path d="M544 330q30-16 58 4" fill="none" stroke="#4a5a66" stroke-width="9" stroke-linecap="round"/>
-    <path d="M534 326 546 330" stroke="#22303c" stroke-width="15" stroke-linecap="round"/>
+    <path d="M585 370 592 336" fill="none" stroke="#4a5a66" stroke-width="10" stroke-linecap="round"/>
+    <path d="M592 336c-4-14-14-22-26-22" fill="none" stroke="#4a5a66" stroke-width="9" stroke-linecap="round"/>
+    <path d="M572 314h10" stroke="#22303c" stroke-width="15" stroke-linecap="round"/>
     <circle cx="584" cy="352" r="7" fill="#ffcf5c" stroke="#22303c" stroke-width="3"/>
 
     <!-- звезда и шатуны -->
@@ -197,9 +197,9 @@
   <g id="pelican">
     <!-- хвост -->
     <g fill="#eef3f7" stroke="#22303c" stroke-width="5" stroke-linejoin="round">
-      <path d="M324 268C296 254 268 236 246 216c30 0 62 16 88 38z"/>
-      <path d="M328 282c-32-8-64-18-88-30 26-6 62 2 96 16z"/>
-      <path d="M332 296c-28 0-58-4-80-14 24-10 58-6 88 2z"/>
+      <path d="M334 262C302 254 272 236 252 214c28-2 62 16 84 38z"/>
+      <path d="M338 280C306 278 276 264 256 244c28-6 64 6 86 22z"/>
+      <path d="M340 298C308 302 280 292 260 272c28-10 64-2 86 12z"/>
     </g>
 
     <!-- тело -->
@@ -221,7 +221,11 @@
     <!-- голова -->
     <circle cx="524" cy="150" r="34" fill="#fafcfe" stroke="#22303c" stroke-width="6"/>
     <!-- хохолок -->
-    <path d="M506 118c-10-8-14-20-10-30 8 8 16 12 26 12-4 8-10 14-16 18z" fill="#f2f6fa" stroke="#22303c" stroke-width="4" stroke-linejoin="round"/>
+    <g fill="#f4f8fb" stroke="#22303c" stroke-width="4" stroke-linejoin="round">
+      <path d="M504 122c-14-4-24-14-28-26 12 2 22 8 30 18z"/>
+      <path d="M500 128c-16 2-30-2-40-10 12-6 26-6 40 0z"/>
+      <path d="M504 136c-14 8-28 10-40 6 10-10 22-16 36-16z"/>
+    </g>
 
     <!-- клюв: надклювье -->
     <path d="M552 138c48 4 106 20 148 50-14 10-42 14-72 12l-66-16c-14-12-16-30-10-46z" fill="url(#beakGrad)" stroke="#22303c" stroke-width="5" stroke-linejoin="round"/>
@@ -229,9 +233,9 @@
 
     <!-- клюв: горловой мешок -->
     <path d="M560 184c62 14 108 18 140 4-8 54-48 84-88 78-36-6-58-42-52-82z" fill="url(#pouchGrad)" stroke="#22303c" stroke-width="5" stroke-linejoin="round"/>
-    <g fill="none" stroke="#c96a17" stroke-width="4" stroke-linecap="round" opacity="0.6">
-      <path d="M606 210c4 26 16 44 34 52"/>
-      <path d="M636 214c6 24 16 38 30 44"/>
+    <g fill="none" stroke="#c96a17" stroke-width="4" stroke-linecap="round" opacity="0.55">
+      <path d="M604 206c2 22 10 38 22 46"/>
+      <path d="M634 208c4 20 10 32 18 38"/>
     </g>
 
     <!-- глаз -->
@@ -241,15 +245,11 @@
     <path d="M512 124q12-8 24-2" fill="none" stroke="#22303c" stroke-width="4" stroke-linecap="round"/>
 
     <!-- ближнее крыло -->
-    <path d="M446 234c58 4 110 48 130 88 5 10-4 18-14 13l-20-11 10 18c-5 5-15 2-21-5l-10 3c-20-11-48-33-66-58-16-22-19-48 1-48z" fill="url(#wingGrad)" stroke="#22303c" stroke-width="6" stroke-linejoin="round"/>
+    <path d="M446 230c54 2 104 26 126 66 8 14 0 24-14 22-16-2-34-8-50-16-26-14-48-34-62-54-6-8-4-18 0-18z" fill="url(#wingGrad)" stroke="#22303c" stroke-width="6" stroke-linejoin="round"/>
     <g fill="none" stroke="#c3d0dc" stroke-width="4" stroke-linecap="round">
-      <path d="M486 258c26 18 50 40 62 62"/>
-      <path d="M462 280c22 16 42 36 54 56"/>
-      <path d="M520 292c16 12 28 26 36 42"/>
-    </g>
-    <g fill="#33424e">
-      <path d="M556 320c8-2 15 3 18 10-7 2-14 1-20-4z"/>
-      <path d="M540 310c8-3 15 1 18 8-7 3-14 2-20-3z"/>
+      <path d="M484 254c26 18 50 40 62 62"/>
+      <path d="M458 274c22 16 42 36 54 56"/>
+      <path d="M516 288c14 10 24 24 30 38"/>
     </g>
 
     <!-- ближняя нога -->
@@ -259,10 +259,10 @@
 
     <!-- ближняя педаль и лапа -->
     <rect x="470" y="515" width="56" height="12" rx="6" fill="#3c4b57" transform="rotate(6 498 521)"/>
-    <path d="M484 512c14-10 34-6 46 6-10 3-16 9-19 17-7-9-16-14-27-14z" fill="#f59c14" stroke="#22303c" stroke-width="4" stroke-linejoin="round"/>
-    <g stroke="#d98811" stroke-width="3" stroke-linecap="round">
-      <path d="M500 512v14"/>
-      <path d="M512 514v12"/>
+    <path d="M488 512c4-10 20-14 30-6 8 6 14 16 20 22-8 4-14 2-18-4-2 6-8 8-14 4-2 6-8 6-13 1-7-7-9-12-5-17z" fill="#f59c14" stroke="#22303c" stroke-width="4" stroke-linejoin="round"/>
+    <g stroke="#d98811" stroke-width="3" stroke-linecap="round" fill="none">
+      <path d="M506 504c3 7 2 12-2 16"/>
+      <path d="M516 512c1 6-1 10-5 13"/>
     </g>
   </g>
 
