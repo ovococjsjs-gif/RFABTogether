@@ -100,10 +100,4 @@ struct MenuPausePolicy
     return policy;
 }
 
-// Interactive container/loot menus in RFAB (vanilla ContainerMenu + QuickLootIE's LootMenu).
-[[nodiscard]] constexpr bool IsInteractiveLootMenu(std::string_view aMenuName) noexcept
-{
-    return aMenuName == "ContainerMenu" || aMenuName == "LootMenu";
-}
-
 } // namespace Compat

@@ -49,6 +49,8 @@
 #include <Events/PlayerJoinEvent.h>
 #include <Messages/AssignCharacterRequest.h>
 #include <Messages/AssignCharacterResponse.h>
+#include <Messages/AssignObjectsResponse.h>
+#include <Messages/AssignObjectsRequest.h>
 #include <Messages/CharacterSpawnRequest.h>
 #include <Messages/ClientMessageFactory.h>
 #include <Messages/ClientReferencesMoveRequest.h>
@@ -2357,6 +2359,136 @@ int main(int argc, char** argv)
               "after the rider left the server the guest can mount the horse");
 
         bEnableMountRideGuard = false;
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+    }
+
+    // Scene 12: a container that is registered only when someone takes from it (M11). QuickLootIE and
+    // the auto-loot cloak take items without activating the container, and a container outside the
+    // player's own cell is not registered in advance. Each client rolls its own levelled contents,
+    // so the second player may be looking at items the server has never heard of. The rules:
+    //  - an item the server lists is taken by exactly one player, whatever the order of packets;
+    //  - an item the server does not list is granted ONCE (CoopLootLedger case 3: a script may have
+    //    put it there on that client only, and refusing would eat quest rewards), never twice.
+    // The second rule is what is left of M11: the second player keeps the one item of its own roll
+    // that it took before the server's contents reached it.
+    {
+        std::printf("[scene 12] loot from a container registered on the first take\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kFirstConn = 0xC001u;
+        constexpr TiltedPhoques::ConnectionId_t kSecondConn = 0xC002u;
+        const GameId kRuinCell{0u, 0x000C1001u};
+        const GameId kChest{0u, 0x000C2001u};
+        const GameId kGold{0u, 0x0000000Fu};
+        const GameId kSword{0u, 0x000139B9u};
+        const GameId kAxe{0u, 0x000139B3u};
+
+        Player* pFirst = world.GetPlayerManager().Create(kFirstConn);
+        Player* pSecond = world.GetPlayerManager().Create(kSecondConn);
+        TimeModel t0{};
+        t0.Time = 11.0f;
+        t0.Day = 4;
+        t0.Month = 4;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pFirst, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pSecond, {}, {}, DateTime{t0}});
+        pFirst->SetCellComponent(CellIdComponent{kRuinCell});
+        pSecond->SetCellComponent(CellIdComponent{kRuinCell});
+
+        const auto registerPlayerCharacter = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, uint32_t aCookie) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = aCookie;
+            request.ReferenceId = GameId{0u, 0x14u};
+            request.CellId = kRuinCell;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[24] = 100.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 100.0f;
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const auto stack = [](const GameId& acItem, int32_t aCount) {
+            Inventory::Entry entry{};
+            entry.BaseId = acItem;
+            entry.Count = aCount;
+            return entry;
+        };
+        // What the client sends for a container it has not registered: the contents as it sees them now.
+        const auto registerChest = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, std::initializer_list<Inventory::Entry> aLocalContents) {
+            Harness::ClearOutbox();
+            AssignObjectsRequest request{};
+            ObjectData chest{};
+            chest.Id = kChest;
+            chest.CellId = kRuinCell;
+            for (const auto& entry : aLocalContents)
+                chest.CurrentInventory.AddOrRemoveEntry(entry);
+            request.Objects.push_back(chest);
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignObjectsResponse>(aConn);
+            return (responses.size() == 1 && responses[0].Objects.size() == 1) ? responses[0].Objects[0] : ObjectData{};
+        };
+        const auto take = [&](Player* apPlayer, uint32_t aChestServerId, const GameId& acItem, int32_t aCount) {
+            Harness::ClearOutbox();
+            RequestInventoryChanges request{};
+            request.ServerId = aChestServerId;
+            request.Item = stack(acItem, -aCount);
+            request.UpdateClients = true;
+            return DeliverWire(world, request, apPlayer);
+        };
+        // Net change the server told this connection to apply to the given entity, for one item.
+        const auto toldToChange = [](TiltedPhoques::ConnectionId_t aConn, uint32_t aEntityServerId, const GameId& acItem) {
+            int32_t total = 0;
+            for (const auto& notify : DecodeOutboxMessagesFor<NotifyInventoryChanges>(aConn))
+                if (notify.ServerId == aEntityServerId && notify.Item.BaseId == acItem)
+                    total += notify.Item.Count;
+            return total;
+        };
+        const auto countOf = [](const Inventory& acInventory, const GameId& acItem) {
+            GameId lookup = acItem;
+            return acInventory.GetEntryCountById(lookup);
+        };
+
+        const uint32_t firstChar = registerPlayerCharacter(pFirst, kFirstConn, 900u);
+        const uint32_t secondChar = registerPlayerCharacter(pSecond, kSecondConn, 901u);
+        Check(firstChar != 0xFFFFFFFFu && secondChar != 0xFFFFFFFFu, "both player characters are registered");
+
+        // The first player's game rolled 10 gold and a sword. It takes the gold through the loot
+        // window, so the container reaches the server already without it.
+        const ObjectData asFirst = registerChest(pFirst, kFirstConn, {stack(kSword, 1)});
+        Check(asFirst.IsSenderFirst && asFirst.ServerId != 0, "the first taker's view of the chest becomes the server's");
+        const uint32_t chestId = asFirst.ServerId;
+
+        // The second player's game rolled an axe instead of the sword. It took the axe before the
+        // chest was known to it, and registers the chest as it sees it now: empty.
+        const ObjectData asSecond = registerChest(pSecond, kSecondConn, {});
+        Check(!asSecond.IsSenderFirst && asSecond.ServerId == chestId, "the second taker is told the chest already exists");
+        Check(countOf(asSecond.CurrentInventory, kSword) == 1 && countOf(asSecond.CurrentInventory, kAxe) == 0,
+              "and receives the server's contents (a sword), not its own roll (an axe)");
+
+        // Its queued take of the axe now reaches the server.
+        Check(take(pSecond, chestId, kAxe, 1), "the queued take of an item only the second client rolled is processed");
+        Check(toldToChange(kSecondConn, secondChar, kAxe) == 0,
+              "an item the server never listed is granted once: the second player keeps the axe of its own roll");
+        Check(toldToChange(kFirstConn, chestId, kSword) == 0, "the server's own contents are untouched by it");
+        Check(take(pFirst, chestId, kAxe, 1) && toldToChange(kFirstConn, firstChar, kAxe) == -1,
+              "but not twice: another player claiming the same unlisted item is told to give it back");
+
+        // Both players go for the single sword; the packets arrive one after the other.
+        Check(take(pSecond, chestId, kSword, 1) && toldToChange(kFirstConn, chestId, kSword) == -1 &&
+                  toldToChange(kSecondConn, secondChar, kSword) == 0,
+              "the take that arrives first is granted and the other player sees the sword leave the chest");
+        Check(take(pFirst, chestId, kSword, 1) && toldToChange(kFirstConn, firstChar, kSword) == -1,
+              "the take that arrives second is refused: that player is told to give the sword back");
+        Check(toldToChange(kSecondConn, chestId, kSword) == 0, "and the winner is not told about a second sword leaving the chest");
+
+        // A third registration (a player who walks in later) gets the chest as it is now.
+        const ObjectData later = registerChest(pFirst, kFirstConn, {stack(kSword, 1), stack(kGold, 10)});
+        Check(!later.IsSenderFirst && countOf(later.CurrentInventory, kSword) == 0 && countOf(later.CurrentInventory, kGold) == 0,
+              "a later registration cannot put taken items back into the chest");
+
         std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
     }
 

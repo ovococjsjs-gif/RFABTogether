@@ -140,9 +140,6 @@ TEST_CASE("3A.1 RFAB.ini overlay forces bAlwaysActive=true and MenuPausePolicy r
     REQUIRE(diffs[0].From == "false");
     REQUIRE(diffs[0].To == "true");
 
-    REQUIRE(Compat::IsInteractiveLootMenu("ContainerMenu"));
-    REQUIRE(Compat::IsInteractiveLootMenu("LootMenu"));
-    REQUIRE_FALSE(Compat::IsInteractiveLootMenu("InventoryMenu"));
 }
 
 TEST_CASE("3A.2 PendingContainerLootQueue buffers QuickLootIE/AutoLoot deltas safely across registration", "[rfab][phase3][loot]")
