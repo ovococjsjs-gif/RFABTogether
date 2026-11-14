@@ -27,6 +27,7 @@ run() {
 run "ci diagnostics self-test"    python3 Tools/rfab/ci_diagnostics.py --self-test
 run "hook discipline self-test"   python3 Tools/rfab/check_hook_discipline.py --self-test
 run "wire contract self-test"     python3 Tools/rfab/check_wire_contract.py --self-test
+run "crash symbolizer self-test"  python3 Tools/rfab/symbolize_crash.py --self-test
 
 # Engine threads only read snapshots and post work (hooks, script sinks, CEF handlers).
 run "hook discipline"             python3 Tools/rfab/check_hook_discipline.py
@@ -36,6 +37,17 @@ run "wire contract"               python3 Tools/rfab/check_wire_contract.py
 run "release invariants"          python3 Tools/rfab/check_release_invariants.py
 # Address Library ids and struct layouts match Skyrim SE 1.5.97.
 run "SE 1.5.97 port audit"        python3 Tools/rfab/verify_se1597_port.py
+
+# PowerShell scripts (build, packaging, installer, report collector) are parsed by the real
+# PowerShell parser, and the ones that carry a self-test run it. GitHub's Linux runners ship
+# PowerShell 7; where there is none the check is skipped out loud. The Windows build runs the same
+# scripts under Windows PowerShell 5.1, half an hour later.
+if command -v pwsh >/dev/null 2>&1; then
+    run "powershell syntax"           pwsh -NoProfile -NonInteractive -File Tools/rfab/Test-PowerShellSyntax.ps1
+    run "report collector self-test"  pwsh -NoProfile -NonInteractive -File Tools/rfab/Collect-RfabReport.ps1 -SelfTest
+else
+    echo "==> powershell checks skipped: pwsh is not installed on this machine"
+fi
 
 if [[ ${#failed[@]} -gt 0 ]]; then
     echo "!! ${#failed[@]} static check(s) failed: ${failed[*]}"

@@ -74,9 +74,13 @@ GENERIC = re.compile(
     r"not found|timed out|terminate called|segmentation fault|core dumped|aborted)\b"
 )
 RESULT_LINE = re.compile(
-    r"Passed all|^test cases\s*:|^assertions\s*:|^PASSED \(|\d+ violation\(s\)|^\[release-invariants\] OK\b|^\[scan\] Total|"
-    r"self-test: |every rule catches|^==> all "
+    r"Passed all|^All tests passed \(|^test cases\s*:|^assertions\s*:|^PASSED \(|\d+ violation\(s\)|^\[release-invariants\] OK\b|"
+    r"^\[scan\] Total|self-test: |every rule catches|^==> all |^\[RFAB_RESULT\] "
 )
+# Any script may state a fact about a successful step by printing a line that starts with this
+# marker; it ends up in the notice of the step, which is all of a CI run that can be read back
+# from the development sandbox.
+RESULT_MARKER = "[RFAB_RESULT] "
 
 
 def read_log(path: str) -> list[str]:
@@ -340,8 +344,19 @@ def report_failure(raw_lines: list[str], step: str, exit_code: str, workspace: s
     return out
 
 
+def result_lines(raw_lines: list[str]) -> list[str]:
+    results = []
+    for line in raw_lines:
+        text = line.strip()
+        if RESULT_LINE.search(text):
+            if text.startswith(RESULT_MARKER):
+                text = text[len(RESULT_MARKER):]
+            results.append(clip(text, 300))
+    return results[-8:]
+
+
 def report_success(raw_lines: list[str], step: str) -> list[str]:
-    results = [clip(line.strip(), 200) for line in raw_lines if RESULT_LINE.search(line.strip())][-8:]
+    results = result_lines(raw_lines)
     message = f"OK: {step_title(step)}"
     if results:
         message += " | " + " | ".join(results)
@@ -493,6 +508,8 @@ def self_test() -> int:
     expect(any("100%25 done" in a for a in out), "plain: percent sign not escaped")
 
     # 7. Success mode reports the result lines.
+    marked = result_lines(["noise", "[RFAB_RESULT] symbols SkyrimSE: 212345 functions", "All tests passed (4494898 assertions in 273 test cases)", "more noise"])
+    expect(marked == ["symbols SkyrimSE: 212345 functions", "All tests passed (4494898 assertions in 273 test cases)"], f"success: marked result lines: {marked}")
     out = report_success(["==> running core tests", "Passed all 248 test cases with 4488389 assertions.", ""], "core tests")
     expect(out == ["::notice title=RFAB_CI::OK: core tests | Passed all 248 test cases with 4488389 assertions."], f"ok: {out}")
 
@@ -511,6 +528,8 @@ def main() -> int:
     parser.add_argument("--step", default="step")
     parser.add_argument("--exit-code", default="")
     parser.add_argument("--ok", action="store_true", help="the step succeeded: print one notice with its result lines")
+    parser.add_argument("--results-only", action="store_true",
+                        help="print the result lines of a successful step as plain text joined by ' | ' (for a caller that writes its own notice)")
     parser.add_argument("--workspace", default=os.environ.get("GITHUB_WORKSPACE", ""))
     parser.add_argument("--max-chunks", type=int, default=MAX_ERROR_CHUNKS,
                         help="error annotations this step may use (a job step shows at most ten per level, "
@@ -527,6 +546,9 @@ def main() -> int:
         if not args.log:
             raise ValueError("--log is required")
         raw_lines = read_log(args.log)
+        if args.results_only:
+            print(" | ".join(result_lines(raw_lines)), flush=True)
+            return 0
         lines = report_success(raw_lines, args.step) if args.ok else report_failure(raw_lines, args.step, args.exit_code, args.workspace, args.max_chunks)
         for line in lines:
             print(line, flush=True)

@@ -915,6 +915,7 @@ $script:DiagMaxChunks = 8
 $script:DiagShared = $false
 
 function Invoke-LoggedCmd([string]$StepName, [string]$CmdString) {
+    $stepResults = ""
     Write-Host "`n==> $StepName" -ForegroundColor Cyan
     $script:ProgressLog.Add("- ⏳ Running: ``$StepName`` ($([DateTime]::UtcNow.ToString('HH:mm:ss')) UTC)")
 
@@ -963,12 +964,30 @@ function Invoke-LoggedCmd([string]$StepName, [string]$CmdString) {
             Remove-Item -LiteralPath $stepLog -Force -ErrorAction SilentlyContinue
             throw "$StepName exited with code $code"
         }
+        # What the step said about itself (test totals, lines marked [RFAB_RESULT]) goes into its
+        # notice: of a successful run, notices are all that can be read from outside GitHub.
+        try {
+            $diagScript = Join-Path $script:RfabRepoRoot "Tools\rfab\ci_diagnostics.py"
+            if (Test-Path -LiteralPath $diagScript) {
+                $stepResults = ((& python $diagScript --log $stepLog --results-only) | Out-String).Trim()
+            }
+        } catch {
+            $stepResults = ""
+        }
         Remove-Item -LiteralPath $stepLog -Force -ErrorAction SilentlyContinue
     } elseif ($code -ne 0) {
         throw "$StepName exited with code $code (no log file)"
     }
     $script:ProgressLog[$script:ProgressLog.Count - 1] = "- ✅ Completed: ``$StepName`` ($([DateTime]::UtcNow.ToString('HH:mm:ss')) UTC)"
-    Emit-Annotation "notice" "RFAB_BUILD" "OK: $StepName"
+    # A job step shows ten notices at most, and the whole build is one job step: the per-target
+    # builds of step 4 stay silent when they succeed, so that BUILD_VERIFIED is not the one dropped.
+    if (-not $script:DiagShared) {
+        if ($stepResults) {
+            Emit-Annotation "notice" "RFAB_BUILD" "OK: $StepName | $stepResults"
+        } else {
+            Emit-Annotation "notice" "RFAB_BUILD" "OK: $StepName"
+        }
+    }
 }
 
 try {

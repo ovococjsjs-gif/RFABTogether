@@ -140,6 +140,12 @@ Copy-Item -LiteralPath (Join-Path $RepoRoot "INSTALL_RFAB_ONLINE.bat") `
           -Destination (Join-Path $StageRoot "INSTALL_RFAB_ONLINE.bat") -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "PROCHTI_MENYA.txt") `
           -Destination (Join-Path $StageRoot "PROCHTI_MENYA.txt") -Force
+# The report collector: Setup-RfabOnline.ps1 installs it into the RFAB folder (it must be next to
+# the installer script for that), and the copy at the package root works straight from the archive.
+Copy-Item -LiteralPath (Join-Path $RepoRoot "Tools\rfab\Collect-RfabReport.ps1") `
+          -Destination (Join-Path $StageTools "Collect-RfabReport.ps1") -Force
+Copy-Item -LiteralPath (Join-Path $RepoRoot "COLLECT_RFAB_REPORT.bat") `
+          -Destination (Join-Path $StageRoot "COLLECT_RFAB_REPORT.bat") -Force
 
 Write-Host "==> [4/6] Running PE64 Transitive DLL Import Auto-Bundler & Integrity Gate..." -ForegroundColor Cyan
 $XmakePkgDir = Join-Path $env:LOCALAPPDATA ".xmake\packages"
@@ -259,12 +265,63 @@ if (-not (Test-Path -LiteralPath (Join-Path $MockRfab "MO2\mods\NSF\NetScriptFra
 if (-not (Test-Path -LiteralPath (Join-Path $MockRfab "MO2\profiles\RFAB\saves\Quarantined_Corrupt_v100\TruncatedScrapHeap.ess"))) {
     throw "TruncatedScrapHeap.ess was not quarantined during Setup-RfabOnline.ps1!"
 }
+# The report collector has to work on the day of the playtest, so it is run here, on the RFAB
+# folder the installer has just filled, by the same Windows PowerShell the players have.
+$CollectorInstalled = Join-Path $MockRfab "Collect-RfabReport.ps1"
+if (-not (Test-Path -LiteralPath $CollectorInstalled)) { throw "Collect-RfabReport.ps1 was not installed into <RfabDir>!" }
+if (-not (Test-Path -LiteralPath (Join-Path $MockRfab "COLLECT_RFAB_REPORT.bat"))) { throw "COLLECT_RFAB_REPORT.bat was not installed into <RfabDir>!" }
+$CollectOut = Join-Path $MockRfab "report_out"
+$ErrorActionPreference = "Continue"
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $CollectorInstalled -GameRoot $MockRfab -OutDir $CollectOut -NoUi
+$collectCode = $LASTEXITCODE
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $CollectorInstalled -SelfTest
+$collectSelfTestCode = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+if ($collectCode -ne 0) { throw "Collect-RfabReport.ps1 failed on the freshly installed mock RFAB ($collectCode)!" }
+if ($collectSelfTestCode -ne 0) { throw "Collect-RfabReport.ps1 -SelfTest failed under Windows PowerShell ($collectSelfTestCode)!" }
+$CollectedZip = Get-ChildItem -LiteralPath $CollectOut -Filter "RFAB_Report_*.zip" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $CollectedZip) { throw "Collect-RfabReport.ps1 reported success but wrote no RFAB_Report_*.zip!" }
+Write-Host "[RFAB_RESULT] report collector: installed into <RfabDir>, collected the mock install ($([math]::Round($CollectedZip.Length / 1KB)) KB zip)"
+
 Remove-Item -LiteralPath $MockRfab -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "  [OK] End-to-end installer test passed: clean wipe, other mods untouched, old edits undone!" -ForegroundColor Green
 
 Write-Host "==> [6/6] Compressing Release ZIP Archives & SHA256 Checksums..." -ForegroundColor Cyan
 Get-ChildItem -LiteralPath $BuildRel -Filter "*.pdb" -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $PdbDir $_.Name) -Force
+}
+
+# Linker maps -> symbols. The maps go into the PDB archive as they are. A compact table of the
+# launcher (and of the server) is installed next to the binary, so that Collect-RfabReport.ps1 puts
+# the symbols of exactly this build into every report; Tools\rfab\symbolize_crash.py reads both
+# forms. Nothing here may fail the build: a build without symbols is still a build.
+foreach ($sym in @(
+        @{ Map = "SkyrimSE.map"; Out = (Join-Path $StageClient "RFAB_Online_Symbols.gz") },
+        @{ Map = "STServer.map"; Out = (Join-Path $StageServer "RFAB_Online_Server_Symbols.gz") })) {
+    try {
+        $mapFile = $null
+        foreach ($searchRoot in @($BuildRel, (Join-Path $RepoRoot "build"))) {
+            if (-not $mapFile -and (Test-Path -LiteralPath $searchRoot)) {
+                $mapFile = Get-ChildItem -LiteralPath $searchRoot -Filter $sym.Map -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            }
+        }
+        if (-not $mapFile -and (Test-Path -LiteralPath (Join-Path $RepoRoot $sym.Map))) {
+            $mapFile = Get-Item -LiteralPath (Join-Path $RepoRoot $sym.Map)
+        }
+        if (-not $mapFile) {
+            Write-Host "[RFAB_RESULT] symbols: $($sym.Map) NOT FOUND - crash addresses of this build cannot be named"
+            continue
+        }
+        Copy-Item -LiteralPath $mapFile.FullName -Destination (Join-Path $PdbDir $mapFile.Name) -Force
+        $ErrorActionPreference = "Continue"
+        & python (Join-Path $RepoRoot "Tools\rfab\symbolize_crash.py") --export-symbols $mapFile.FullName --out $sym.Out
+        $symCode = $LASTEXITCODE
+        $ErrorActionPreference = "Stop"
+        if ($symCode -ne 0) { Write-Host "[RFAB_RESULT] symbols: export of $($sym.Map) failed ($symCode)" }
+    } catch {
+        $ErrorActionPreference = "Stop"
+        Write-Host "[RFAB_RESULT] symbols: $($sym.Map) not packaged: $($_.Exception.Message)"
+    }
 }
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
@@ -286,6 +343,14 @@ Copy-Item -LiteralPath (Join-Path $StageMo2 "SKSE\Plugins\RFAB_Online_Bindings.j
 Invoke-RobocopySafe -Src (Join-Path $StageClient "UI") -Dst (Join-Path $QuickDir "UI") -ExtraArgs @("/MIR")
 foreach ($sf in @("SkyrimTogetherServer.exe", "STServer.dll")) {
     Copy-Item -LiteralPath (Join-Path $StageServer $sf) -Destination (Join-Path $QuickSrvDir $sf) -Force
+}
+# The symbol tables travel with the binaries they describe (a table of another build names the
+# wrong functions).
+if (Test-Path -LiteralPath (Join-Path $StageClient "RFAB_Online_Symbols.gz")) {
+    Copy-Item -LiteralPath (Join-Path $StageClient "RFAB_Online_Symbols.gz") -Destination (Join-Path $QuickDir "RFAB_Online_Symbols.gz") -Force
+}
+if (Test-Path -LiteralPath (Join-Path $StageServer "RFAB_Online_Server_Symbols.gz")) {
+    Copy-Item -LiteralPath (Join-Path $StageServer "RFAB_Online_Server_Symbols.gz") -Destination (Join-Path $QuickSrvDir "RFAB_Online_Server_Symbols.gz") -Force
 }
 
 $QuickUpdatePs1 = @'
@@ -348,7 +413,7 @@ $ClientDst = Join-Path $ModRoot "SkyrimTogetherReborn"
 if (-not (Test-Path -LiteralPath $ClientDst)) {
     throw "Client folder not found: $ClientDst (run INSTALL_RFAB_ONLINE.bat from Full_Installer first!)"
 }
-foreach ($cf in @("SkyrimSE.exe", "SkyrimTogether.exe", "EarlyLoad.dll", "TPProcess.exe")) {
+foreach ($cf in @("SkyrimSE.exe", "SkyrimTogether.exe", "EarlyLoad.dll", "TPProcess.exe", "RFAB_Online_Symbols.gz")) {
     if (Test-Path -LiteralPath (Join-Path $SrcDir $cf)) {
         Copy-Item -LiteralPath (Join-Path $SrcDir $cf) -Destination (Join-Path $ClientDst $cf) -Force
     }
@@ -482,6 +547,9 @@ foreach ($SrvDst in $SrvCandidates) {
     if ($SrvDst -and (Test-Path -LiteralPath $SrvDst)) {
         foreach ($sf in @("SkyrimTogetherServer.exe", "STServer.dll")) {
             Copy-Item -LiteralPath (Join-Path $SrcDir "Server\$sf") -Destination (Join-Path $SrvDst $sf) -Force
+        }
+        if (Test-Path -LiteralPath (Join-Path $SrcDir "Server\RFAB_Online_Server_Symbols.gz")) {
+            Copy-Item -LiteralPath (Join-Path $SrcDir "Server\RFAB_Online_Server_Symbols.gz") -Destination (Join-Path $SrvDst "RFAB_Online_Server_Symbols.gz") -Force
         }
         $SrvIni = Join-Path $SrvDst "config\STServer.ini"
         if (Test-Path -LiteralPath $SrvIni) {
