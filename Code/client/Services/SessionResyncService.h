@@ -50,6 +50,7 @@ struct SessionResyncService final : Session::IParticipant
     void OnSessionBegin(const Session::Transition& acTransition) noexcept override;
     void OnSessionEnd(const Session::Transition& acTransition) noexcept override;
     void OnWorldLoadBegin(const Session::Transition& acTransition) noexcept override;
+    void OnWorldLoadEnd(const Session::Transition& acTransition) noexcept override;
 
 private:
     void OnUpdate(const UpdateEvent& acEvent) noexcept;

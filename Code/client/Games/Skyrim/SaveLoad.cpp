@@ -1,4 +1,5 @@
 #include <TiltedOnlinePCH.h>
+#include <CrashBreadcrumbs.h>
 
 #include <SaveLoad.h>
 #include <common/CoopWorldStabilizer.h>
@@ -164,6 +165,7 @@ bool PatchRelativeCallSite(uintptr_t aCallSiteAddr, void* apDetourFn, TFn** appO
 
 bool TP_MAKE_THISCALL(HookLoadEntry, BGSSaveLoadManager, void* apFileEntry, uint64_t aArg2, uint64_t aArg3, uint64_t aArg4, uint64_t aArg5)
 {
+    RFAB_HOOK_CRUMB("HookLoadEntry");
     RFAB_EXPECT_MAIN_THREAD("HookLoadEntry");
     if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealLoadEntry, apThis, apFileEntry, aArg2, aArg3, aArg4, aArg5);
@@ -196,6 +198,7 @@ bool TP_MAKE_THISCALL(HookLoadCallSite, BGSSaveLoadManager, uint64_t* apUnk0, ui
 
 bool TP_MAKE_THISCALL(HookSaveImpl, BGSSaveLoadManager, int32_t aDeviceId, uint32_t aOutputStats, const char* acpFileName)
 {
+    RFAB_HOOK_CRUMB("HookSaveImpl");
     RFAB_EXPECT_MAIN_THREAD("HookSaveImpl");
     if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealSaveImpl, apThis, aDeviceId, aOutputStats, acpFileName);
@@ -218,6 +221,7 @@ bool TP_MAKE_THISCALL(HookSaveImpl, BGSSaveLoadManager, int32_t aDeviceId, uint3
 
 bool TP_MAKE_THISCALL(HookSaveGame2, BGSSaveLoadManager, uint64_t aArg1, uint64_t aArg2, uint64_t aArg3)
 {
+    RFAB_HOOK_CRUMB("HookSaveGame2");
     RFAB_EXPECT_MAIN_THREAD("HookSaveGame2");
     if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealSaveGame2, apThis, aArg1, aArg2, aArg3);
@@ -235,6 +239,7 @@ bool TP_MAKE_THISCALL(HookSaveGame2, BGSSaveLoadManager, uint64_t aArg1, uint64_
 
 bool TP_MAKE_THISCALL(HookLoadImpl, BGSSaveLoadManager, const char* acpFileName, int32_t aDeviceId, uint32_t aOutputStats, bool aCheckForMods)
 {
+    RFAB_HOOK_CRUMB("HookLoadImpl");
     RFAB_EXPECT_MAIN_THREAD("HookLoadImpl");
     if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealLoadImpl, apThis, acpFileName, aDeviceId, aOutputStats, aCheckForMods);
@@ -247,6 +252,7 @@ bool TP_MAKE_THISCALL(HookLoadImpl, BGSSaveLoadManager, const char* acpFileName,
 
 bool TP_MAKE_THISCALL(HookLoadMostRecent, BGSSaveLoadManager)
 {
+    RFAB_HOOK_CRUMB("HookLoadMostRecent");
     RFAB_EXPECT_MAIN_THREAD("HookLoadMostRecent");
     if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealLoadMostRecent, apThis);
@@ -259,6 +265,7 @@ bool TP_MAKE_THISCALL(HookLoadMostRecent, BGSSaveLoadManager)
 
 void TP_MAKE_THISCALL(HookQueueSaveLoadTask, BGSSaveLoadManager, uint32_t aTaskMask)
 {
+    RFAB_HOOK_CRUMB("HookQueueSaveLoadTask", aTaskMask);
     RFAB_EXPECT_MAIN_THREAD("HookQueueSaveLoadTask");
     if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
     {

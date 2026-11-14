@@ -4,6 +4,7 @@
 
 #include <Actor.h>
 #include <Components.h>
+#include <CrashBreadcrumbs.h>
 #include <Events/UpdateEvent.h>
 #include <Forms/ActorValueInfo.h>
 #include <Forms/TESObjectCELL.h>
@@ -255,11 +256,14 @@ void SessionResyncService::OnResyncComplete(const NotifyResyncComplete& acMessag
 
 void SessionResyncService::OnSessionBegin(const Session::Transition&) noexcept
 {
+    RFAB_EVENT_CRUMB("session-begin");
     m_pollAccumulatorSec = 0.0;
+    m_digestAccumulatorSec = 0.0;
 }
 
 void SessionResyncService::OnSessionEnd(const Session::Transition&) noexcept
 {
+    RFAB_EVENT_CRUMB("session-end");
     LogStats("session end");
     m_ledger.Reset();
     m_outgoing.clear();
@@ -270,8 +274,14 @@ void SessionResyncService::OnWorldLoadBegin(const Session::Transition& acTransit
     // World packets queued during the pause are discarded with the reload and spawns arriving during
     // the load are dropped: ask for the whole session once the load is over (sent only when the player
     // stands in a loaded cell again). Offline loads have no session to resync.
+    RFAB_EVENT_CRUMB("world-load-begin", acTransition.Online ? 1u : 0u);
     if (acTransition.Online)
         NoteWorldReloadStarted();
+}
+
+void SessionResyncService::OnWorldLoadEnd(const Session::Transition& acTransition) noexcept
+{
+    RFAB_EVENT_CRUMB("world-load-end", acTransition.Online ? 1u : 0u);
 }
 
 void SessionResyncService::LogStats(const char* acpWhen) const noexcept

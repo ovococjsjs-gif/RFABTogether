@@ -177,6 +177,18 @@ Get-FileHash .\RFAB_Online_v3.1.8_Full_Installer.zip -Algorithm SHA256
 
 Как отчёт читается (для разработки): `python3 Tools/rfab/symbolize_crash.py <папка распакованного отчёта>` находит в ней журнал вылетов и символы, проверяет, что символы от установленного бинарника, и для каждого кадра стека пишет функцию клиента или номер функции игры из Address Library с местом в коде, где клиент на неё ссылается.
 
+В записи о вылете (`RFAB_Online_Crash.log`) после стека идут строки `[crumb …]` — последние события до вылета: до 40 событий сессии и мира, до 28 пакетов, до 28 вызовов хуков. Скрипт выше выводит их одной лентой по времени:
+
+```
+    before the fault (oldest first; '*' = on the thread that crashed):
+      * -  5210 ms  event   world-load-end (in a session)
+      * -    40 ms  packet  packet-in kNotifyRemoveCharacter, 88 bytes
+      * -    38 ms  event   remove-character: server id 1A3
+      * -     3 ms  hook    HookActorProcess form FF000A12  x57
+      * -     0 ms  hook    HookDamageActor form FF000A12 (other 14)
+```
+
+
 ---
 
 ## 5. Что уже проверено без игры (и во что можно не целиться)

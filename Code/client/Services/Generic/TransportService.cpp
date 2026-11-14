@@ -1,5 +1,6 @@
 
 #include <Services/TransportService.h>
+#include <CrashBreadcrumbs.h>
 
 #include <Events/ConnectionErrorEvent.h>
 #include <Events/UpdateEvent.h>
@@ -84,6 +85,8 @@ bool TransportService::Send(const ClientMessage& acMessage, const TiltedPhoques:
 
     if (IsConnected())
     {
+        RFAB_PACKET_CRUMB("packet-out", static_cast<uint32_t>(acMessage.GetOpcode()));
+
         ScopedAllocator _{s_allocator};
 
         Buffer buffer(1 << 16);
@@ -115,6 +118,7 @@ void TransportService::OnConsume(const void* apData, uint32_t aSize)
     }
 
     const uint32_t opcode = static_cast<uint32_t>(pMessage->GetOpcode());
+    RFAB_PACKET_CRUMB("packet-in", opcode, aSize);
     if (opcode >= static_cast<uint32_t>(kServerOpcodeMax) || !m_messageHandlers[opcode])
     {
         spdlog::error("[RFAB Transport] Rejecting inbound server packet with invalid/unhandled opcode {}", opcode);
@@ -299,7 +303,10 @@ void TransportService::FlushPausedInboundPackets() noexcept
 
         const uint32_t opcode = static_cast<uint32_t>(pMessage->GetOpcode());
         if (opcode < static_cast<uint32_t>(kServerOpcodeMax) && m_messageHandlers[opcode])
+        {
+            RFAB_PACKET_CRUMB("packet-in-deferred", opcode);
             m_messageHandlers[opcode](pMessage);
+        }
     }
 
     // Movement/animation folded during the pause goes last, so spawns/removals queued during the

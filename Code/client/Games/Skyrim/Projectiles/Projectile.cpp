@@ -1,4 +1,5 @@
 #include "Projectile.h"
+#include <CrashBreadcrumbs.h>
 #include <Games/Skyrim/Forms/TESObjectWEAP.h>
 #include <Games/Skyrim/Forms/MagicItem.h>
 #include <Games/Skyrim/Forms/TESAmmo.h>
@@ -62,6 +63,7 @@ BSPointerHandle<Projectile>* Projectile::Launch(BSPointerHandle<Projectile>* apR
 
 BSPointerHandle<Projectile>* TP_MAKE_THISCALL(HookLaunch, BSPointerHandle<Projectile>, Projectile::LaunchData& arData)
 {
+    RFAB_HOOK_CRUMB("HookLaunch");
     if (!World::IsCreated() || !World::IsConnectedCached())
         return TiltedPhoques::ThisCall(RealLaunch, apThis, arData);
 

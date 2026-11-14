@@ -1,4 +1,5 @@
 #include <TiltedOnlinePCH.h>
+#include <CrashBreadcrumbs.h>
 
 #include <Services/DiscoveryService.h>
 #include <Services/CharacterService.h>
@@ -108,6 +109,7 @@ void DiscoveryService::VisitExteriorCell(bool aForceTrigger) noexcept
 
         cellChangeEvent.CurrentCoords = gameCurrentGrid;
 
+        RFAB_EVENT_CRUMB("cell-change-exterior", pCell->formID, worldSpaceId);
         m_dispatcher.trigger(cellChangeEvent);
 
         m_currentGrid = gameCurrentGrid;
@@ -129,6 +131,7 @@ void DiscoveryService::VisitInteriorCell(bool aForceTrigger) noexcept
             return;
         }
 
+        RFAB_EVENT_CRUMB("cell-change-interior", cellId);
         m_dispatcher.trigger(cellChangeEvent);
         m_interiorCellId = cellId;
     }

@@ -1,4 +1,5 @@
 #include <Games/References.h>
+#include <CrashBreadcrumbs.h>
 #include <Games/Skyrim/EquipManager.h>
 #include <AI/AIProcess.h>
 #include <Misc/MiddleProcess.h>
@@ -581,6 +582,7 @@ uint8_t Actor::GetPerkRank(uint32_t aPerkFormId) const noexcept
 
 bool TP_MAKE_THISCALL(HookRemoveSpell, Actor, MagicItem* apSpell)
 {
+    RFAB_HOOK_CRUMB("HookRemoveSpell", apThis ? apThis->formID : 0, apSpell ? apSpell->formID : 0);
     if (!apThis || !apSpell || apThis->IsDeleted())
         return false;
 
@@ -619,6 +621,7 @@ Actor* TP_MAKE_THISCALL(HookCharacterConstructor2, Actor, uint8_t aUnk)
 
 Actor* TP_MAKE_THISCALL(HookCharacterDestructor, Actor)
 {
+    RFAB_HOOK_CRUMB("HookCharacterDestructor", apThis ? apThis->formID : 0);
     TP_EMPTY_HOOK_PLACEHOLDER;
 
     if (apThis)
@@ -1514,6 +1517,7 @@ void Actor::FixVampireLordModel() noexcept
 
 char TP_MAKE_THISCALL(HookSetPosition, Actor, NiPoint3& aPosition)
 {
+    RFAB_HOOK_CRUMB("HookSetPosition", 0, apThis ? apThis->formID : 0);
     if (!apThis)
         return 0;
 
@@ -1540,6 +1544,7 @@ static TForceState* RealForceState = nullptr;
 
 void TP_MAKE_THISCALL(HookForceState, Actor, const NiPoint3& acPosition, float aX, float aZ, TESObjectCELL* apCell, TESWorldSpace* apWorldSpace, bool aUnkBool)
 {
+    RFAB_HOOK_CRUMB("HookForceState", apThis ? apThis->formID : 0);
     /*const auto pNpc = Cast<TESNPC>(apThis->baseForm);
     if (pNpc)
     {
@@ -1559,6 +1564,7 @@ static TSpawnActorInWorld* RealSpawnActorInWorld = nullptr;
 // TODO: this isn't SpawnActorInWorld, this is TESObjectREFR::UpdateReference3D()
 bool TP_MAKE_THISCALL(HookSpawnActorInWorld, Actor)
 {
+    RFAB_HOOK_CRUMB("HookSpawnActorInWorld", apThis ? apThis->formID : 0);
     if (!apThis || apThis->IsDeleted())
         return false;
 
@@ -1661,6 +1667,7 @@ namespace
 // TODO: this is flawed, since it does not account for invulnerable actors
 bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bool aKillMove)
 {
+    RFAB_HOOK_CRUMB("HookDamageActor", apThis ? apThis->formID : 0, apHitter ? apHitter->formID : 0);
     if (!apThis)
         return false;
 
@@ -1870,6 +1877,7 @@ static TApplyActorEffect* RealApplyActorEffect = nullptr;
 
 void TP_MAKE_THISCALL(HookApplyActorEffect, ActiveEffect, Actor* apTarget, float aEffectValue, unsigned int unk1)
 {
+    RFAB_HOOK_CRUMB("HookApplyActorEffect", 0, apTarget ? apTarget->formID : 0);
     if (!World::IsCreated() || !World::IsConnectedCached())
         return TiltedPhoques::ThisCall(RealApplyActorEffect, apThis, apTarget, aEffectValue, unk1);
 
@@ -2123,6 +2131,7 @@ void TP_MAKE_THISCALL(HookRestoreActorValue, Actor, ActorValueOwner::ForceMode a
 
 void TP_MAKE_THISCALL(HookAddInventoryItem, Actor, TESBoundObject* apItem, ExtraDataList* apExtraData, int32_t aCount, TESObjectREFR* apOldOwner)
 {
+    RFAB_HOOK_CRUMB("HookAddInventoryItem", apThis ? apThis->formID : 0, apItem ? apItem->formID : 0);
     const auto* pExt = apThis ? apThis->GetExtension() : nullptr;
     const bool isInteractivePlayerTransfer =
         (apOldOwner && apOldOwner == PlayerCharacter::Get()) ||
@@ -2166,6 +2175,7 @@ void TP_MAKE_THISCALL(HookAddInventoryItem, Actor, TESBoundObject* apItem, Extra
 
 void* TP_MAKE_THISCALL(HookPickUpObject, Actor, TESObjectREFR* apObject, int32_t aCount, bool aUnk1, float aUnk2)
 {
+    RFAB_HOOK_CRUMB("HookPickUpObject", apThis ? apThis->formID : 0, apObject ? apObject->formID : 0);
     if (World::IsCreated() &&
         World::IsConnectedCached() &&
         !ScopedInventoryOverride::IsOverriden() &&
@@ -2217,6 +2227,7 @@ void Actor::PickUpObject(TESObjectREFR* apObject, int32_t aCount, bool aUnk1, fl
 
 void* TP_MAKE_THISCALL(HookDropObject, Actor, void* apResult, TESBoundObject* apObject, ExtraDataList* apExtraData, int32_t aCount, NiPoint3* apLocation, NiPoint3* apRotation)
 {
+    RFAB_HOOK_CRUMB("HookDropObject", apThis ? apThis->formID : 0, apObject ? apObject->formID : 0);
     const bool cSync = World::IsCreated() &&
                        World::IsConnectedCached() &&
                        apThis &&
@@ -2421,6 +2432,7 @@ static TProcessResponse* RealProcessResponse = nullptr;
 
 uint64_t TP_MAKE_THISCALL(HookProcessResponse, void, DialogueItem* apVoice, Actor* apTalkingActor, Actor* apTalkedToActor)
 {
+    RFAB_HOOK_CRUMB("HookProcessResponse", apTalkingActor ? apTalkingActor->formID : 0);
     if (apTalkingActor && apTalkingActor->GetExtension() && apTalkingActor->GetExtension()->IsRemotePlayer())
         return 0;
 
@@ -2433,6 +2445,7 @@ uint64_t TP_MAKE_THISCALL(HookProcessResponse, void, DialogueItem* apVoice, Acto
 
 bool TP_MAKE_THISCALL(HookInitiateMountPackage, Actor, Actor* apMount)
 {
+    RFAB_HOOK_CRUMB("HookInitiateMountPackage", apThis ? apThis->formID : 0, apMount ? apMount->formID : 0);
     if (World::IsCreated() &&
         World::IsConnectedCached() &&
         apThis &&
@@ -2451,6 +2464,7 @@ static TUnequipObject* RealUnequipObject = nullptr;
 
 void TP_MAKE_THISCALL(HookUnequipObject, Actor, void* apUnk1, TESBoundObject* apObject, int32_t aUnk2, void* apUnk3)
 {
+    RFAB_HOOK_CRUMB("HookUnequipObject", apThis ? apThis->formID : 0, apObject ? apObject->formID : 0);
     if (!apThis || !apObject || apThis->IsDeleted() || !apThis->currentProcess || !apThis->currentProcess->middleProcess)
         return;
 
@@ -2536,6 +2550,7 @@ bool Actor::IsSpeakingInScene()
 
 char TP_MAKE_THISCALL(HookActorProcess, Actor, float aDeltaTime)
 {
+    RFAB_HOOK_CRUMB("HookActorProcess", 0, apThis ? apThis->formID : 0);
     if (!apThis)
         return 0;
 
@@ -2559,6 +2574,7 @@ static TAddDeathItems* RealAddDeathItems = nullptr;
 
 void TP_MAKE_THISCALL(HookAddDeathItems, Actor)
 {
+    RFAB_HOOK_CRUMB("HookAddDeathItems", apThis ? apThis->formID : 0);
     if (!apThis)
         return;
 

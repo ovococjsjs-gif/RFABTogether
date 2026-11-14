@@ -1,4 +1,5 @@
 #include "Forms/TESObjectCELL.h"
+#include <CrashBreadcrumbs.h>
 #include "Forms/TESWorldSpace.h"
 #include "Services/PapyrusService.h"
 #include <Services/PartyService.h>
@@ -1772,6 +1773,7 @@ void CharacterService::OnCharacterSpawn(const CharacterSpawnRequest& acMessage) 
 
 void CharacterService::OnOwnershipTransfer(const NotifyOwnershipTransfer& acMessage) const noexcept
 {
+    RFAB_EVENT_CRUMB("ownership-transfer", acMessage.ServerId, static_cast<uint32_t>(acMessage.OwnershipEpoch));
     const uint64_t knownEpoch = m_ownershipLeases.EpochOf(acMessage.ServerId);
     if ((acMessage.OwnershipEpoch != 0 && acMessage.OwnershipEpoch < knownEpoch) ||
         (acMessage.OwnershipEpoch == 0 && knownEpoch != 0))
@@ -1856,6 +1858,7 @@ void CharacterService::OnOwnershipTransfer(const NotifyOwnershipTransfer& acMess
 
 void CharacterService::OnRemoveCharacter(const NotifyRemoveCharacter& acMessage) const noexcept
 {
+    RFAB_EVENT_CRUMB("remove-character", acMessage.ServerId);
     m_world.GetSessionResyncService().NoteEntityRemoved(acMessage.ServerId);
     m_ownershipLeases.Forget(acMessage.ServerId);
     m_lastVoluntaryClaimMs.erase(acMessage.ServerId);
@@ -2304,6 +2307,8 @@ void CharacterService::DematerializeRemoteView(entt::entity aEntity, RemoteEntit
     else if (const auto* pRemoteComp = m_world.try_get<RemoteComponent>(aEntity))
         formId = pRemoteComp->CachedRefId;
 
+    RFAB_EVENT_CRUMB("remote-actor-dematerialize", formId, apModel ? apModel->SpawnRequest.ServerId : 0u);
+
     Actor* pActor = formId != 0 ? Cast<Actor>(TESForm::GetById(formId)) : nullptr;
     const bool isNetworkActor =
         (apModel && apModel->SpawnRequest.FormId == GameId{}) || IsNetworkCreatedActor(pActor);
@@ -2429,6 +2434,8 @@ Actor* CharacterService::MaterializeRemoteView(
 {
     if (!m_world.valid(aEntity) || !apTargetCell || !apTargetCell->IsAttachedAndLoaded())
         return nullptr;
+
+    RFAB_EVENT_CRUMB("remote-actor-materialize", aModel.SpawnRequest.ServerId, apTargetCell->formID);
 
     const auto& acMessage = aModel.SpawnRequest;
     const NiPoint3 spawnPos = aModel.LatestPosition;

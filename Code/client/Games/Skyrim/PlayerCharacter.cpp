@@ -1,4 +1,5 @@
 #include <PlayerCharacter.h>
+#include <CrashBreadcrumbs.h>
 #include <Games/ActorExtension.h>
 
 #include <Structs/Skyrim/AnimationGraphDescriptor_Master_Behavior.h>
@@ -176,6 +177,7 @@ void PlayerCharacter::RemoveWaypoint() noexcept
 
 char TP_MAKE_THISCALL(HookPickUpObject, PlayerCharacter, TESObjectREFR* apObject, int32_t aCount, bool aUnk1, bool aUnk2)
 {
+    RFAB_HOOK_CRUMB("HookPickUpObject", apObject ? apObject->formID : 0);
     if (World::IsCreated() &&
         World::IsConnectedCached() &&
         !ScopedInventoryOverride::IsOverriden() &&
@@ -227,6 +229,7 @@ char TP_MAKE_THISCALL(HookPickUpObject, PlayerCharacter, TESObjectREFR* apObject
 
 void TP_MAKE_THISCALL(HookSetBeastForm, void, void* apUnk1, void* apUnk2, bool aEntering)
 {
+    RFAB_HOOK_CRUMB("HookSetBeastForm", aEntering ? 1u : 0u);
     if (!aEntering)
     {
         if (PlayerCharacter* pPlayer = PlayerCharacter::Get())

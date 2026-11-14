@@ -1,4 +1,5 @@
 #include <TiltedOnlinePCH.h>
+#include <CrashBreadcrumbs.h>
 
 #include <Games/References.h>
 
@@ -25,6 +26,7 @@ thread_local bool g_forceAnimation = false;
 
 uint8_t TP_MAKE_THISCALL(HookPerformAction, ActorMediator, TESActionData* apAction)
 {
+    RFAB_HOOK_CRUMB("HookPerformAction");
     if (!World::IsCreated() || !World::IsConnectedCached())
         return TiltedPhoques::ThisCall(RealPerformAction, apThis, apAction);
 

@@ -1,4 +1,5 @@
 #include <TiltedOnlinePCH.h>
+#include <CrashBreadcrumbs.h>
 
 #include <Games/References.h>
 
@@ -169,6 +170,7 @@ static TCheckForNewPackage* RealCheckForNewPackage = nullptr;
 
 bool TP_MAKE_THISCALL(HookCheckForNewPackage, void, Actor* apActor, uint64_t aUnk1)
 {
+    RFAB_HOOK_CRUMB("HookCheckForNewPackage", 0, apActor ? apActor->formID : 0);
 #if AI_SYNC
     if (apActor && apActor->GetExtension()->IsRemote())
         return false;
@@ -182,6 +184,7 @@ static TInitFromPackage* RealInitFromPackage = nullptr;
 
 void TP_MAKE_THISCALL(HookInitFromPackage, void, TESPackage* apPackage, TESObjectREFR* apTarget, Actor* arActor)
 {
+    RFAB_HOOK_CRUMB("HookInitFromPackage", 0, arActor ? arActor->formID : 0);
 #if AI_SYNC
     // This guard is here for when the client sets the package based on a remote message
     if (s_execInitPackage)

@@ -1,4 +1,5 @@
 #include "MagicTarget.h"
+#include <CrashBreadcrumbs.h>
 
 #include <algorithm>
 #include <chrono>
@@ -296,6 +297,7 @@ Sync::ConcentrationLimiter<64> s_concentrationSyncLimiter{};
 
 bool TP_MAKE_THISCALL(HookAddTarget, MagicTarget, MagicTarget::AddTargetData& arData)
 {
+    RFAB_HOOK_CRUMB("HookAddTarget");
     if (!World::IsCreated() || !World::IsConnectedCached())
         return TiltedPhoques::ThisCall(RealAddTarget, apThis, arData);
 
@@ -560,6 +562,7 @@ bool TP_MAKE_THISCALL(HookCheckAddEffectTargetData, MagicTarget::AddTargetData, 
 
 bool TP_MAKE_THISCALL(HookFindTargets, MagicCaster, float afEffectivenessMult, int32_t* aruiTargetCount, TESBoundObject* apSource, char abLoadCast, char abAdjust)
 {
+    RFAB_HOOK_CRUMB("HookFindTargets");
     bool enablePartyTeammateAuras = false;
     if (World::IsCreated() &&
         World::IsConnectedCached() &&

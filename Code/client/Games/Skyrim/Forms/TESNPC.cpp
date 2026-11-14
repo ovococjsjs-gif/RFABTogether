@@ -1,4 +1,5 @@
 #include <TiltedOnlinePCH.h>
+#include <CrashBreadcrumbs.h>
 
 #include <Forms/TESNPC.h>
 
@@ -76,6 +77,7 @@ static TSetLeveledNpc* RealSetLeveledNpc = nullptr;
 
 TESNPC* TP_MAKE_THISCALL(HookSetLeveledNpc, TESNPC, TESNPC* apSelectedNpc)
 {
+    RFAB_HOOK_CRUMB("HookSetLeveledNpc", apThis ? apThis->formID : 0);
     RecordLeveledNpcSource(apThis, apSelectedNpc);
     TESNPC* pResult = TiltedPhoques::ThisCall(RealSetLeveledNpc, apThis, apSelectedNpc);
     if (pResult && pResult != apThis)

@@ -101,7 +101,8 @@ PORTABLE_TESTS := \
   $(REPO_ROOT)/Code/tests/rfab_v410_compat_overlay.cpp \
   $(REPO_ROOT)/Code/tests/rfab_v411_stabilization_tests.cpp \
   $(REPO_ROOT)/Code/tests/rfab_v411_phase3_adaptation_tests.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_desync_detector.cpp
+  $(REPO_ROOT)/Code/tests/rfab_v411_desync_detector.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_breadcrumbs.cpp
 
 CORE_SRCS     := $(filter-out %MimallocAllocator.cpp,$(wildcard $(TILTEDCORE)/Code/core/src/*.cpp)) \
                  $(TILTEDCORE)/Code/core/src/MimallocAllocator.cpp

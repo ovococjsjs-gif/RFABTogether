@@ -356,6 +356,12 @@ _FRAME = re.compile(r"\[unwind #(?P<n>\d+)\]\s+(?P<module>[^\s\[+]+)(?P<tramp>\[
 _CPP = re.compile(r"Type=\[(?P<type>[^\]]*)\]\s+what\(\)=\[\"(?P<what>.*?)\"\]")
 _TIMESTAMP = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\]")
 _ADDRESS = re.compile(r"^(?P<module>[^+]+)\+(?:0x)?(?P<rva>[0-9A-Fa-f]+)$")
+# Breadcrumbs (Code/common/Diag/Breadcrumbs.h): what the client did just before the fault.
+_CRUMB = re.compile(
+    r"\[crumb (?P<kind>\S+) -(?P<age>\d+)ms T(?P<thread>\d+)\]\s+(?P<name>\S+)\s+a=0x(?P<a>[0-9A-Fa-f]+)\s+b=0x(?P<b>[0-9A-Fa-f]+)\s+x(?P<count>\d+)"
+)
+_THREAD = re.compile(r"\bTID=(\d+)")
+OPCODES_HEADER = REPO_ROOT / "Code" / "encoding" / "Opcodes.h"
 
 
 def describe_code(code: int, fault: int | None) -> str:
@@ -371,6 +377,71 @@ def describe_code(code: int, fault: int | None) -> str:
 
 
 @dataclass
+class Crumb:
+    kind: str      # "event" (session, world, remote actors), "packet" or "hook"
+    age_ms: int    # before the fault
+    thread: int
+    name: str
+    a: int
+    b: int
+    count: int
+
+
+def load_opcode_names(header: Path = OPCODES_HEADER) -> dict[str, list[str]]:
+    """Enumerator names of ClientOpcode and ServerOpcode, by value. Read from the checkout this
+    script runs in: the numbers are only right for a crash of the same protocol version."""
+    names: dict[str, list[str]] = {}
+    try:
+        text = header.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return names
+    for enum in re.finditer(r"enum\s+(ClientOpcode|ServerOpcode)\b[^{]*\{(.*?)\};", text, re.S):
+        body = re.sub(r"//[^\n]*", "", enum.group(2))
+        names[enum.group(1)] = [item.split("=")[0].strip() for item in body.split(",") if item.strip()]
+    return names
+
+
+# What the two values of an event crumb mean (the RFAB_EVENT_CRUMB call sites in Code/client).
+EVENT_CRUMBS = {
+    "session-begin": "session-begin",
+    "session-end": "session-end",
+    "world-load-begin": "world-load-begin ({online})",
+    "world-load-end": "world-load-end ({online})",
+    "cell-change-exterior": "cell-change-exterior to cell {a:X}, worldspace {b:X}",
+    "cell-change-interior": "cell-change-interior to cell {a:X}",
+    "remove-character": "remove-character: server id {a:X}",
+    "ownership-transfer": "ownership-transfer: server id {a:X}, epoch {b}",
+    "remote-actor-materialize": "remote-actor-materialize: server id {a:X} into cell {b:X}",
+    "remote-actor-dematerialize": "remote-actor-dematerialize: form {a:X}, server id {b:X}",
+}
+
+
+def describe_crumb(crumb: Crumb, opcodes: dict[str, list[str]]) -> str:
+    def opcode(table: str) -> str:
+        values = opcodes.get(table, [])
+        return values[crumb.a] if crumb.a < len(values) else f"opcode {crumb.a}"
+
+    if crumb.name in EVENT_CRUMBS:
+        what = EVENT_CRUMBS[crumb.name].format(a=crumb.a, b=crumb.b, online="in a session" if crumb.a else "offline")
+    elif crumb.name in ("packet-in", "packet-in-deferred"):
+        what = f"{crumb.name} {opcode('ServerOpcode')}"
+        if crumb.name == "packet-in":
+            what += f", {crumb.b} bytes"
+    elif crumb.name == "packet-out":
+        what = f"packet-out {opcode('ClientOpcode')}"
+    elif crumb.kind == "hook":
+        subject = crumb.a or crumb.b
+        what = crumb.name + (f" form {subject:X}" if subject else "")
+        if crumb.a and crumb.b:
+            what += f" (other {crumb.b:X})"
+    else:
+        what = crumb.name + (f" {crumb.a:X}" if crumb.a or crumb.b else "") + (f" / {crumb.b:X}" if crumb.b else "")
+    if crumb.count > 1:
+        what += f"  x{crumb.count}"
+    return what
+
+
+@dataclass
 class CrashRecord:
     stamp: str
     code: int
@@ -379,7 +450,9 @@ class CrashRecord:
     rva: int
     cpp_type: str = ""
     cpp_what: str = ""
+    thread: int = 0
     frames: list[tuple[int, str, int]] = field(default_factory=list)  # (index, module, rva)
+    crumbs: list["Crumb"] = field(default_factory=list)
 
     def key(self) -> tuple:
         return (self.stamp, self.code, self.module.lower(), self.rva, tuple(self.frames))
@@ -394,6 +467,7 @@ def parse_records(text: str) -> list[CrashRecord]:
             match = record or short
             stamp = _TIMESTAMP.match(line)
             cpp = _CPP.search(line)
+            thread = _THREAD.search(line)
             records.append(
                 CrashRecord(
                     stamp=stamp.group(1) if stamp else "",
@@ -403,11 +477,24 @@ def parse_records(text: str) -> list[CrashRecord]:
                     rva=int(match.group("rva"), 16),
                     cpp_type=cpp.group("type") if cpp else "",
                     cpp_what=cpp.group("what") if cpp else "",
+                    thread=int(thread.group(1)) if thread else 0,
                 )
             )
         if records:
             for frame in _FRAME.finditer(line):
                 records[-1].frames.append((int(frame.group("n")), frame.group("module"), int(frame.group("rva"), 16)))
+            for crumb in _CRUMB.finditer(line):
+                records[-1].crumbs.append(
+                    Crumb(
+                        kind=crumb.group("kind"),
+                        age_ms=int(crumb.group("age")),
+                        thread=int(crumb.group("thread")),
+                        name=crumb.group("name"),
+                        a=int(crumb.group("a"), 16),
+                        b=int(crumb.group("b"), 16),
+                        count=int(crumb.group("count")),
+                    )
+                )
     return records
 
 
@@ -422,6 +509,13 @@ def render_record(number: int, record: CrashRecord, maps: list[LinkerMap], game:
     for index, module, rva in record.frames:
         out.append(f"    #{index:<2}     {module}+0x{rva:X}")
         out.append(f"            {explain(module, rva, maps, game)}")
+    if record.crumbs:
+        opcodes = load_opcode_names()
+        out.append("    before the fault (oldest first; '*' = on the thread that crashed):")
+        # Both rings are written oldest first; one timeline is easier to read than two.
+        for crumb in sorted(record.crumbs, key=lambda c: -c.age_ms):
+            mark = "*" if record.thread and crumb.thread == record.thread else " "
+            out.append(f"      {mark} -{crumb.age_ms:>6} ms  {crumb.kind:<6}  {describe_crumb(crumb, opcodes)}")
     return out
 
 
@@ -543,6 +637,13 @@ _SAMPLE_LOG = (
     "    [unwind #2] SkyrimSE.exe[TiltedTrampoline]+0x4001010 (0x144001010)\r\n"
     "    [unwind #3] SkyrimSE.exe+0x900000 (0x140900000)\r\n"
     "    [unwind #4] KERNEL32.DLL+0x17614 (0x7FF8AAAA7614)\r\n"
+    "    [crumbs] events=812 packets=40311 hooks=90211 dropped=0 (newest last; a/b: see the RFAB_*_CRUMB call sites)\r\n"
+    "    [crumb event -5210ms T4242] world-load-end a=0x1 b=0x0 x1\r\n"
+    "    [crumb event -38ms T4242] remove-character a=0x1A3 b=0x0 x1\r\n"
+    "    [crumb packet -40ms T4242] packet-in a=0x1 b=0x58 x1\r\n"
+    "    [crumb packet -12ms T9000] packet-out a=0x2 b=0x0 x4\r\n"
+    "    [crumb hook -3ms T4242] HookActorProcess a=0x0 b=0xFF000A12 x57\r\n"
+    "    [crumb hook -0ms T4242] HookDamageActor a=0xFF000A12 b=0x14 x1\r\n"
     "[2026-11-14 21:40:00.001] [UNHANDLED_CRASH] TID=7 Code=0xE06D7363 RIP=0x7FF8BBBB0000 FaultAddr=0x0 "
     "Module='C:\\Windows\\System32\\KERNELBASE.dll' Base=0x7FF8BBB00000 RVA=+0xB0000 Bytes=[] | CppThrowOrigin=[x] Magic=0x19930520 "
     "Type=[.?AVsystem_error@std@@] what()=[\"No mapping for the Unicode character exists in the target multi-byte code page.\"]\r\n"
@@ -596,6 +697,25 @@ def self_test() -> int:
     expect("C++ type .?AVsystem_error@std@@  what(): No mapping for the Unicode character" in report, "report: C++ exception type and message")
     expect("Helper  (?Helper@?A0x1234@@YAXXZ) +0x8" in report, "report: a static function (anonymous namespace) from the map")
 
+    expect("before the fault (oldest first" in report, "crumbs: the section is there")
+    expect("      * -    40 ms  packet  packet-in " in report and ", 88 bytes" in report, "crumbs: an inbound packet with its size, on the crashing thread")
+    expect("        -    12 ms  packet  packet-out " in report and "  x4" in report, "crumbs: another thread is not starred, repeats are counted")
+    expect("hook    HookDamageActor form FF000A12 (other 14)" in report, "crumbs: a hook with its subject and the other party")
+    expect("hook    HookActorProcess form FF000A12  x57" in report, "crumbs: a per-frame hook collapses into one row")
+    expect("event   world-load-end (in a session)" in report and "event   remove-character: server id 1A3" in report, "crumbs: event values are named")
+    for line in (REPO_ROOT / "Code" / "client").rglob("*.cpp") if (REPO_ROOT / "Code" / "client").is_dir() else []:
+        for name in re.findall(r'RFAB_EVENT_CRUMB\("([^"]+)"', line.read_text(encoding="utf-8", errors="replace")):
+            expect(name in EVENT_CRUMBS, f"crumbs: event '{name}' ({line.name}) has no description in EVENT_CRUMBS")
+    expect(report.index("world-load-end") < report.index("packet-in ") < report.index("remove-character: server id 1A3") < report.index("packet-out ") < report.index("HookDamageActor form"),
+           "crumbs: the three rings become one timeline, oldest first")
+    opcodes = load_opcode_names()
+    if opcodes:
+        expect(opcodes["ClientOpcode"][0] == "kAuthenticationRequest" and "kClientOpcodeMax" in opcodes["ClientOpcode"], "crumbs: client opcode names come from Opcodes.h")
+        expect(describe_crumb(Crumb("packet", 1, 1, "packet-out", 0, 0, 1), opcodes) == "packet-out kAuthenticationRequest", "crumbs: opcode number becomes a name")
+        expect(describe_crumb(Crumb("packet", 1, 1, "packet-in", 9999, 12, 1), opcodes) == "packet-in opcode 9999, 12 bytes", "crumbs: an opcode outside the table stays a number")
+    second = [r for r in parse_records(_SAMPLE_LOG)][1]
+    expect(not second.crumbs, "crumbs: they belong to the record they follow")
+
     without_map = "\n".join(symbolize_text(_SAMPLE_LOG, [], game))
     expect("pass --map SkyrimSE.map" in without_map, "report: says what is missing when no map is given")
     expect("GAME  +0x2A after Address Library id 36345" in without_map, "report: game addresses need no map")
@@ -640,7 +760,7 @@ def self_test() -> int:
         for failure in failures:
             print(f"  - {failure}")
         return 1
-    print("symbolize_crash self-test: map parsing, game ids, both record formats, C++ exceptions")
+    print("symbolize_crash self-test: map parsing, game ids, both record formats, C++ exceptions, breadcrumbs")
     return 0
 
 
