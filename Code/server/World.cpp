@@ -1,6 +1,8 @@
 #include <World.h>
 #include <Components.h>
 
+#include <algorithm>
+
 #include <Services/CharacterService.h>
 #include <Services/ObjectService.h>
 #include <Services/QuestService.h>
@@ -70,5 +72,21 @@ World::World()
 
 World::~World()
 {
+    // The admin service is also a log sink: the constructor hands it to the default logger, which
+    // would keep it alive - with its reference to this World and its connection into the dispatcher -
+    // until the process exits. Every log line written after this World is gone would be handed to
+    // it, and its connection would be released at exit into a dispatcher freed long before (found by
+    // the sanitized server harness, defect M20). The logger gives it back here; as the last owner,
+    // m_spAdminService then destroys it with the other members, while the dispatcher is alive.
+    if (m_spAdminService)
+    {
+        if (const auto logger = spdlog::default_logger())
+        {
+            auto& sinks = logger->sinks();
+            const auto asSink = std::static_pointer_cast<spdlog::sinks::sink>(m_spAdminService);
+            sinks.erase(std::remove(sinks.begin(), sinks.end(), asSink), sinks.end());
+        }
+    }
+
     m_pScriptService.reset();
 }
