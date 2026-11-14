@@ -23,6 +23,9 @@ this project actually hit:
   7. The four Tilted* libraries are submodule links pinned to the revisions
      patch_submodules.py was written against. An import once dropped the links;
      nothing failed on Linux and the client could not be built at all.
+  8. No line disabled on purpose is left behind. A fix is proven by breaking it and
+     watching its test fail; the broken line carries a marker, and a marker that
+     survives into a commit ships the breakage.
 
 Behaviour of the game itself is covered by the test suites in Code/tests, which
 execute code instead of reading it.
@@ -288,6 +291,32 @@ else:
                 f"{path} points at {sha}, expected {pin}; patch_submodules.py is written against "
                 "the pinned revision - move the pin and the patches together",
             )
+
+# 8. No deliberate breakage left behind -------------------------------------------
+# The marker is spelled in two halves so that this file does not contain it.
+BREAKAGE_MARKER = "MUTATION" + "-TEST"
+SOURCE_SUFFIXES = {".cpp", ".h", ".hpp", ".inl", ".c", ".py", ".sh", ".ps1", ".bat", ".lua", ".ini", ".json"}
+tracked = git("ls-files", "--cached", "--others", "--exclude-standard", "--", "Code", "Tools", "dist_ready")
+if tracked is None:
+    notes.append("git index unavailable, skipped the deliberate-breakage marker check")
+else:
+    for relative in tracked.splitlines():
+        candidate = ROOT / relative
+        if candidate.suffix.lower() not in SOURCE_SUFFIXES and candidate.name != "Makefile":
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if BREAKAGE_MARKER not in text:
+            continue
+        for number, line in enumerate(text.splitlines(), start=1):
+            if BREAKAGE_MARKER in line:
+                check(
+                    False,
+                    f"{relative}:{number} carries the {BREAKAGE_MARKER} marker: a line was disabled to "
+                    "prove that a test can fail and was not restored",
+                )
 
 # -----------------------------------------------------------------------------
 for note in notes:

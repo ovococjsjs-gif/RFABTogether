@@ -132,6 +132,7 @@ extern Console::Setting<bool> bEnableDesyncDetector;
 extern Console::Setting<bool> bEnableDesyncAutoRepair;
 extern Console::Setting<bool> bEnableBossLeaseRenewal;
 extern Console::Setting<bool> bEnableUnlockMemory;
+extern Console::Setting<bool> bEnableBodyLootAuthority;
 
 namespace
 {
@@ -3316,6 +3317,56 @@ int main(int argc, char** argv)
             Check(change(pGuest, victim, kGold, -7) && onBody(kGold) == 7 && toldToChange(kHostConn, victim, kGold) == 0,
                   "a player who is not in the cell cannot take from the body");
             pGuest->SetCellComponent(CellIdComponent{kCell});
+
+            // --- M24: the body changes hands while it is being looted ---------------------------
+            // The host hands the body over and the server grants it to the guest. Before the
+            // guest's confirmation arrives, the host - now just a player standing next to the body
+            // - takes the ring and 5 of the 7 gold. The confirmation was built before those takes
+            // reached the guest: it lists the ring, 7 gold, and a dagger only the guest's game has.
+            const GameId kRing{0u, 0x000877C9u};
+            const GameId kDagger{0u, 0x0001397Eu};
+            const auto listed = [](const Inventory& acInventory, const GameId& acItem) {
+                GameId lookup = acItem;
+                return acInventory.GetEntryCountById(lookup);
+            };
+            Check(change(pHost, victim, kRing, 1) && onBody(kRing) == 1 && onBody(kGold) == 7,
+                  "the body holds a ring and 7 gold, and both players' games show them");
+
+            RequestOwnershipTransfer handBody{};
+            handBody.ServerId = victim;
+            Check(DeliverWire(world, handBody, pHost) && ownerOf(victim) == pGuest, "the host hands the body over: the guest simulates it now");
+            Check(change(pHost, victim, kRing, -1) && onBody(kRing) == 0 && change(pHost, victim, kGold, -5) && onBody(kGold) == 2,
+                  "before the guest's confirmation arrives the host takes the ring and 5 of the 7 gold");
+
+            RequestOwnershipClaim bodyClaim{};
+            bodyClaim.ServerId = victim;
+            bodyClaim.NewActorData.BaseId = kBanditBase;
+            bodyClaim.NewActorData.IsDead = true;
+            bodyClaim.NewActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 0.0f;
+            bodyClaim.NewActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 300.0f;
+            bodyClaim.NewActorData.InitialInventory.AddOrRemoveEntry(stack(kRing, 1));
+            bodyClaim.NewActorData.InitialInventory.AddOrRemoveEntry(stack(kGold, 7));
+            bodyClaim.NewActorData.InitialInventory.AddOrRemoveEntry(stack(kDagger, 1));
+            Harness::ClearOutbox();
+            Check(DeliverWire(world, bodyClaim, pGuest) && ownerOf(victim) == pGuest && isDead(victim),
+                  "the guest's confirmation arrives with the list his game showed a moment earlier");
+            Check(onBody(kRing) == 0, "the ring the host took does not come back with that list");
+            Check(onBody(kGold) == 2, "the gold is what the server counted (2), not what the list says (7)");
+            Check(onBody(kDagger) == 1, "an item the server never listed and nobody took is accepted from the new simulator");
+            const auto hostBodyUpdates = DecodeOutboxMessagesFor<NotifySpawnData>(kHostConn);
+            Check(hostBodyUpdates.size() == 1 && hostBodyUpdates[0].Id == victim &&
+                      listed(hostBodyUpdates[0].NewActorData.InitialInventory, kRing) == 0 &&
+                      listed(hostBodyUpdates[0].NewActorData.InitialInventory, kGold) == 2 &&
+                      listed(hostBodyUpdates[0].NewActorData.InitialInventory, kDagger) == 1,
+                  "the host's game is sent the server's list, so the ring does not reappear on the body in front of him");
+            Check(change(pGuest, victim, kRing, -1) && toldToChange(kGuestConn, guestChar, kRing) == -1 && onBody(kRing) == 0,
+                  "the guest clicking the ring his copy still shows is told to give it back");
+
+            // The switch off: the list of the player who simulates the body replaces the server's.
+            bEnableBodyLootAuthority = false;
+            Check(DeliverWire(world, bodyClaim, pGuest) && onBody(kRing) == 1 && onBody(kGold) == 7,
+                  "switch off: the same confirmation lists the ring and all 7 gold again (4.1.0)");
+            bEnableBodyLootAuthority = true;
         }
 
         // --- 4. Handover in the middle of the fight ---------------------------------------------

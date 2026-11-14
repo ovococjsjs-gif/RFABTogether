@@ -61,6 +61,16 @@ Console::Setting bEnableBossLeaseRenewal{
     "(RFAB) A boss fight locked to its simulating player keeps the 15 s boss lease on every renewal (off: renewals shorten it to the ordinary 8 s)",
     true};
 
+// Work plan 5.3 / defect M24. A player who takes over the simulation of an NPC sends the NPC as
+// his game shows it, items included, and the server replaced its own list with that one. On: for
+// an NPC the server already holds as dead its own list stands, and only items it never listed
+// and nobody took are added (CoopLootLedger::ShouldAcceptClaimedBodyItem). Off = 4.1.0: the new
+// simulator's list replaces the server's, so an item taken a moment earlier can be listed again.
+Console::Setting bEnableBodyLootAuthority{
+    "Gameplay:bEnableBodyLootAuthority",
+    "(RFAB) The server's list of what a dead NPC holds is not replaced by the list of the player who takes the body over (off = 4.1.0: it is, and a taken item can reappear)",
+    true};
+
 namespace
 {
 constexpr uint32_t kHealthActorValueIndex = 24;
@@ -1479,6 +1489,18 @@ void CharacterService::OnOwnershipClaimRequest(const PacketEvent<RequestOwnershi
         sanitizedData.InitialActorValues.ActorValuesList[kHealthActorValueIndex] = claimedHealth;
     if (claimedMaxHealth > 0.0f && (claimedMaxHpIt != sanitizedData.InitialActorValues.ActorMaxValuesList.end() || serverMaxHealth > 0.0f))
         sanitizedData.InitialActorValues.ActorMaxValuesList[kHealthActorValueIndex] = claimedMaxHealth;
+
+    // One writer for what a body holds (M24): the loot ledger, not the list of whoever simulates
+    // the body next. `pCharComp->IsDead()` is the server's state before this claim is applied, so
+    // an NPC the claim itself reports dead for the first time still brings its own list.
+    if (bEnableBodyLootAuthority && pCharComp->IsDead())
+    {
+        if (const auto* pHeldInventory = m_world.try_get<InventoryComponent>(cEntity))
+        {
+            sanitizedData.InitialInventory = m_world.GetInventoryService().MergeClaimedBodyInventory(
+                cEntity, acMessage.Packet.ServerId, pHeldInventory->Content, sanitizedData.InitialInventory);
+        }
+    }
 
     uint32_t prevHealthRev = 0;
     if (const auto* pAvBefore = m_world.try_get<ActorValuesComponent>(cEntity))

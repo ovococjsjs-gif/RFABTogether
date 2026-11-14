@@ -42,6 +42,33 @@ struct ClaimResolution
 };
 
 /**
+ * A body changes hands: may an item from the new simulator's list enter the server's list?
+ *
+ * The player who takes over the simulation of an NPC sends the NPC as his game shows it, items
+ * included, and the server used to replace its own list with that one. For a living NPC that is
+ * the owner's snapshot. For a body it undid the loot ledger: a take by another player that reached
+ * the server between the grant and the new simulator's confirmation was overwritten by a list
+ * built before the take, the item was listed again, sent to every player in range, and could be
+ * taken a second time (work plan 5.3, defect M24).
+ *
+ * For a body the server already holds as dead its own list stands. From the new simulator's list
+ * only what the server has never listed and nobody has taken is added - an item his game put on
+ * the body that the server has not heard of yet.
+ *
+ *   aHeldCount   how many of the item the server lists on the body now
+ *   aIsDepleted  the last one was taken and nothing was put back since (ContainerLootLedger)
+ */
+[[nodiscard]] constexpr bool ShouldAcceptClaimedBodyItem(int32_t aHeldCount, bool aIsDepleted) noexcept
+{
+    // Listed: the server's count stands, whatever the claim says. A higher count in the claim is a
+    // take the claimer has not seen yet; a lower one is his own take the server has not seen yet.
+    if (aHeldCount > 0)
+        return false;
+    // Taken to the last one: it stays taken.
+    return !aIsDepleted;
+}
+
+/**
  * SkyMP-grade server-authoritative container & corpse anti-duplication ledger.
  * Depletion claims persist for the lifetime of the container/corpse (not a short 15s window) so
  * late-arriving peers cannot re-loot dynamic RFAB boss tokens / death drops minutes later, while
@@ -94,6 +121,21 @@ public:
         if (!acItemId)
             return;
         RecordDeposit(aContainerServerId, acItemId.ModId, acItemId.BaseId);
+    }
+
+    // Was the last one of this item taken from the container, with nothing put back since?
+    [[nodiscard]] bool IsDepleted(uint32_t aContainerServerId, uint32_t aModId, uint32_t aBaseId) const noexcept
+    {
+        if (aContainerServerId == 0 || (aModId == 0 && aBaseId == 0))
+            return false;
+        return m_depletions.find(LootSlotKey{aContainerServerId, aModId, aBaseId}) != m_depletions.end();
+    }
+
+    template <class TGameId>
+        requires requires(const TGameId& id) { id.ModId; id.BaseId; }
+    [[nodiscard]] bool IsDepleted(uint32_t aContainerServerId, const TGameId& acItemId) const noexcept
+    {
+        return IsDepleted(aContainerServerId, acItemId.ModId, acItemId.BaseId);
     }
 
     void ForgetContainer(uint32_t aContainerServerId) noexcept

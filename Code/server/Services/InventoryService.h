@@ -52,6 +52,15 @@ public:
     void ResetLootLedger() noexcept { m_lootLedger.Clear(); }
     void ForgetContainerForEntity(entt::entity aEntity, uint32_t aFallbackServerId) noexcept;
     [[nodiscard]] uint32_t ResolveLootContainerKey(entt::entity aEntity, uint32_t aFallbackServerId) const noexcept;
+    /**
+     * @brief The list of items a body keeps when a player takes its simulation over (defect M24).
+     * @param acHeld what the server lists on the body now
+     * @param acClaimed what the new simulator's game shows on it
+     * @return acHeld plus the items of acClaimed the server never listed and nobody took
+     *         (CoopLootLedger::ShouldAcceptClaimedBodyItem).
+     */
+    [[nodiscard]] Inventory MergeClaimedBodyInventory(entt::entity aBody, uint32_t aBodyServerId, const Inventory& acHeld,
+                                                      const Inventory& acClaimed) const noexcept;
     [[nodiscard]] CoopLootLedger::ContainerLootLedger::Snapshot CaptureLootLedgerSnapshot() const { return m_lootLedger.CaptureSnapshot(); }
     void RestoreLootLedgerSnapshot(const CoopLootLedger::ContainerLootLedger::Snapshot& acSnapshot, bool aForgetClaimants = false)
     {

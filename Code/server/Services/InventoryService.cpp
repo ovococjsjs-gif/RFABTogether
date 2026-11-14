@@ -58,6 +58,29 @@ uint32_t InventoryService::ResolveLootContainerKey(entt::entity aEntity, uint32_
     return aFallbackServerId;
 }
 
+Inventory InventoryService::MergeClaimedBodyInventory(entt::entity aBody, uint32_t aBodyServerId, const Inventory& acHeld,
+                                                     const Inventory& acClaimed) const noexcept
+{
+    Inventory merged = acHeld;
+    const uint32_t lootContainerKey = ResolveLootContainerKey(aBody, aBodyServerId);
+
+    for (const Inventory::Entry& entry : acClaimed.Entries)
+    {
+        if (!entry.BaseId || entry.Count <= 0)
+            continue;
+
+        // Against the list the server held before the claim, not the one being built: two entries
+        // of the same item (plain and enchanted) are both taken or both left.
+        GameId lookupId = entry.BaseId;
+        const int32_t heldCount = acHeld.GetEntryCountById(lookupId);
+        const bool isDepleted = m_lootLedger.IsDepleted(lootContainerKey, entry.BaseId);
+        if (CoopLootLedger::ShouldAcceptClaimedBodyItem(heldCount, isDepleted))
+            merged.AddOrRemoveEntry(entry);
+    }
+
+    return merged;
+}
+
 void InventoryService::ForgetContainerForEntity(entt::entity aEntity, uint32_t aFallbackServerId) noexcept
 {
     if (aFallbackServerId != 0)
