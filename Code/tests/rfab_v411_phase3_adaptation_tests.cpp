@@ -1,5 +1,11 @@
 #include <catch2/catch.hpp>
 
+// Before any Structs/ header: those rely on TiltedPhoques being declared, and the suites are
+// compiled without the encoding prefix header.
+#include <TiltedCore/Stl.hpp>
+#include <TiltedCore/Buffer.hpp>
+#include <TiltedCore/Serialization.hpp>
+
 #include <common/Authority/Lease.h>
 #include <common/Compat/ConfigOverlay.h>
 #include <common/Compat/MenuPausePolicy.h>
@@ -9,7 +15,6 @@
 #include <common/RfabModpackCompat.h>
 #include <common/RfabWorldImmersion.h>
 #include <Structs/Inventory.h>
-#include <TiltedCore/Buffer.hpp>
 
 #include <filesystem>
 #include <fstream>

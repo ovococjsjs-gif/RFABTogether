@@ -908,6 +908,12 @@ function Emit-Annotation([string]$Level, [string]$Title, [string]$Msg) {
     Write-Host "::${Level} title=${Title}::${clean}"
 }
 
+# A job step shows at most ten annotations per level. When several commands of this script may fail
+# in one run (the per-target builds of step 4), each gets a share and the two legacy annotations
+# (DIAG_MATCHES, DIAG_TAIL) are left out: ci_diagnostics.py already reports the same lines.
+$script:DiagMaxChunks = 8
+$script:DiagShared = $false
+
 function Invoke-LoggedCmd([string]$StepName, [string]$CmdString) {
     Write-Host "`n==> $StepName" -ForegroundColor Cyan
     $script:ProgressLog.Add("- ⏳ Running: ``$StepName`` ($([DateTime]::UtcNow.ToString('HH:mm:ss')) UTC)")
@@ -936,7 +942,7 @@ function Invoke-LoggedCmd([string]$StepName, [string]$CmdString) {
             try {
                 $diagScript = Join-Path $script:RfabRepoRoot "Tools\rfab\ci_diagnostics.py"
                 if (Test-Path -LiteralPath $diagScript) {
-                    & python $diagScript --log $stepLog --step $StepName --exit-code $code
+                    & python $diagScript --log $stepLog --step $StepName --exit-code $code --max-chunks $script:DiagMaxChunks
                 }
             } catch {
                 Write-Host "[DIAG] ci_diagnostics.py could not run: $($_.Exception.Message)"
@@ -944,11 +950,11 @@ function Invoke-LoggedCmd([string]$StepName, [string]$CmdString) {
             $errMatches = @($allLines | Where-Object { $_ -match '(?i)(error\s+[A-Z]*\d+|fatal error|unresolved external|error:|Traceback|Assertion|Exception)' } | ForEach-Object { $_ -replace '-external:[^\s]+', '' })
             if ($errMatches.Count -gt 0) {
                 $script:LastDiagMatches = ($errMatches -join "`r`n")
-                Emit-Annotation "warning" "DIAG_MATCHES" ($errMatches -join "`n")
+                if (-not $script:DiagShared) { Emit-Annotation "warning" "DIAG_MATCHES" ($errMatches -join "`n") }
             }
             $compactTail = @($tailShow | ForEach-Object { $_ -replace '-external:[^\s]+', '' })
             $script:LastDiagTail = ($compactTail -join "`r`n")
-            Emit-Annotation "warning" "DIAG_TAIL" ($compactTail -join "`n")
+            if (-not $script:DiagShared) { Emit-Annotation "warning" "DIAG_TAIL" ($compactTail -join "`n") }
             if ($PublishRelease -and ($VersionTag -notin $ProtectedTags) -and ($VersionTag -ne "v2.0.2" -or $script:V202BackupReady)) {
                 $failLogAsset = Join-Path $env:TEMP "build_step_log.txt"
                 Copy-Item -LiteralPath $stepLog -Destination $failLogAsset -Force -ErrorAction SilentlyContinue
@@ -986,6 +992,30 @@ try {
     }
     Invoke-LoggedCmd "[3/8] xmake config (Windows x64 /MT $BuildMode)" "xmake config --plat=windows --arch=x64 --mode=$BuildMode --yes -vD"
     $script:PackagesReady = $true
+
+    # xmake stops at the first failing target, so one run used to show the errors of whichever
+    # target failed first and nothing about the others. The three targets that hold the project's
+    # own code are built one by one and a failure does not stop the next: a single run reports the
+    # tests, the server and the client. The full build afterwards is the gate, as before.
+    $buildFailures = New-Object System.Collections.Generic.List[string]
+    $script:DiagShared = $true
+    foreach ($buildGroup in @(
+            @{ Name = "tests";  Target = "TPTests";              Chunks = 2 },
+            @{ Name = "server"; Target = "SkyrimTogetherServer"; Chunks = 2 },
+            @{ Name = "client"; Target = "SkyrimTogetherClient"; Chunks = 4 })) {
+        $script:DiagMaxChunks = $buildGroup.Chunks
+        try {
+            Invoke-LoggedCmd "[4/8] xmake build: $($buildGroup.Name) ($($buildGroup.Target))" "xmake build -y -v $($buildGroup.Target)"
+        } catch {
+            $buildFailures.Add($buildGroup.Name)
+            Write-Host "[4/8] $($buildGroup.Name) failed; building the remaining targets to collect their errors too" -ForegroundColor Yellow
+        }
+    }
+    $script:DiagShared = $false
+    $script:DiagMaxChunks = 8
+    if ($buildFailures.Count -gt 0) {
+        throw "[4/8] xmake build failed for: $($buildFailures -join ', ')"
+    }
 
     Invoke-LoggedCmd "[4/8] xmake build (Client + Launcher + Server + Tests)" "xmake -y -v"
 

@@ -153,7 +153,10 @@ endef
 $(foreach s,$(CORE_SRCS),$(eval $(call compile_rule,core,$(s),$(VENDOR_SAN))))
 $(foreach s,$(ENCODING_SRCS),$(eval $(call compile_rule,encoding,$(s),$(PCH))))
 $(foreach s,$(COMMON_SRCS),$(eval $(call compile_rule,common,$(s),$(PCH))))
-$(foreach s,$(PORTABLE_TESTS),$(eval $(call compile_rule,tests,$(s),$(PCH))))
+# The suites are compiled WITHOUT the encoding prefix header, exactly like the xmake TPTests
+# target: a suite that only compiles because EncodingPch.h was force-included builds here and
+# fails under MSVC (first Windows CI run: rfab_v411_phase3_adaptation_tests.cpp, 38 errors).
+$(foreach s,$(PORTABLE_TESTS),$(eval $(call compile_rule,tests,$(s),)))
 
 -include $(ALL_DEPS)
 

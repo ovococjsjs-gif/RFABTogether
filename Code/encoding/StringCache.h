@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include <Messages/StringCacheUpdate.h>
 
 struct StringCache

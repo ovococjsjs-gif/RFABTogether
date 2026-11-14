@@ -295,7 +295,7 @@ def step_title(step: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w .\-\[\]/()+]", " ", step)).strip()[:60] or "step"
 
 
-def report_failure(raw_lines: list[str], step: str, exit_code: str, workspace: str) -> list[str]:
+def report_failure(raw_lines: list[str], step: str, exit_code: str, workspace: str, max_chunks: int = MAX_ERROR_CHUNKS) -> list[str]:
     primary, secondary, duplicates = extract(raw_lines, workspace)
     name = step_title(step)
     out: list[str] = []
@@ -325,7 +325,7 @@ def report_failure(raw_lines: list[str], step: str, exit_code: str, workspace: s
     if len(blocks) < 6:
         # Little that is specific: add the generic error-looking lines, they may be all there is.
         blocks += [d.lines for d in secondary[:40]]
-    chunks, left_out = chunk_blocks(blocks, CHUNK_CHARS, MAX_ERROR_CHUNKS)
+    chunks, left_out = chunk_blocks(blocks, CHUNK_CHARS, max(1, min(max_chunks, MAX_ERROR_CHUNKS)))
     for number, chunk in enumerate(chunks, 1):
         if number == len(chunks) and left_out:
             chunk += f"\n... +{left_out} more diagnostic(s) not shown"
@@ -481,6 +481,9 @@ def self_test() -> int:
     expect(errors and errors[0].startswith("Code/client/File0.cpp(0)"), "flood: the first error is not first")
     expect(errors and "more diagnostic(s) not shown" in errors[-1], "flood: no marker for what was left out")
     expect(all(len(a) < 4200 for a in out), "flood: an annotation exceeds the size GitHub keeps")
+    # Several failing commands inside one job step share its ten error annotations.
+    shared = messages(report_failure(flood, "build", "1", "", 2), "error")
+    expect(len(shared) == 2 and "more diagnostic(s) not shown" in shared[-1], f"flood: --max-chunks 2 gave {len(shared)} chunks")
 
     # 6. Nothing recognisable: the tail is still reported, and workflow-command characters are escaped.
     out = report_failure(["step one", "100% done\rprogress", "something went sideways"], "odd: step, name", "3", "")
@@ -509,6 +512,9 @@ def main() -> int:
     parser.add_argument("--exit-code", default="")
     parser.add_argument("--ok", action="store_true", help="the step succeeded: print one notice with its result lines")
     parser.add_argument("--workspace", default=os.environ.get("GITHUB_WORKSPACE", ""))
+    parser.add_argument("--max-chunks", type=int, default=MAX_ERROR_CHUNKS,
+                        help="error annotations this step may use (a job step shows at most ten per level, "
+                             "so several failing commands inside one step have to share them)")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -521,7 +527,7 @@ def main() -> int:
         if not args.log:
             raise ValueError("--log is required")
         raw_lines = read_log(args.log)
-        lines = report_success(raw_lines, args.step) if args.ok else report_failure(raw_lines, args.step, args.exit_code, args.workspace)
+        lines = report_success(raw_lines, args.step) if args.ok else report_failure(raw_lines, args.step, args.exit_code, args.workspace, args.max_chunks)
         for line in lines:
             print(line, flush=True)
     except Exception as error:  # noqa: BLE001 - this script must never fail the step it reports on

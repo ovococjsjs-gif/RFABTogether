@@ -10,6 +10,7 @@
  *  5. LateJoinerCatchUp: bounded, idempotent catch-up XP calculation for friends joining mid-session.
  */
 
+#include <TiltedCore/Buffer.hpp>
 #include <Structs/GameId.h>
 
 #include <algorithm>
