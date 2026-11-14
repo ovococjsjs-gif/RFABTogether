@@ -30,6 +30,9 @@ run "actor lifetime self-test"    python3 Tools/rfab/check_actor_lifetime.py --s
 run "filesystem calls self-test"  python3 Tools/rfab/check_filesystem_calls.py --self-test
 run "wire contract self-test"     python3 Tools/rfab/check_wire_contract.py --self-test
 run "crash symbolizer self-test"  python3 Tools/rfab/symbolize_crash.py --self-test
+# Not a check of the sources: the tool that brings a reset working copy back in line with the server
+# must keep telling "an older version" from "work that was never pushed" (it runs on throwaway repos).
+run "workspace recovery self-test" python3 Tools/rfab/recover_workspace.py --self-test
 
 # Engine threads only read snapshots and post work (hooks, script sinks, CEF handlers).
 run "hook discipline"             python3 Tools/rfab/check_hook_discipline.py
