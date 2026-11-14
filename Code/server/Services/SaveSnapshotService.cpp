@@ -179,13 +179,10 @@ void SerializeProgressionSnapshot(TiltedPhoques::Buffer::Writer& aWriter, const 
         Serialization::WriteFloat(aWriter, pEntry->second);
     }
 
-    const auto bossGhostStates = SortedEntries(acProg.BossGhostStates);
-    Serialization::WriteVarInt(aWriter, bossGhostStates.size());
-    for (const auto* pEntry : bossGhostStates)
-    {
-        Serialization::WriteVarInt(aWriter, pEntry->first);
-        Serialization::WriteBool(aWriter, pEntry->second);
-    }
+    // Ghost phases are keyed by server entity ids, and those mean nothing to the next process:
+    // after a restart the same number belongs to whatever registered first. The list keeps its
+    // place in the layout and is written empty (M18).
+    Serialization::WriteVarInt(aWriter, 0u);
 }
 
 void DeserializeProgressionSnapshot(TiltedPhoques::Buffer::Reader& aReader, RfabProgressionLedger::Snapshot& aOutProg)
@@ -220,12 +217,14 @@ void DeserializeProgressionSnapshot(TiltedPhoques::Buffer::Reader& aReader, Rfab
         aOutProg.SyncedGlobals[edid] = val;
     }
 
+    // A checkpoint of an earlier build may carry ghost phases keyed by the server entity ids of the
+    // process that wrote it. They are read past: restoring them made whichever creature received
+    // the same number in this process invulnerable on every client (M18).
     const uint64_t ghostCount = std::min<uint64_t>(Serialization::ReadVarInt(aReader), 65536ULL);
     for (uint64_t i = 0; i < ghostCount; ++i)
     {
-        const uint32_t id = static_cast<uint32_t>(Serialization::ReadVarInt(aReader));
-        const bool ghost = Serialization::ReadBool(aReader);
-        aOutProg.BossGhostStates[id] = ghost;
+        (void)Serialization::ReadVarInt(aReader);
+        (void)Serialization::ReadBool(aReader);
     }
 }
 

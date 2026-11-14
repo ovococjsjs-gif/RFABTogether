@@ -734,6 +734,8 @@ int main(int argc, char** argv)
         Check(calendar.SetDate(12, 4, 205), "the checkpoint date is set");
         Check(calendar.SetTime(13, 17, 33.0f), "the checkpoint time is set");
         Check(ledger.TryGrantXp("restart-test", 123).Accepted, "the checkpoint progression is set");
+        // A creature is in an invulnerable phase when the checkpoint is taken (M18).
+        Check(ledger.UpdateBossGhostState(World::ToInteger(actor), true), "an invulnerable phase is in progress at the checkpoint");
         Check(pOwner->GetId() == 1, "the checkpoint claimant is player ID 1");
 
         LockData lock{};
@@ -920,6 +922,8 @@ int main(int argc, char** argv)
         const auto progress = restored.GetRfabProgressionService().GetLedger().CaptureSnapshot();
         Check(progress.GrantedXpBySource.count("restart-test") == 1,
               "the fresh server restores the progression ledger");
+        Check(progress.BossGhostStates.empty(),
+              "an invulnerable phase is not restored into a new process, where its server id belongs to another creature");
         Check(restored.GetCalendarService().GetDate() == CalendarService::TDate{12, 4, 205},
               "the fresh server restores the checkpoint date");
         Check(restored.GetCalendarService().GetTime() == CalendarService::TTime{13, 17},
@@ -1791,23 +1795,34 @@ int main(int argc, char** argv)
 
         const uint64_t epoch = world.GetSaveSnapshotService().GetCurrentWorldEpoch();
 
-        // 8.1 Boss Lease Lock: Host locks a boss -> Guest claim is rejected until unlocked!
+        // 8.1 Boss encounter lock (M7): it is the owner's statement, it lasts as long as the fight,
+        //     and nothing about it outlives the owner, the boss or the server process.
         {
             const entt::entity boss = world.create();
             const uint32_t bossId = World::ToInteger(boss);
             world.emplace<OwnerComponent>(boss, pHost);
             world.emplace<CellIdComponent>(boss, kCell);
             world.emplace<CharacterComponent>(boss);
+            const auto& ledger = world.GetRfabProgressionService().GetLedger();
 
-            SyncRfabProgressionEvent lockReq{};
-            lockReq.Kind = SyncRfabProgressionEvent::EventKind::BossEncounterSync;
-            lockReq.EpochId = epoch;
-            lockReq.SourceKey = "boss_lock";
-            lockReq.XpDelta = static_cast<int32_t>(bossId);
-            lockReq.GlobalValue = 1.0f;
-            Check(DeliverWire(world, lockReq, pHost), "boss_lock packet accepted by server");
-            Check(world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(bossId),
-                  "boss entity is marked locked in progression ledger");
+            // What the owner's client sends when a boss it simulates enters or leaves combat, and
+            // when the boss turns invulnerable for a phase.
+            const auto report = [&](Player* apSender, const char* acWhat, bool aOn) {
+                SyncRfabProgressionEvent packet{};
+                packet.Kind = SyncRfabProgressionEvent::EventKind::BossEncounterSync;
+                packet.EpochId = epoch;
+                packet.SourceKey = acWhat;
+                packet.XpDelta = static_cast<int32_t>(bossId);
+                packet.GlobalValue = aOn ? 1.0f : 0.0f;
+                return DeliverWire(world, packet, apSender);
+            };
+
+            Check(report(pGuest, "boss_lock", true) && !ledger.IsBossEncounterLocked(bossId, pGuest->GetId()) &&
+                      !ledger.IsBossEncounterLocked(bossId, pHost->GetId()),
+                  "a player who does not simulate the boss cannot lock it");
+
+            Check(report(pHost, "boss_lock", true) && ledger.IsBossEncounterLocked(bossId, pHost->GetId()),
+                  "the simulating player locks the boss when it enters combat");
 
             Harness::ClearOutbox();
             RequestOwnershipClaim steal{};
@@ -1818,10 +1833,26 @@ int main(int argc, char** argv)
             Check(!DecodeOutboxMessagesFor<NotifyRelinquishControl>(kGuestConn).empty(),
                   "guest receives NotifyRelinquishControl rejecting locked boss claim");
 
-            world.GetRfabProgressionService().GetLedger().ClearBossGhostState(bossId);
-            Check(!world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(bossId),
-                  "ClearBossGhostState releases boss encounter lock on boss death");
+            Check(!ledger.IsBossEncounterLocked(bossId, pGuest->GetId()),
+                  "the lock is void once another player simulates the boss");
+
+            Check(report(pHost, "boss_lock", false) && !ledger.IsBossEncounterLocked(bossId, pHost->GetId()),
+                  "the lock is given back when the boss leaves combat, not only when it dies");
+
+            // An invulnerable phase holds the boss by itself and lets go when it ends. It used to
+            // leave a lock behind that only the boss's death removed.
+            Check(report(pHost, "boss_ghost", true) && ledger.IsBossEncounterLocked(bossId, pHost->GetId()) &&
+                      ledger.IsBossEncounterLocked(bossId, pGuest->GetId()),
+                  "an invulnerable phase holds the boss whoever simulates it");
+            Check(report(pHost, "boss_ghost", false) && !ledger.IsBossEncounterLocked(bossId, pHost->GetId()),
+                  "the end of the invulnerable phase leaves no lock behind");
+
+            // The boss is gone: nothing keyed by its server id stays.
+            Check(report(pHost, "boss_ghost", true) && report(pHost, "boss_lock", true) && ledger.GetBossGhostStates().count(bossId) == 1,
+                  "a phase and a lock are recorded for the living boss");
             world.destroy(boss);
+            Check(ledger.GetBossGhostStates().count(bossId) == 0 && !ledger.IsBossEncounterLocked(bossId, pHost->GetId()),
+                  "destroying the boss entity removes its phase and its lock");
         }
 
         // 8.2 Shared dragon souls have their own scene (10). Shared Words of Power were removed: no

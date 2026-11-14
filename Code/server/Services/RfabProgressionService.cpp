@@ -200,7 +200,7 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
                 break;
 
             const bool locked = (pkt.GlobalValue >= 0.5f);
-            m_ledger.SetBossEncounterLocked(bossServerId, locked);
+            m_ledger.SetBossEncounterLocked(bossServerId, locked, pSender->GetId());
         }
         else if (sourceKey == "arena_unlock" && pkt.BookId)
         {

@@ -108,6 +108,10 @@ void CharacterService::OnCharacterIndexConstructed(entt::registry& aRegistry, en
 
 void CharacterService::OnCharacterIndexDestroyed(entt::registry& aRegistry, entt::entity aEntity) noexcept
 {
+    // Ghost phases and encounter locks are keyed by the server id of this entity.
+    if (auto* pProgression = m_world.ctx().find<RfabProgressionService>())
+        pProgression->GetLedger().ClearBossGhostState(World::ToInteger(aEntity));
+
     if (const auto* pForm = aRegistry.try_get<FormIdComponent>(aEntity); pForm && pForm->Id != GameId{})
     {
         const uint64_t key = CoopWorldView::PackGameIdKey(pForm->Id.ModId, pForm->Id.BaseId);
@@ -887,7 +891,8 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
                 {
                     const uint32_t existingServerId = World::ToInteger(existingEntity);
                     const bool isBossLocked =
-                        m_world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(existingServerId) ||
+                        m_world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(
+                            existingServerId, GetOwnerPlayerId(existingOwnerComp.GetOwner())) ||
                         (characterComponent.IsDragon() && characterComponent.IsWeaponDrawn());
 
                     Authority::Subject subject{};
@@ -1345,7 +1350,8 @@ void CharacterService::OnOwnershipClaimRequest(const PacketEvent<RequestOwnershi
     const uint64_t nowMs = SteadyClockMs();
 
     const bool isBossLocked =
-        m_world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(acMessage.Packet.ServerId) ||
+        m_world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(
+            acMessage.Packet.ServerId, GetOwnerPlayerId(pOwnerComp->GetOwner())) ||
         (pCharComp->IsDragon() && pCharComp->IsWeaponDrawn());
 
     Authority::Subject subject{};
