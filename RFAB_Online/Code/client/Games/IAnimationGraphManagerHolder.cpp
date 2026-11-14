@@ -1,0 +1,51 @@
+#include <TiltedOnlinePCH.h>
+
+#include <Games/Animation/IAnimationGraphManagerHolder.h>
+
+#include <BSAnimationGraphManager.h>
+
+bool IAnimationGraphManagerHolder::SetVariableFloat(BSFixedString* apVariable, float aValue)
+{
+    TP_THIS_FUNCTION(TSetFloatVariable, bool, IAnimationGraphManagerHolder, BSFixedString*, float);
+    POINTER_SKYRIMSE(TSetFloatVariable, InternalSetFloatVariable, 32143);
+
+    return TiltedPhoques::ThisCall(InternalSetFloatVariable, this, apVariable, aValue);
+}
+
+bool IAnimationGraphManagerHolder::SetVariableInt(BSFixedString* apVariable, int32_t aValue)
+{
+    TP_THIS_FUNCTION(TSetIntVariable, bool, IAnimationGraphManagerHolder, BSFixedString*, int32_t);
+    POINTER_SKYRIMSE(TSetIntVariable, InternalSetIntVariable, 32142);
+
+    return TiltedPhoques::ThisCall(InternalSetIntVariable, this, apVariable, aValue);
+}
+
+bool IAnimationGraphManagerHolder::SetVariableBool(BSFixedString* apVariable, bool aValue)
+{
+    TP_THIS_FUNCTION(TSetBoolVariable, bool, IAnimationGraphManagerHolder, BSFixedString*, bool);
+    POINTER_SKYRIMSE(TSetBoolVariable, InternalSetBoolVariable, 32141);
+
+    return TiltedPhoques::ThisCall(InternalSetBoolVariable, this, apVariable, aValue);
+}
+
+bool IAnimationGraphManagerHolder::RevertAnimationGraphManager()
+{
+    TP_THIS_FUNCTION(TRevertAnimationGraphManager, bool, IAnimationGraphManagerHolder);
+    POINTER_SKYRIMSE(TRevertAnimationGraphManager, InternalRevertAnimationGraphManager, 32139);
+
+    return TiltedPhoques::ThisCall(InternalRevertAnimationGraphManager, this);
+}
+
+bool IAnimationGraphManagerHolder::IsReady()
+{
+    BSTSmartPointer<BSAnimationGraphManager> spManager;
+    return GetBSAnimationGraph(spManager);
+}
+
+BSTSmartPointer<BSAnimationGraphManager> IAnimationGraphManagerHolder::GetAnimationGraphManagerPtr() const noexcept
+{
+    BSTSmartPointer<BSAnimationGraphManager> spManager;
+    GetBSAnimationGraph(spManager);
+
+    return spManager;
+}

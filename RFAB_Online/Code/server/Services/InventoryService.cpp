@@ -1,0 +1,286 @@
+#include "InventoryService.h"
+
+#include <Components.h>
+#include <World.h>
+#include <GameServer.h>
+#include <common/CoopPacketSafety.h>
+
+#include <Messages/NotifyObjectInventoryChanges.h>
+#include <Messages/RequestInventoryChanges.h>
+#include <Messages/NotifyInventoryChanges.h>
+#include <Messages/RequestEquipmentChanges.h>
+#include <Messages/NotifyEquipmentChanges.h>
+#include <Messages/DrawWeaponRequest.h>
+#include <Messages/NotifyDrawWeapon.h>
+
+#include <Setting.h>
+#include <chrono>
+// Not in the anonymous namespace: GameServer.cpp folds it into Session::Feature::kServerOwnedWorldItems
+// (no world sync of dropped items at all when it is off, whichever path a client uses).
+Console::Setting bEnableItemDrops{"Gameplay:bEnableItemDrops", "Syncs dropped items in the 3D world across players", true};
+
+namespace
+{
+uint64_t SteadyInventoryNowMs() noexcept
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+}
+
+InventoryService::InventoryService(World& aWorld, entt::dispatcher& aDispatcher)
+    : m_world(aWorld)
+{
+    m_inventoryChangeConnection = aDispatcher.sink<PacketEvent<RequestInventoryChanges>>().connect<&InventoryService::OnInventoryChanges>(this);
+    m_equipmentChangeConnection = aDispatcher.sink<PacketEvent<RequestEquipmentChanges>>().connect<&InventoryService::OnEquipmentChanges>(this);
+    m_drawWeaponConnection = aDispatcher.sink<PacketEvent<DrawWeaponRequest>>().connect<&InventoryService::OnWeaponDrawnRequest>(this);
+}
+
+uint32_t InventoryService::ResolveLootContainerKey(entt::entity aEntity, uint32_t aFallbackServerId) const noexcept
+{
+    if (m_world.valid(aEntity))
+    {
+        if (const auto* pForm = m_world.try_get<FormIdComponent>(aEntity); pForm && pForm->Id != GameId{})
+        {
+            uint64_t h = 14695981039346656037ULL;
+            const uint64_t packed = (static_cast<uint64_t>(pForm->Id.ModId) << 32) | static_cast<uint64_t>(pForm->Id.BaseId);
+            for (int shift = 0; shift < 64; shift += 8)
+            {
+                h ^= (packed >> shift) & 0xFFULL;
+                h *= 1099511628211ULL;
+            }
+            const uint32_t folded = static_cast<uint32_t>((h >> 32) ^ (h & 0xFFFFFFFFULL));
+            return folded | 0x80000000u;
+        }
+    }
+    return aFallbackServerId;
+}
+
+void InventoryService::ForgetContainerForEntity(entt::entity aEntity, uint32_t aFallbackServerId) noexcept
+{
+    if (aFallbackServerId != 0)
+        m_lootLedger.ForgetContainer(aFallbackServerId);
+
+    const uint32_t resolvedKey = ResolveLootContainerKey(aEntity, 0);
+    if (resolvedKey != 0)
+        m_lootLedger.ForgetContainer(resolvedKey);
+}
+
+void InventoryService::OnInventoryChanges(const PacketEvent<RequestInventoryChanges>& acMessage) noexcept
+{
+    const auto& message = acMessage.Packet;
+    // Legacy drop path (Session::Feature::kServerOwnedWorldItems off, or an older client): peers replay
+    // the drop on the dropper's puppet. bEnableItemDrops off turns that replay into a plain inventory
+    // change.
+    (void)ApplyInventoryDelta(acMessage.pPlayer, message.ServerId, message.Item, message.Drop,
+                              bEnableItemDrops ? message.Drop : false, message.UpdateClients);
+}
+
+bool InventoryService::ApplyInventoryDelta(Player* apSender, uint32_t aServerId, const Inventory::Entry& acItem,
+                                           bool aIsWorldTransfer, bool aNotifyDrop, bool aUpdateClients) noexcept
+{
+    const entt::entity cOrigin = static_cast<entt::entity>(aServerId);
+    if (!m_world.valid(cOrigin))
+        return false;
+
+    if (!acItem.BaseId || acItem.Count == 0)
+        return false;
+
+    // Strict player inventory ownership isolation: a peer client's remote puppet scripts must NEVER
+    // add or remove items from another player's character inventory!
+    const auto* pChar = m_world.try_get<CharacterComponent>(cOrigin);
+    const auto* pOwner = m_world.try_get<OwnerComponent>(cOrigin);
+    bool isRemoteNpcInteraction = false;
+    if (pChar && pChar->IsPlayer())
+    {
+        if (!pOwner || pOwner->GetOwner() != apSender)
+        {
+            spdlog::warn(
+                "Rejected cross-client inventory mutation on player entity {:X} from sender {:X}",
+                aServerId,
+                apSender ? apSender->GetId() : 0);
+            return false;
+        }
+    }
+    else if (pChar && pOwner && (!apSender || pOwner->GetOwner() != apSender))
+    {
+        // RFAB mount saddlebag guard: block bystanders from mutating a mount's saddlebag while
+        // another player owns or is actively riding that horse (prevents saddlebag dupes/theft).
+        if (pChar->IsMount())
+        {
+            const uint32_t senderId = apSender ? apSender->GetId() : 0u;
+            const uint32_t ownerId = pOwner->GetOwner() ? pOwner->GetOwner()->GetId() : 0u;
+            if (!m_world.GetCharacterService().GetMountGuard().CanMutateMountSaddlebag(aServerId, senderId, ownerId))
+            {
+                spdlog::warn(
+                    "[RFAB Mounts] Rejected bystander saddlebag mutation on mount {:X} from player {}",
+                    aServerId,
+                    senderId);
+                return false;
+            }
+        }
+
+        // A different peer may interact with an owned NPC (pickpocket or loot it) only while the
+        // entity is in that peer's replicated cell range. Never let a stale/out-of-range server id
+        // authorize an inventory mutation. Broadcast this interaction even when the engine marked
+        // UpdateClients=false; that flag normally suppresses propagation for local-only inventory ops.
+        const auto* pCell = m_world.try_get<CellIdComponent>(cOrigin);
+        if (!apSender || !pCell || !apSender->GetCellComponent().IsInRange(*pCell, pChar->IsDragon()))
+        {
+            spdlog::debug("Rejected out-of-range inventory interaction on owned NPC {:X} from sender {:X}",
+                          aServerId, apSender ? apSender->GetId() : 0);
+            return false;
+        }
+        isRemoteNpcInteraction = true;
+    }
+
+    Inventory::Entry sanitizedItem = acItem;
+    sanitizedItem.Count = CoopPacketSafety::SanitizeItemCountDelta(sanitizedItem.Count);
+    CoopCraftedItems::NormalizeCraftedEntry(sanitizedItem);
+
+    auto view = m_world.view<InventoryComponent>();
+
+    const auto it = view.find(cOrigin);
+    const bool isSharedContainerOrNpc = (!pChar || !pChar->IsPlayer());
+
+    if (it != view.end())
+    {
+        auto& inventoryComponent = view.get<InventoryComponent>(*it);
+
+        if (isSharedContainerOrNpc)
+        {
+            const uint32_t lootContainerKey = ResolveLootContainerKey(*it, aServerId);
+            if (sanitizedItem.Count > 0)
+            {
+                m_lootLedger.RecordDeposit(lootContainerKey, sanitizedItem.BaseId);
+            }
+            else if (sanitizedItem.Count < 0 && !aIsWorldTransfer && apSender)
+            {
+                GameId lookupId = sanitizedItem.BaseId;
+                const int32_t availableBefore = inventoryComponent.Content.GetEntryCountById(lookupId);
+                const auto claim = m_lootLedger.EvaluateWithdrawal(
+                    lootContainerKey,
+                    sanitizedItem.BaseId,
+                    apSender->GetId(),
+                    availableBefore,
+                    -sanitizedItem.Count,
+                    sanitizedItem.IsQuestItem,
+                    SteadyInventoryNowMs());
+
+                if (claim.OverdrawnRollback > 0)
+                {
+                    if (const auto senderCharOpt = apSender->GetCharacter();
+                        senderCharOpt.has_value() && m_world.valid(*senderCharOpt))
+                    {
+                        Inventory::Entry rollbackEntry = sanitizedItem;
+                        rollbackEntry.Count = -claim.OverdrawnRollback;
+                        rollbackEntry.ExtraWorn = false;
+                        rollbackEntry.ExtraWornLeft = false;
+
+                        if (auto* pSenderInv = m_world.try_get<InventoryComponent>(*senderCharOpt))
+                            pSenderInv->Content.AddOrRemoveEntry(rollbackEntry);
+
+                        NotifyInventoryChanges rollbackNotify{};
+                        rollbackNotify.ServerId = World::ToInteger(*senderCharOpt);
+                        rollbackNotify.Item = std::move(rollbackEntry);
+                        rollbackNotify.Drop = false;
+                        apSender->Send(rollbackNotify);
+
+                        spdlog::info(
+                            "[RFAB AntiDupe] Rolled back {}x overdrawn item {:X}:{:X} from container {:X} on player {}",
+                            claim.OverdrawnRollback,
+                            sanitizedItem.BaseId.ModId,
+                            sanitizedItem.BaseId.BaseId,
+                            aServerId,
+                            apSender->GetId());
+                    }
+                }
+
+                if (claim.GrantedTake <= 0)
+                    return false;
+
+                sanitizedItem.Count = -claim.GrantedTake;
+            }
+        }
+
+        inventoryComponent.Content.AddOrRemoveEntry(sanitizedItem);
+        if (auto* pObjComp = m_world.try_get<ObjectComponent>(*it))
+            pObjComp->HasAuthoritativeMutation = true;
+    }
+
+    if (!aUpdateClients && !isRemoteNpcInteraction)
+        return true;
+
+    NotifyInventoryChanges notify{};
+    notify.ServerId = aServerId;
+    notify.Item = std::move(sanitizedItem);
+    notify.Drop = isRemoteNpcInteraction ? false : aNotifyDrop;
+
+    if (!GameServer::Get()->SendToPlayersInRange(notify, cOrigin, apSender))
+        spdlog::error("{}: SendToPlayersInRange failed", __FUNCTION__);
+    return true;
+}
+
+void InventoryService::OnEquipmentChanges(const PacketEvent<RequestEquipmentChanges>& acMessage) noexcept
+{
+    auto& message = acMessage.Packet;
+    const entt::entity cOrigin = static_cast<entt::entity>(message.ServerId);
+    if (!m_world.valid(cOrigin))
+        return;
+
+    if (const auto* pOwner = m_world.try_get<OwnerComponent>(cOrigin))
+    {
+        if (pOwner->GetOwner() != acMessage.pPlayer)
+        {
+            spdlog::debug("Ignored non-owner RequestEquipmentChanges for {:X}", message.ServerId);
+            return;
+        }
+    }
+
+    auto view = m_world.view<InventoryComponent>();
+
+    const auto it = view.find(cOrigin);
+
+    if (it != view.end())
+    {
+        auto& inventoryComponent = view.get<InventoryComponent>(*it);
+        inventoryComponent.Content.UpdateEquipment(message.CurrentInventory);
+    }
+
+    NotifyEquipmentChanges notify;
+    notify.ServerId = message.ServerId;
+    notify.ItemId = message.ItemId;
+    notify.EquipSlotId = message.EquipSlotId;
+    notify.Count = message.Count;
+    notify.Unequip = message.Unequip;
+    notify.IsSpell = message.IsSpell;
+    notify.IsShout = message.IsShout;
+
+    if (!GameServer::Get()->SendToPlayersInRange(notify, cOrigin, acMessage.GetSender()))
+        spdlog::error("{}: SendToPlayersInRange failed", __FUNCTION__);
+}
+
+void InventoryService::OnWeaponDrawnRequest(const PacketEvent<DrawWeaponRequest>& acMessage) noexcept
+{
+    auto& message = acMessage.Packet;
+    const entt::entity targetEntity = static_cast<entt::entity>(message.Id);
+    if (!acMessage.pPlayer || !m_world.valid(targetEntity))
+        return;
+
+    auto characterView = m_world.view<CharacterComponent, OwnerComponent>();
+    const auto it = characterView.find(targetEntity);
+
+    if (it != std::end(characterView) && characterView.get<OwnerComponent>(*it).GetOwner() == acMessage.pPlayer)
+    {
+        auto& characterComponent = characterView.get<CharacterComponent>(*it);
+        characterComponent.SetWeaponDrawn(message.IsWeaponDrawn);
+        spdlog::debug("Updating weapon drawn state {:x}:{}", message.Id, message.IsWeaponDrawn);
+
+        NotifyDrawWeapon notify{};
+        notify.Id = message.Id;
+        notify.IsWeaponDrawn = message.IsWeaponDrawn;
+        (void)GameServer::Get()->SendToPlayersInRange(notify, *it, acMessage.pPlayer);
+    }
+}

@@ -1,0 +1,92 @@
+
+local function build_client(name)
+target(name)
+    set_kind("static")
+    set_group("Client")
+    add_includedirs(".","../../Libraries/")
+    set_pcxxheader("TiltedOnlinePCH.h")
+
+    -- exclude game specifc stuff
+    add_headerfiles("**.h|Games/Skyrim/**|Services/Vivox/**")
+    add_files("**.cpp|Games/Skyrim/**|Services/Vivox/**")
+
+    after_install(function(target)
+        -- copy dlls
+        for _, pkg_with_dlls in ipairs({"cef", "discord"}) do
+            local linkdir = target:pkg(pkg_with_dlls):get("linkdirs")
+            local bindir = path.join(linkdir, "..", "bin")
+            os.cp(bindir, target:installdir())
+        end
+        -- copy ui
+        local uidir = path.join(target:scriptdir(), "..", "skyrim_ui", "src")
+        os.cp(path.join(uidir, "assets", "images", "cursor.dds"), path.join(target:installdir(), "bin", "assets", "images", "cursor.dds"))
+        os.cp(path.join(uidir, "assets", "images", "cursor.png"), path.join(target:installdir(), "bin", "assets", "images", "cursor.png"))
+        local built_ui = path.join(target:scriptdir(), "..", "skyrim_ui", "dist", "UI")
+        local prebuilt_ui = path.join(target:scriptdir(), "..", "..", "dist_ready", "RFAB_Online_MO2", "SkyrimTogetherReborn", "UI")
+        if os.isdir(built_ui) and os.isfile(path.join(built_ui, "index.html")) then
+            os.cp(built_ui, path.join(target:installdir(), "bin"))
+        elseif os.isdir(prebuilt_ui) and os.isfile(path.join(prebuilt_ui, "index.html")) then
+            os.cp(prebuilt_ui, path.join(target:installdir(), "bin"))
+        end
+        -- copy RFAB EditorID/modpack bindings manifest for both MO2 root-Data layout (SKSE/Plugins/) and game-dir layout (Data/SKSE/Plugins/)
+        local rfab_bindings = path.join(target:scriptdir(), "..", "..", "Data", "SKSE", "Plugins", "RFAB_Online_Bindings.json")
+        if os.isfile(rfab_bindings) then
+            os.mkdir(path.join(target:installdir(), "SKSE", "Plugins"))
+            os.cp(rfab_bindings, path.join(target:installdir(), "SKSE", "Plugins", "RFAB_Online_Bindings.json"))
+            os.mkdir(path.join(target:installdir(), "Data", "SKSE", "Plugins"))
+            os.cp(rfab_bindings, path.join(target:installdir(), "Data", "SKSE", "Plugins", "RFAB_Online_Bindings.json"))
+        end
+        os.rm(path.join(target:installdir(), "bin", "**Tests.exe"))
+    end)
+
+    add_files("Games/Skyrim/**.cpp")
+    add_headerfiles("Games/Skyrim/**.h")
+    -- rather hacky:
+    add_includedirs("Games/Skyrim")
+    add_deps("SkyrimEncoding")
+    add_deps(
+        "UiProcess",
+        "CommonLib",
+        "BaseLib",
+        "ImGuiImpl",
+        "TiltedConnect",
+        "TiltedReverse",
+        "TiltedHooks",
+        "TiltedUi",
+        {inherit = true}
+    )
+
+    add_packages(
+        "tiltedcore",
+        "spdlog",
+        "hopscotch-map",
+        "cryptopp",
+        "gamenetworkingsockets",
+        "discord",
+        "imgui",
+        "cef",
+        "minhook",
+        "entt",
+        "glm",
+        "mem",
+        "xbyak")
+
+    if has_config("vivox") then
+        add_files("Services/Vivox/**.cpp")
+        add_headerfiles("Services/Vivox/**.h")
+        add_includedirs("Services/Vivox")
+        add_deps("Vivox")
+        add_defines("TP_VIVOX=1")
+    else
+        add_defines("TP_VIVOX=0")
+    end
+
+    add_syslinks(
+        "version",
+        "dbghelp",
+        "kernel32")
+end
+
+add_requires("tiltedcore")
+
+build_client("SkyrimTogetherClient")

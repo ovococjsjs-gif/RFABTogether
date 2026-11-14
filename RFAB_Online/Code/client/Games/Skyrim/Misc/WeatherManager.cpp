@@ -1,0 +1,10 @@
+#include <TiltedOnlinePCH.h>
+
+#include <Misc/WeatherManager.h>
+
+WeatherManager* WeatherManager::Get()
+{
+    POINTER_SKYRIMSE(WeatherManager*, s_instance, 517228);
+
+    return *s_instance.Get();
+}
