@@ -83,6 +83,20 @@ Session::EntityDigest::Facts SessionResyncService::BuildServerFacts(entt::entity
             }
             facts.EquipmentHash = hasher.Finish();
             facts.Flags |= kFlagHasEquipment;
+
+            // The observer's own player: what the server believes that player carries. This copy is
+            // what a rollback restores from, so it had better be the inventory the player has.
+            if (apObserver && apObserver->GetCharacter().has_value() && *apObserver->GetCharacter() == aEntity)
+            {
+                InventoryHasher inventory;
+                for (const auto& entry : pInventory->Content.Entries)
+                    inventory.Add(entry.BaseId.ModId, entry.BaseId.BaseId, entry.Count);
+                const InventoryHasher::Summary summary = inventory.Finish();
+                facts.InventoryHash = summary.Hash;
+                facts.InventoryKinds = summary.Kinds;
+                facts.InventoryItems = summary.Items;
+                facts.Flags |= kFlagHasInventory;
+            }
         }
     }
     return facts;
@@ -211,6 +225,34 @@ void SessionResyncService::OnEntityDigest(const PacketEvent<ClientEntityDigest>&
                     std::snprintf(what, sizeof(what), "worn items differ (client hash %08X, server hash %08X)", finding.ClientValue,
                                   finding.ServerValue);
                     break;
+                case Field::kInventory:
+                {
+                    // Both ends counted what they have; the numbers say how far apart the copies are.
+                    uint32_t clientKinds = 0, clientItems = 0, serverKinds = 0, serverItems = 0;
+                    for (const Facts& facts : clientFacts)
+                    {
+                        if (facts.ServerId == finding.ServerId)
+                        {
+                            clientKinds = facts.InventoryKinds;
+                            clientItems = facts.InventoryItems;
+                            break;
+                        }
+                    }
+                    for (const Facts& facts : serverFacts)
+                    {
+                        if (facts.ServerId == finding.ServerId)
+                        {
+                            serverKinds = facts.InventoryKinds;
+                            serverItems = facts.InventoryItems;
+                            break;
+                        }
+                    }
+                    std::snprintf(what, sizeof(what),
+                                  "the player carries %u kinds / %u items, the server's copy has %u kinds / %u items%s",
+                                  clientKinds, clientItems, serverKinds, serverItems,
+                                  (clientKinds == serverKinds && clientItems == serverItems) ? " (same counts, different items)" : "");
+                    break;
+                }
                 }
 
                 spdlog::warn("[RFAB Desync] player {} entity {:X} ({}form {:X}:{:X}, simulated by player {}) {}: {}, for {} ms{}",

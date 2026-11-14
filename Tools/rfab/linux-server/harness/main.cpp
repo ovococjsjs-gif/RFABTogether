@@ -2668,6 +2668,80 @@ int main(int argc, char** argv)
         Check(removalsForFlood > 0 && removalsForFlood <= 24,
               "a report full of unknown characters costs the server at most its per-player resend budget");
 
+        // --- The guest's own inventory against the server's copy of it (work plan 5.3). The copy is
+        //     what a rollback restores from. The server can only say that it is wrong: it never hands
+        //     out or takes away items, and it never resends a character for it.
+        {
+            using Session::EntityDigest::InventoryHasher;
+            using Session::EntityDigest::kFlagHasInventory;
+            const GameId kGold{0u, 0x0000000Fu};
+            const GameId kSword{0u, 0x000139B9u};
+
+            // What the guest's game holds, as that client would sum it up.
+            const auto carrying = [&](std::initializer_list<std::pair<GameId, int32_t>> aItems) {
+                InventoryHasher hasher;
+                for (const auto& [id, count] : aItems)
+                    hasher.Add(id.ModId, id.BaseId, count);
+                const InventoryHasher::Summary summary = hasher.Finish();
+                Facts facts = row(guestChar, kFlagOwnedByReporter | kFlagHasInventory);
+                facts.InventoryHash = summary.Hash;
+                facts.InventoryKinds = summary.Kinds;
+                facts.InventoryItems = summary.Items;
+                return facts;
+            };
+            // The packet the guest's client sends when its player gains or loses an item.
+            const auto guestItemDelta = [&](const GameId& acItem, int32_t aCount) {
+                RequestInventoryChanges request{};
+                request.ServerId = guestChar;
+                request.Item.BaseId = acItem;
+                request.Item.Count = aCount;
+                request.UpdateClients = true;
+                return DeliverWire(world, request, pGuest);
+            };
+            const auto sentToGuestAsRepair = [&]() {
+                return !DecodeOutboxMessagesFor<CharacterSpawnRequest>(kGuestConn).empty() ||
+                       !DecodeOutboxMessagesFor<NotifyRemoveCharacter>(kGuestConn).empty();
+            };
+
+            // The rest of this client's view agrees with the server from here on (the guard is dead on
+            // both sides), so every finding below is about the inventory. Two reports close whatever
+            // the checks above left open.
+            (void)report({mine, hostSeen, guardDead});
+            (void)report({mine, hostSeen, guardDead});
+
+            bEnableDesyncAutoRepair = true;  // even with repairs on, an inventory is never "repaired"
+            const uint64_t confirmedBefore = totals().Confirmed;
+            const uint64_t repairedBeforeInventory = totals().Repaired;
+
+            Check(guestItemDelta(kGold, 250) && guestItemDelta(kSword, 1), "the guest's client reports 250 gold and a sword gained");
+            (void)report({carrying({{kGold, 250}, {kSword, 1}}), hostSeen, guardDead});
+            (void)report({carrying({{kGold, 250}, {kSword, 1}}), hostSeen, guardDead});
+            Check(totals().Confirmed == confirmedBefore, "an inventory the server's copy agrees with produces no finding");
+
+            // The player picks up 30 more gold; the digest leaves before the item packet does.
+            (void)report({carrying({{kGold, 280}, {kSword, 1}}), hostSeen, guardDead});
+            Check(guestItemDelta(kGold, 30), "the item packet arrives after the digest that already counted it");
+            (void)report({carrying({{kGold, 280}, {kSword, 1}}), hostSeen, guardDead});
+            Check(totals().Confirmed == confirmedBefore, "a pickup that was still in flight is not reported as a desync");
+
+            // A change the client never told the server about (a script, a hook that did not fire):
+            // the player has 5 more gold than the server's copy, report after report.
+            (void)report({carrying({{kGold, 285}, {kSword, 1}}), hostSeen, guardDead});
+            Check(totals().Confirmed == confirmedBefore, "seen once it is only a suspicion");
+            (void)report({carrying({{kGold, 285}, {kSword, 1}}), hostSeen, guardDead});
+            Check(totals().Confirmed == confirmedBefore + 1, "seen again it is a confirmed inventory difference, written to the log");
+            Check(!sentToGuestAsRepair() && totals().Repaired == repairedBeforeInventory,
+                  "nothing is resent for it, with auto-repair on: the server cannot make a player's inventory right");
+
+            // The copy catches up (the client reports the missing gold): the difference is gone.
+            Check(guestItemDelta(kGold, 5), "the missing gold is reported after all");
+            const uint64_t confirmedAfter = totals().Confirmed;
+            (void)report({carrying({{kGold, 285}, {kSword, 1}}), hostSeen, guardDead});
+            (void)report({carrying({{kGold, 285}, {kSword, 1}}), hostSeen, guardDead});
+            Check(totals().Confirmed == confirmedAfter, "once the copy agrees again nothing more is said");
+            bEnableDesyncAutoRepair = false;
+        }
+
         // --- The detector's own switch.
         bEnableDesyncDetector = false;
         const uint64_t reportsBefore = totals().Reports;

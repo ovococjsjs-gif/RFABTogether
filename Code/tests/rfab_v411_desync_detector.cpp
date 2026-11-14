@@ -13,7 +13,10 @@
 #include <common/Session/Features.h>
 
 #include <algorithm>
+#include <initializer_list>
 #include <limits>
+#include <string>
+#include <utility>
 #include <vector>
 
 using namespace Session::EntityDigest;
@@ -434,7 +437,7 @@ TEST_CASE("Desync detector: the report on the wire", "[rfab][v411][desync]")
         Serialization::WriteBool(writer, false); // truncated
         Serialization::WriteVarInt(writer, 1);   // one row
         Serialization::WriteVarInt(writer, 9);   // server id
-        writer.WriteBits(0xE7, 8);               // unknown flag bits set, equipment flag clear
+        writer.WriteBits(0xC7, 8);               // unknown flag bits set, equipment and inventory flags clear
         writer.WriteBits(200, 8);                // not a percentage
 
         TiltedPhoques::Buffer::Reader reader(&buffer);
@@ -444,7 +447,7 @@ TEST_CASE("Desync detector: the report on the wire", "[rfab][v411][desync]")
         const auto& report = *static_cast<ClientEntityDigest*>(pMessage.get());
         REQUIRE(report.Entries.size() == 1);
         CHECK(report.Entries[0].ServerId == 9);
-        CHECK(report.Entries[0].Flags == (0xE7 & kKnownFlags));
+        CHECK(report.Entries[0].Flags == (0xC7 & kKnownFlags));
         CHECK(report.Entries[0].HealthPct == kNoHealth);
         CHECK(report.Entries[0].EquipmentHash == 0);
     }
@@ -474,4 +477,257 @@ TEST_CASE("Desync detector: the report on the wire", "[rfab][v411][desync]")
         CHECK(Session::IsEnabledIn(0u, Session::Feature::kDesyncDetector));
         CHECK_FALSE(Session::IsEnabledIn(Session::Bit(Session::Feature::kDesyncDetector), Session::Feature::kDesyncDetector));
     }
+}
+
+// ---- the reporter's own inventory (work plan 5.3: the comparison 3.3 left out) ----
+
+namespace
+{
+Facts OwnPlayerRow(uint32_t aServerId, InventoryHasher aCarried)
+{
+    Facts facts = Row(aServerId, kFlagOwnedByReporter | kFlagPlayer | kFlagHasInventory);
+    const InventoryHasher::Summary summary = aCarried.Finish();
+    facts.InventoryHash = summary.Hash;
+    facts.InventoryKinds = summary.Kinds;
+    facts.InventoryItems = summary.Items;
+    return facts;
+}
+
+InventoryHasher Carried(std::initializer_list<std::pair<uint32_t, int32_t>> aItems)
+{
+    InventoryHasher hasher;
+    for (const auto& [baseId, count] : aItems)
+        hasher.Add(0u, baseId, count);
+    return hasher;
+}
+} // namespace
+
+TEST_CASE("Desync detector: an inventory is summed up the same way at both ends", "[rfab][v411][desync][inventory]")
+{
+    SECTION("the order of the entries does not matter")
+    {
+        InventoryHasher a;
+        a.Add(0, 0x0F, 250);     // gold
+        a.Add(0, 0x139B9, 1);    // a sword
+        a.Add(2, 0x800, 12);     // arrows of a mod
+        InventoryHasher b;
+        b.Add(2, 0x800, 12);
+        b.Add(0, 0x139B9, 1);
+        b.Add(0, 0x0F, 250);
+        const auto sa = a.Finish();
+        const auto sb = b.Finish();
+        CHECK(sa.Hash == sb.Hash);
+        CHECK(sa.Kinds == 3);
+        CHECK(sa.Items == 263);
+        CHECK(sa.Hash != 0);
+    }
+
+    SECTION("stacks of the same item add up: the two ends split them differently")
+    {
+        InventoryHasher oneStack;
+        oneStack.Add(0, 0x139B9, 3);
+        InventoryHasher split;  // one worn, two spare; or one tempered, two plain
+        split.Add(0, 0x139B9, 1);
+        split.Add(0, 0x139B9, 2);
+        const auto a = oneStack.Finish();
+        const auto b = split.Finish();
+        CHECK(a.Hash == b.Hash);
+        CHECK(b.Kinds == 1);
+        CHECK(b.Items == 3);
+    }
+
+    SECTION("one piece more or less is a different inventory")
+    {
+        CHECK(Carried({{0x0F, 250}}).Finish().Hash != Carried({{0x0F, 251}}).Finish().Hash);
+        CHECK(Carried({{0x0F, 250}, {0x10, 1}}).Finish().Hash != Carried({{0x0F, 250}}).Finish().Hash);
+        // The same counts on different items: equal totals, different hash.
+        const auto swords = Carried({{0x139B9, 2}}).Finish();
+        const auto axes = Carried({{0x139BA, 2}}).Finish();
+        CHECK(swords.Kinds == axes.Kinds);
+        CHECK(swords.Items == axes.Items);
+        CHECK(swords.Hash != axes.Hash);
+        // Moving a piece from one item to another keeps the totals too.
+        CHECK(Carried({{1, 2}, {2, 1}}).Finish().Hash != Carried({{1, 1}, {2, 2}}).Finish().Hash);
+    }
+
+    SECTION("the same base id in another plugin is another item")
+    {
+        InventoryHasher a;
+        a.Add(1, 0x800, 1);
+        InventoryHasher b;
+        b.Add(2, 0x800, 1);
+        CHECK(a.Finish().Hash != b.Finish().Hash);
+    }
+
+    SECTION("rows that are not items are left out at both ends")
+    {
+        InventoryHasher plain;
+        plain.Add(0, 0x0F, 10);
+
+        InventoryHasher noisy;
+        noisy.Add(0, 0x0F, 10);
+        noisy.Add(0, 0x1234, 0);    // a bookkeeping row
+        noisy.Add(0, 0x1235, -3);   // a removal that was never netted out
+        // An item the player made (enchanted, brewed): a temporary form with a different id on
+        // every machine. Comparing it would report every crafted item as a difference.
+        noisy.Add(InventoryHasher::kRuntimeFormModId, 0xFF000A31, 1);
+
+        const auto a = plain.Finish();
+        const auto b = noisy.Finish();
+        CHECK(a.Hash == b.Hash);
+        CHECK(b.Kinds == 1);
+        CHECK(b.Items == 10);
+    }
+
+    SECTION("an empty inventory still has a hash, and it differs from one item")
+    {
+        InventoryHasher nothing;
+        const auto empty = nothing.Finish();
+        CHECK(empty.Hash != 0);
+        CHECK(empty.Kinds == 0);
+        CHECK(empty.Items == 0);
+        CHECK(empty.Hash != Carried({{0x0F, 1}}).Finish().Hash);
+    }
+
+    SECTION("the counters saturate instead of wrapping")
+    {
+        InventoryHasher huge;
+        for (uint32_t i = 0; i < 70000; ++i)
+            huge.Add(0, 0x100000 + i, 1);
+        huge.Add(0, 0x0F, std::numeric_limits<int32_t>::max());
+        huge.Add(0, 0x0F, std::numeric_limits<int32_t>::max());
+        huge.Add(0, 0x0F, std::numeric_limits<int32_t>::max());
+        const auto summary = huge.Finish();
+        CHECK(summary.Kinds == 0xFFFF);
+        CHECK(summary.Items == 0xFFFFFFFFu);
+    }
+}
+
+TEST_CASE("Desync detector: the reporter's own inventory against the server's copy", "[rfab][v411][desync][inventory]")
+{
+    Comparer comparer;
+    std::vector<Finding> findings;
+
+    const auto real = Carried({{0x0F, 250}, {0x139B9, 1}, {0x800, 12}});
+    const auto copyWithoutArrows = Carried({{0x0F, 250}, {0x139B9, 1}});
+
+    SECTION("the same inventory at both ends: nothing")
+    {
+        const std::vector<Facts> client{OwnPlayerRow(7, real)};
+        const std::vector<Facts> server{OwnPlayerRow(7, real)};
+        comparer.Compare(client, server, false, 0, findings);
+        comparer.Compare(client, server, false, 5000, findings);
+        CHECK(findings.empty());
+        CHECK(comparer.TrackedCount() == 0);
+    }
+
+    SECTION("the server's copy lost something: confirmed by the second report, logged, never repaired")
+    {
+        const std::vector<Facts> client{OwnPlayerRow(7, real)};
+        const std::vector<Facts> server{OwnPlayerRow(7, copyWithoutArrows)};
+        comparer.Compare(client, server, false, 0, findings);
+        CHECK(findings.empty());  // could be an item picked up this very frame
+
+        comparer.Compare(client, server, false, 5000, findings);
+        const Finding* pFinding = Find(findings, 7, Field::kInventory);
+        REQUIRE(pFinding != nullptr);
+        CHECK(pFinding->Log);
+        CHECK_FALSE(pFinding->Repair);  // the server cannot hand out or take away items to be right
+        CHECK(pFinding->ClientValue == client[0].InventoryHash);
+        CHECK(pFinding->ServerValue == server[0].InventoryHash);
+        CHECK(comparer.GetStats().Confirmed[static_cast<uint8_t>(Field::kInventory)] == 1);
+        CHECK_FALSE(IsRepairable(Field::kInventory));
+        CHECK(std::string(ToString(Field::kInventory)) == "inventory");
+    }
+
+    SECTION("an item picked up between the digest and its own packet: gone in the next report, never said")
+    {
+        const std::vector<Facts> ahead{OwnPlayerRow(7, real)};
+        const std::vector<Facts> behind{OwnPlayerRow(7, copyWithoutArrows)};
+        comparer.Compare(ahead, behind, false, 0, findings);
+        comparer.Compare(ahead, ahead, false, 5000, findings);   // the server applied the pickup
+        comparer.Compare(ahead, ahead, false, 10000, findings);
+        CHECK(findings.empty());
+        CHECK(comparer.GetStats().Cleared == 1);
+    }
+
+    SECTION("only when both ends report it")
+    {
+        Facts clientRow = OwnPlayerRow(7, real);
+        Facts serverRow = OwnPlayerRow(7, copyWithoutArrows);
+        serverRow.Flags &= static_cast<uint8_t>(~kFlagHasInventory);  // the server has no inventory for this character yet
+        comparer.Compare({clientRow}, {serverRow}, false, 0, findings);
+        comparer.Compare({clientRow}, {serverRow}, false, 5000, findings);
+        CHECK(findings.empty());
+
+        clientRow.Flags &= static_cast<uint8_t>(~kFlagHasInventory);  // an older client
+        serverRow.Flags |= kFlagHasInventory;
+        comparer.Compare({clientRow}, {serverRow}, false, 10000, findings);
+        comparer.Compare({clientRow}, {serverRow}, false, 15000, findings);
+        CHECK(findings.empty());
+    }
+
+    SECTION("only for a character the reporter simulates: another player's inventory is not on this screen")
+    {
+        Facts clientRow = OwnPlayerRow(8, real);
+        clientRow.Flags = kFlagLive | kFlagPlayer | kFlagHasInventory;  // a remote copy, with a value it should not carry
+        Facts serverRow = OwnPlayerRow(8, copyWithoutArrows);
+        serverRow.Flags = kFlagPlayer | kFlagHasInventory;
+        comparer.Compare({clientRow}, {serverRow}, false, 0, findings);
+        comparer.Compare({clientRow}, {serverRow}, false, 5000, findings);
+        CHECK(Find(findings, 8, Field::kInventory) == nullptr);
+    }
+
+    SECTION("a difference that stays is logged once a minute")
+    {
+        const std::vector<Facts> client{OwnPlayerRow(7, real)};
+        const std::vector<Facts> server{OwnPlayerRow(7, copyWithoutArrows)};
+        size_t logged = 0;
+        for (uint64_t now = 0; now <= 125000; now += 5000)
+        {
+            findings.clear();
+            comparer.Compare(client, server, false, now, findings);
+            if (const Finding* pFinding = Find(findings, 7, Field::kInventory); pFinding && pFinding->Log)
+                ++logged;
+        }
+        CHECK(logged == 3);  // at 5 s, 65 s and 125 s
+    }
+}
+
+TEST_CASE("Desync detector: the inventory summary on the wire", "[rfab][v411][desync][inventory]")
+{
+    ClientEntityDigest sent;
+    sent.Sequence = 77;
+    sent.Entries.push_back(Row(1, kFlagLive, 80));
+    sent.Entries.push_back(OwnPlayerRow(2, Carried({{0x0F, 250}, {0x139B9, 1}})));
+    Facts everything = Row(3, kFlagLive | kFlagPlayer | kFlagHasEquipment | kFlagHasInventory, 55, 0xDEADBEEF);
+    everything.InventoryHash = 0x01020304;
+    everything.InventoryKinds = 0xFFFF;
+    everything.InventoryItems = 0xFFFFFFFFu;
+    sent.Entries.push_back(everything);
+    sent.Entries.push_back(Row(4, kFlagOwnedByReporter));  // the row after it must still be read in place
+
+    const ClientEntityDigest received = RoundTrip(sent);
+    REQUIRE(received.Entries.size() == 4);
+    CHECK(received == sent);
+    CHECK(received.Entries[1].InventoryKinds == 2);
+    CHECK(received.Entries[1].InventoryItems == 251);
+    CHECK(received.Entries[1].InventoryHash == sent.Entries[1].InventoryHash);
+    CHECK(received.Entries[2].EquipmentHash == 0xDEADBEEF);
+    CHECK(received.Entries[2].InventoryItems == 0xFFFFFFFFu);
+    CHECK(received.Entries[3].ServerId == 4);
+    CHECK(received.Entries[3].Flags == kFlagOwnedByReporter);
+
+    // Without the flag the three values do not travel.
+    ClientEntityDigest unflagged;
+    Facts row = Row(9, kFlagOwnedByReporter);
+    row.InventoryHash = 123;
+    row.InventoryKinds = 4;
+    row.InventoryItems = 5;
+    unflagged.Entries.push_back(row);
+    const ClientEntityDigest back = RoundTrip(unflagged);
+    REQUIRE(back.Entries.size() == 1);
+    CHECK(back.Entries[0].InventoryHash == 0);
+    CHECK(back.Entries[0].InventoryKinds == 0);
+    CHECK(back.Entries[0].InventoryItems == 0);
 }

@@ -59,8 +59,9 @@ enum Flag : uint8_t
     kFlagLive = 1u << 2,             // client: a live actor exists here, life state and health are real
     kFlagHasEquipment = 1u << 3,     // EquipmentHash is meaningful (player characters only)
     kFlagPlayer = 1u << 4,           // a player character
+    kFlagHasInventory = 1u << 5,     // Inventory* are meaningful (the reporter's own player character only)
 };
-inline constexpr uint8_t kKnownFlags = 0x1F;
+inline constexpr uint8_t kKnownFlags = 0x3F;
 
 struct Facts
 {
@@ -68,6 +69,11 @@ struct Facts
     uint8_t Flags{0};
     uint8_t HealthPct{kNoHealth};  // 0..100, kNoHealth when unknown
     uint32_t EquipmentHash{0};
+    // What the character carries (InventoryHasher). Compared for the reporter's own player: the
+    // server keeps a copy of it and acts on that copy by itself (a rollback restores from it).
+    uint32_t InventoryHash{0};
+    uint16_t InventoryKinds{0};  // different items; for the log line
+    uint32_t InventoryItems{0};  // pieces in total; for the log line
 
     [[nodiscard]] constexpr bool Has(Flag aFlag) const noexcept { return (Flags & aFlag) != 0; }
 };
@@ -80,8 +86,9 @@ enum class Field : uint8_t
     kLifeState = 3,
     kHealth = 4,
     kEquipment = 5,
+    kInventory = 6,        // the reporter's own inventory and the server's copy of it differ
 };
-inline constexpr uint8_t kFieldCount = 6;
+inline constexpr uint8_t kFieldCount = 7;
 
 [[nodiscard]] constexpr const char* ToString(Field aField) noexcept
 {
@@ -93,6 +100,7 @@ inline constexpr uint8_t kFieldCount = 6;
     case Field::kLifeState: return "life-state";
     case Field::kHealth: return "health";
     case Field::kEquipment: return "equipment";
+    case Field::kInventory: return "inventory";
     }
     return "?";
 }
@@ -102,7 +110,9 @@ inline constexpr uint8_t kFieldCount = 6;
 //    to the one it simulates);
 //  - health has its own authority and its own corrections (Authority/Health.h), and a resend in
 //    the middle of a fight moves the actor;
-//  - a player's equipment is compared before anyone has seen the comparison work in the game.
+//  - a player's equipment is compared before anyone has seen the comparison work in the game;
+//  - a player's inventory belongs to that player's game. The server cannot hand items out or take
+//    them away to make its copy right; what it can do is say that its copy is wrong.
 [[nodiscard]] constexpr bool IsRepairable(Field aField) noexcept
 {
     return aField == Field::kMissingOnClient || aField == Field::kUnknownToServer || aField == Field::kLifeState;
@@ -151,6 +161,72 @@ public:
 
 private:
     std::vector<uint64_t> m_keys{};
+};
+
+// Hash of WHAT a character carries and HOW MANY of each: `Add` once per inventory entry, in any
+// order. Entries of the same item add up, because the two ends split stacks differently (worn and
+// spare, tempered and plain). Left out on both ends:
+//  - entries with a count of zero or less (bookkeeping rows);
+//  - items whose base form was created while the game ran (mod id 0xFFFFFFFF: an enchanted weapon
+//    or a potion the player made has a different temporary form id on every machine).
+// The hash is never 0, which means "not reported".
+class InventoryHasher
+{
+public:
+    struct Summary
+    {
+        uint32_t Hash{0};
+        uint16_t Kinds{0};
+        uint32_t Items{0};
+    };
+
+    static constexpr uint32_t kRuntimeFormModId = 0xFFFFFFFFu;
+
+    void Add(uint32_t aModId, uint32_t aBaseId, int32_t aCount)
+    {
+        if (aCount <= 0 || aModId == kRuntimeFormModId)
+            return;
+        m_rows.emplace_back((static_cast<uint64_t>(aModId) << 32) | aBaseId, static_cast<uint32_t>(aCount));
+    }
+
+    [[nodiscard]] Summary Finish()
+    {
+        std::sort(m_rows.begin(), m_rows.end());
+
+        Summary summary{};
+        uint64_t hash = 14695981039346656037ULL;
+        const auto mix = [&hash](uint64_t aValue) {
+            for (int shift = 0; shift < 64; shift += 8)
+            {
+                hash ^= (aValue >> shift) & 0xFFULL;
+                hash *= 1099511628211ULL;
+            }
+        };
+
+        size_t kinds = 0;
+        uint64_t items = 0;
+        for (size_t i = 0; i < m_rows.size();)
+        {
+            const uint64_t key = m_rows[i].first;
+            uint64_t count = 0;
+            for (; i < m_rows.size() && m_rows[i].first == key; ++i)
+                count += m_rows[i].second;
+            mix(key);
+            mix(count);
+            ++kinds;
+            items += count;
+        }
+        mix(kinds);
+
+        summary.Kinds = kinds > 0xFFFFu ? uint16_t{0xFFFF} : static_cast<uint16_t>(kinds);
+        summary.Items = items > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(items);
+        const uint32_t folded = static_cast<uint32_t>(hash ^ (hash >> 32));
+        summary.Hash = folded == 0 ? 1u : folded;
+        return summary;
+    }
+
+private:
+    std::vector<std::pair<uint64_t, uint32_t>> m_rows{};
 };
 
 struct Policy
@@ -238,7 +314,13 @@ public:
                 continue;  // the two ends do not agree on who the source is: nothing else is comparable
             }
             if (clientOwns)
-                continue;  // the reporter is the source of this character's state
+            {
+                // The reporter is the source of this character's state. One part of it the server
+                // keeps a copy of and uses by itself: its player's inventory.
+                if (client.Has(kFlagHasInventory) && server.Has(kFlagHasInventory) && client.InventoryHash != server.InventoryHash)
+                    Observe(serverId, Field::kInventory, client.InventoryHash, server.InventoryHash, aNowMs, aOut);
+                continue;
+            }
 
             if (!client.Has(kFlagLive))
                 continue;  // known here, but no actor: nothing on this screen can be wrong

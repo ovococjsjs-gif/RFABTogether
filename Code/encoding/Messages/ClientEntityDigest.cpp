@@ -19,6 +19,12 @@ void ClientEntityDigest::SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) co
         aWriter.WriteBits(facts.HealthPct, 8);
         if (facts.Has(kFlagHasEquipment))
             aWriter.WriteBits(facts.EquipmentHash, 32);
+        if (facts.Has(kFlagHasInventory))
+        {
+            aWriter.WriteBits(facts.InventoryHash, 32);
+            aWriter.WriteBits(facts.InventoryKinds, 16);
+            Serialization::WriteVarInt(aWriter, facts.InventoryItems);
+        }
     }
 }
 
@@ -67,6 +73,16 @@ void ClientEntityDigest::DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) 
             aReader.ReadBits(raw, 32);
             facts.EquipmentHash = static_cast<uint32_t>(raw & 0xFFFFFFFF);
         }
+        if (facts.Has(kFlagHasInventory))
+        {
+            raw = 0;
+            aReader.ReadBits(raw, 32);
+            facts.InventoryHash = static_cast<uint32_t>(raw & 0xFFFFFFFF);
+            raw = 0;
+            aReader.ReadBits(raw, 16);
+            facts.InventoryKinds = static_cast<uint16_t>(raw & 0xFFFF);
+            facts.InventoryItems = static_cast<uint32_t>(Serialization::ReadVarInt(aReader) & 0xFFFFFFFF);
+        }
         Entries.push_back(facts);
     }
 }
@@ -80,7 +96,8 @@ bool ClientEntityDigest::operator==(const ClientEntityDigest& acRhs) const noexc
     {
         const auto& a = Entries[i];
         const auto& b = acRhs.Entries[i];
-        if (a.ServerId != b.ServerId || a.Flags != b.Flags || a.HealthPct != b.HealthPct || a.EquipmentHash != b.EquipmentHash)
+        if (a.ServerId != b.ServerId || a.Flags != b.Flags || a.HealthPct != b.HealthPct || a.EquipmentHash != b.EquipmentHash ||
+            a.InventoryHash != b.InventoryHash || a.InventoryKinds != b.InventoryKinds || a.InventoryItems != b.InventoryItems)
             return false;
     }
     return true;

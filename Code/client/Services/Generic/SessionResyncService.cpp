@@ -193,6 +193,24 @@ void SessionResyncService::SendEntityDigest() noexcept
         Facts facts{};
         facts.ServerId = localView.get<LocalComponent>(entity).Id;
         facts.Flags |= kFlagOwnedByReporter;
+
+        // This client's own player also says what it carries: the server keeps a copy of that
+        // inventory and restores from it at a rollback, so the two had better be the same.
+        if (const auto* pFormId = m_world.try_get<FormIdComponent>(entity); pFormId && pFormId->Id == 0x14)
+        {
+            if (PlayerCharacter* pPlayer = PlayerCharacter::Get())
+            {
+                InventoryHasher hasher;
+                const Inventory carried = pPlayer->GetInventory();
+                for (const auto& entry : carried.Entries)
+                    hasher.Add(entry.BaseId.ModId, entry.BaseId.BaseId, entry.Count);
+                const InventoryHasher::Summary summary = hasher.Finish();
+                facts.InventoryHash = summary.Hash;
+                facts.InventoryKinds = summary.Kinds;
+                facts.InventoryItems = summary.Items;
+                facts.Flags |= kFlagHasInventory;
+            }
+        }
         message.Entries.push_back(facts);
     }
 
