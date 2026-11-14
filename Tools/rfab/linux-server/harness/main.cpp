@@ -242,6 +242,21 @@ std::vector<uint32_t> OutboxOpcodesFor(TiltedPhoques::ConnectionId_t aConn)
     return opcodes;
 }
 
+// A connection that ends, the way the transport reports it: GameServer::OnDisconnection, the code
+// that runs when a player's game closes or the link drops. It is protected in the transport's base
+// class; this reaches it without changing the server. A scene that only fires PlayerLeaveEvent and
+// removes the player skips what the real path does with the entities that player simulated.
+struct TransportAccess : TiltedPhoques::Server
+{
+    using TiltedPhoques::Server::OnDisconnection;
+};
+
+void Disconnect(GameServer& aServer, TiltedPhoques::ConnectionId_t aConnectionId)
+{
+    TiltedPhoques::Server& transport = aServer;
+    (transport.*(&TransportAccess::OnDisconnection))(aConnectionId, TiltedPhoques::Server::EDisconnectReason::Quit);
+}
+
 template <class TMap>
 bool HasApproxValue(const TMap& acMap, uint32_t aKey, float aExpected, float aEps = 0.01f)
 {
@@ -2869,6 +2884,141 @@ int main(int argc, char** argv)
         request(pHost, RequestCoordinatedSaveLoad::ActionType::LoadSpecificSlot, "Quicksave0_of_somebody");
         Check(toldToLoad(kHostConn) == first && toldToLoad(kGuestConn) == first,
               "a slot name that is not a party checkpoint loads the newest checkpoint instead");
+    }
+
+    // Scene 15: the player who simulates the enemies of a fight disconnects in the middle of it
+    // (work plan 5.1 / 5.2). The other player in the cell must become their simulator without the
+    // fight changing: a wounded enemy keeps its wounds, a dead one stays dead, and the new simulator
+    // is told. Every request goes through the wire encoding.
+    {
+        std::printf("[scene 15] the simulating player leaves in the middle of a fight\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xF001u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xF002u;
+        const GameId kCell{0u, 0x000F1001u};
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kBanditBase{0u, 0x000F4001u};
+        constexpr uint32_t kHealthIndex = ActorValuesComponent::kHealthActorValueIndex;
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 12.0f;
+        t0.Day = 5;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+        pHost->SetCellComponent(CellIdComponent{kCell});
+        pGuest->SetCellComponent(CellIdComponent{kCell});
+
+        uint32_t nextCookie = 1500u;
+        const auto assign = [&](Player* apOwner, TiltedPhoques::ConnectionId_t aConn, const GameId& acRefId) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            request.ReferenceId = acRefId;
+            if (acRefId != kPlayerRef)
+                request.FormId = kBanditBase;
+            request.CellId = kCell;
+            request.Position = glm::vec3{200.0f, 200.0f, 0.0f};
+            request.CurrentActorData.BaseId = request.FormId;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 300.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 300.0f;
+            (void)DeliverWire(world, request, apOwner);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+
+        const uint32_t hostChar = assign(pHost, kHostConn, kPlayerRef);
+        const uint32_t guestChar = assign(pGuest, kGuestConn, kPlayerRef);
+        const uint32_t wounded = assign(pHost, kHostConn, GameId{0u, 0x000F2001u});
+        const uint32_t corpse = assign(pHost, kHostConn, GameId{0u, 0x000F2002u});
+        const uint32_t untouched = assign(pHost, kHostConn, GameId{0u, 0x000F2003u});
+        Check(hostChar != 0xFFFFFFFFu && guestChar != 0xFFFFFFFFu && wounded != 0xFFFFFFFFu && corpse != 0xFFFFFFFFu &&
+                  untouched != 0xFFFFFFFFu,
+              "two players and three bandits simulated by the host are registered");
+
+        const auto entityOf = [](uint32_t aServerId) { return static_cast<entt::entity>(aServerId); };
+        const auto ownerOf = [&](uint32_t aServerId) { return world.get<OwnerComponent>(entityOf(aServerId)).GetOwner(); };
+        const auto healthOf = [&](uint32_t aServerId) {
+            float health = -1.0f;
+            (void)world.get<ActorValuesComponent>(entityOf(aServerId)).TryGetHealth(health);
+            return health;
+        };
+        Check(ownerOf(wounded) == pHost && ownerOf(corpse) == pHost && ownerOf(untouched) == pHost, "the host simulates all three");
+
+        // The fight: the host's client reports one bandit down to 120 of 300 and another one dead.
+        RequestActorValueChanges hit{};
+        hit.Id = wounded;
+        hit.Values[kHealthIndex] = 120.0f;
+        // The revision the host's client holds for this actor (it came with the assignment).
+        hit.HealthRevision = world.get<ActorValuesComponent>(entityOf(wounded)).HealthRevision;
+        Check(DeliverWire(world, hit, pHost) && std::fabs(healthOf(wounded) - 120.0f) < 0.01f, "the host wounds a bandit to 120 of 300");
+        RequestDeathStateChange death{};
+        death.Id = corpse;
+        death.IsDead = true;
+        Check(DeliverWire(world, death, pHost) && world.get<CharacterComponent>(entityOf(corpse)).IsDead(), "the host kills another bandit");
+
+        const uint64_t woundedEpochBefore = world.get<OwnerComponent>(entityOf(wounded)).GetLease().Epoch;
+        const uint32_t woundedRevisionBefore = world.get<ActorValuesComponent>(entityOf(wounded)).HealthRevision;
+
+        // The host's connection drops: the transport reports it, as it does when a game closes.
+        Harness::ClearOutbox();
+        Disconnect(server, kHostConn);
+        pHost = nullptr;
+        Check(world.GetPlayerManager().GetByConnectionId(kHostConn) == nullptr, "the host is gone from the server");
+
+        Check(world.valid(entityOf(wounded)) && world.valid(entityOf(corpse)) && world.valid(entityOf(untouched)),
+              "the bandits outlive the player who simulated them");
+        Check(ownerOf(wounded) == pGuest && ownerOf(untouched) == pGuest, "the guest, who stands in the same cell, simulates the living bandits now");
+
+        const auto transfers = DecodeOutboxMessagesFor<NotifyOwnershipTransfer>(kGuestConn);
+        const auto transferOf = [&](uint32_t aServerId) -> const NotifyOwnershipTransfer* {
+            for (const auto& transfer : transfers)
+                if (transfer.ServerId == aServerId)
+                    return &transfer;
+            return nullptr;
+        };
+        const NotifyOwnershipTransfer* pWoundedTransfer = transferOf(wounded);
+        Check(pWoundedTransfer != nullptr && transferOf(untouched) != nullptr, "the guest is told about each bandit it took over");
+        Check(pWoundedTransfer != nullptr && pWoundedTransfer->OwnershipEpoch > woundedEpochBefore &&
+                  world.get<OwnerComponent>(entityOf(wounded)).GetLease().Epoch == pWoundedTransfer->OwnershipEpoch,
+              "with a newer ownership epoch than the host had, the one the server holds");
+        Check(pWoundedTransfer != nullptr && pWoundedTransfer->HealthRevision == world.get<ActorValuesComponent>(entityOf(wounded)).HealthRevision,
+              "and with the health revision its own readings must carry from now on");
+
+        Check(std::fabs(healthOf(wounded) - 120.0f) < 0.01f, "the wounded bandit is still at 120: the handover did not heal it");
+        Check(world.get<ActorValuesComponent>(entityOf(wounded)).HealthRevision >= woundedRevisionBefore,
+              "its health revision did not go backwards");
+        Check(std::fabs(healthOf(untouched) - 300.0f) < 0.01f, "the untouched bandit is still at full health");
+        Check(world.get<CharacterComponent>(entityOf(corpse)).IsDead(), "the dead bandit is still dead");
+        Check(!world.valid(entityOf(hostChar)) || !world.all_of<CharacterComponent>(entityOf(hostChar)) || ownerOf(hostChar) != pGuest,
+              "the departed player's own character is not handed to anybody");
+
+        // The new simulator goes on with the fight: its readings are accepted, with the new epoch.
+        RequestActorValueChanges secondHit{};
+        secondHit.Id = wounded;
+        secondHit.Values[kHealthIndex] = 60.0f;
+        // The revision the handover told the guest's client.
+        secondHit.HealthRevision = pWoundedTransfer != nullptr ? pWoundedTransfer->HealthRevision : 0u;
+        Check(DeliverWire(world, secondHit, pGuest) && std::fabs(healthOf(wounded) - 60.0f) < 0.01f,
+              "the guest's next hit on the bandit it now simulates is applied");
+
+        // The body is the guest's to keep as well: it is told, and the body is still a body.
+        Check(ownerOf(corpse) == pGuest || ownerOf(corpse) == nullptr, "the dead bandit is not left with the departed player");
+        Check(world.get<CharacterComponent>(entityOf(corpse)).IsDead(), "and it is still dead after the guest's hit on the other one");
+
+        // The guest leaves too: nobody is left to simulate, and placed NPCs wait as they are.
+        Harness::ClearOutbox();
+        Disconnect(server, kGuestConn);
+        Check(world.valid(entityOf(wounded)) && ownerOf(wounded) == nullptr, "with nobody left the wounded bandit stays in the world without a simulator");
+        Check(world.valid(entityOf(wounded)) && std::fabs(healthOf(wounded) - 60.0f) < 0.01f, "at the health the fight left it with");
+        Check(world.valid(entityOf(corpse)) && world.get<CharacterComponent>(entityOf(corpse)).IsDead(), "and the dead one remains dead for whoever comes next");
     }
 
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures,
