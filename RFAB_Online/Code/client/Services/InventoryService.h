@@ -1,0 +1,99 @@
+#pragma once
+
+#include <Structs/Inventory.h>
+#include <unordered_map>
+#include <common/Session/Lifecycle.h>
+
+struct World;
+struct TransportService;
+
+struct UpdateEvent;
+struct NotifyObjectInventoryChanges;
+struct NotifyInventoryChanges;
+struct InventoryChangeEvent;
+struct EquipmentChangeEvent;
+struct NotifyEquipmentChanges;
+struct NotifyDrawWeapon;
+
+/**
+ * @brief Manages inventories of actors and containers.
+ *
+ * The initial contents of actor inventories are synced through spawn messages through CharacterService
+ * @see CharacterService
+ * The initial contents of container inventories are synced through the ObjectService
+ * @see ObjectService
+ * The InventoryService manages any changes to both the current equipment of actors,
+ * and the contents of both actor and object inventories.
+ */
+struct InventoryService final : Session::IParticipant
+{
+    InventoryService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept;
+    ~InventoryService() noexcept = default;
+
+    TP_NOCOPYMOVE(InventoryService);
+
+    /**
+     * @brief Check weapon state.
+     * @see RunWeaponStateUpdates
+     */
+    void OnUpdate(const UpdateEvent& acUpdateEvent) noexcept;
+    /**
+     * @brief Sends out inventory changes made by the local client.
+     */
+    void OnInventoryChangeEvent(const InventoryChangeEvent& acEvent) noexcept;
+    /**
+     * @brief Sends out equipment changes made by the local client.
+     */
+    void OnEquipmentChangeEvent(const EquipmentChangeEvent& acEvent) noexcept;
+
+    /**
+     * @brief Applies inventory changes sent by the server.
+     */
+    void OnNotifyInventoryChanges(const NotifyInventoryChanges& acMessage) noexcept;
+    /**
+     * @brief Applies equipment changes sent by the server.
+     */
+    void OnNotifyEquipmentChanges(const NotifyEquipmentChanges& acMessage) noexcept;
+    void OnNotifyDrawWeapon(const NotifyDrawWeapon& acMessage) noexcept;
+
+    // Session::ParticipantId::kInventory: pending NPC ammo deltas name actors of one world.
+    void OnSessionEnd(const Session::Transition& acTransition) noexcept override;
+    void OnWorldLoadBegin(const Session::Transition& acTransition) noexcept override;
+
+private:
+    struct PendingNpcAmmoDelta
+    {
+        uint32_t ServerId{0};
+        uint32_t ActorFormId{0};
+        Inventory::Entry Item{};
+        bool UpdateClients{true};
+    };
+
+    void DropPendingNpcAmmoDeltas() noexcept;
+    void FlushPendingNpcAmmoDeltas(bool aForceFlushAll) noexcept;
+
+    /**
+     * Checks whether local actors their weapon draw states have changed,
+     * and if so, send the new states to the server.
+     */
+    void RunWeaponStateUpdates() noexcept;
+    /**
+    * Checks whether an NPC's (local or remote) equipment is bugged (i.e. naked NPCS)
+    * and resets their inventory.
+    */
+    void RunNakedNPCBugChecks() noexcept;
+
+    World& m_world;
+    entt::dispatcher& m_dispatcher;
+    TransportService& m_transport;
+
+    double m_npcAmmoFlushAccumSec{0.0};
+    std::unordered_map<uint64_t, PendingNpcAmmoDelta> m_pendingNpcAmmoDeltas{};
+
+    entt::scoped_connection m_updateConnection;
+    entt::scoped_connection m_inventoryConnection;
+    entt::scoped_connection m_equipmentConnection;
+    entt::scoped_connection m_inventoryChangeConnection;
+    entt::scoped_connection m_equipmentChangeConnection;
+    entt::scoped_connection m_drawWeaponChangeConnection;
+};

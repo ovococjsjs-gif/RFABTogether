@@ -1,0 +1,68 @@
+#pragma once
+
+#include <Events/PacketEvent.h>
+#include <Structs/Inventory.h>
+#include <common/CoopLootLedger.h>
+
+struct World;
+struct Player;
+struct UpdateEvent;
+struct RequestObjectInventoryChanges;
+struct RequestInventoryChanges;
+struct RequestEquipmentChanges;
+struct DrawWeaponRequest;
+struct PlayerLeaveCellEvent;
+
+/**
+ * @brief Relays inventory/equipment changes and updates the server side state.
+ */
+class InventoryService
+{
+public:
+    InventoryService(World& aWorld, entt::dispatcher& aDispatcher);
+
+    /**
+     * @brief Relays inventory changes to other clients and updates server side inventories.
+     */
+    void OnInventoryChanges(const PacketEvent<RequestInventoryChanges>& acMessage) noexcept;
+
+    /**
+     * The one writer of actor/container inventories reported by clients: ownership isolation for
+     * player characters, count/extra-data sanitizing, the loot-ledger anti-dupe and the relay to the
+     * players in range. RequestInventoryChanges and the server-owned world items (WorldItemService)
+     * both go through it.
+     *
+     * @param aIsWorldTransfer the items move between the entity and the 3D world (drop / pickup), not
+     *        out of a shared container: the loot ledger does not treat a removal as a withdrawal.
+     * @param aNotifyDrop value of NotifyInventoryChanges::Drop for the peers (legacy drop replay).
+     * @return false when the change was refused (unknown entity, empty item, foreign player character,
+     *         nothing left to withdraw): nothing was changed or relayed.
+     */
+    bool ApplyInventoryDelta(Player* apSender, uint32_t aServerId, const Inventory::Entry& acItem, bool aIsWorldTransfer,
+                             bool aNotifyDrop, bool aUpdateClients) noexcept;
+    /**
+     * @brief Relays equipment changes to other clients and updates server side equipment.
+     */
+    void OnEquipmentChanges(const PacketEvent<RequestEquipmentChanges>& acMessage) noexcept;
+    /**
+     * @brief Relays weapon draw changes to other clients and updates server side weapon draw state.
+     */
+    void OnWeaponDrawnRequest(const PacketEvent<DrawWeaponRequest>& acMessage) noexcept;
+
+    void ResetLootLedger() noexcept { m_lootLedger.Clear(); }
+    void ForgetContainerForEntity(entt::entity aEntity, uint32_t aFallbackServerId) noexcept;
+    [[nodiscard]] uint32_t ResolveLootContainerKey(entt::entity aEntity, uint32_t aFallbackServerId) const noexcept;
+    [[nodiscard]] CoopLootLedger::ContainerLootLedger::Snapshot CaptureLootLedgerSnapshot() const { return m_lootLedger.CaptureSnapshot(); }
+    void RestoreLootLedgerSnapshot(const CoopLootLedger::ContainerLootLedger::Snapshot& acSnapshot, bool aForgetClaimants = false)
+    {
+        m_lootLedger.RestoreSnapshot(acSnapshot, aForgetClaimants);
+    }
+
+private:
+    World& m_world;
+    CoopLootLedger::ContainerLootLedger m_lootLedger{};
+
+    entt::scoped_connection m_inventoryChangeConnection;
+    entt::scoped_connection m_equipmentChangeConnection;
+    entt::scoped_connection m_drawWeaponConnection;
+};

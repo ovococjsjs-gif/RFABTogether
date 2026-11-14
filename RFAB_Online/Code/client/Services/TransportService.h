@@ -1,0 +1,105 @@
+#pragma once
+
+#include <atomic>
+#include <deque>
+#include <Client.hpp>
+#include <Messages/ServerReferencesMoveRequest.h>
+
+struct ImguiService;
+struct UpdateEvent;
+struct ClientMessage;
+struct AuthenticationResponse;
+struct NotifySettingsChange;
+
+struct World;
+
+using TiltedPhoques::Client;
+
+/**
+ * @brief Handles communication with the server.
+ */
+struct TransportService : Client
+{
+    TransportService(World& aWorld, entt::dispatcher& aDispatcher) noexcept;
+    ~TransportService() noexcept = default;
+
+    TP_NOCOPYMOVE(TransportService);
+
+    bool Send(const ClientMessage& acMessage, TiltedPhoques::EPacketFlags aPacketFlags = TiltedPhoques::kReliable) const noexcept;
+
+    void OnConsume(const void* apData, uint32_t aSize) override;
+    void OnConnected() override;
+    void OnDisconnected(EDisconnectReason aReason) override;
+    void OnUpdate() override;
+
+    [[nodiscard]] bool IsOnline() const noexcept { return m_connected; }
+    void SetServerPassword(const std::string& acPassword) noexcept
+    {
+        m_serverPassword = acPassword;
+        m_lastServerPassword = acPassword;
+    }
+    bool Connect(const std::string& acEndpoint) noexcept
+    {
+        if (!acEndpoint.empty())
+            m_lastServerEndpoint = acEndpoint;
+        return Client::Connect(acEndpoint);
+    }
+    bool ConnectToServer(const std::string& acEndpoint, const std::string& acPassword = "") noexcept
+    {
+        m_lastServerEndpoint = acEndpoint;
+        m_lastServerPassword = acPassword;
+        m_serverPassword = acPassword;
+        return Client::Connect(acEndpoint);
+    }
+    [[nodiscard]] bool HasLastServerEndpoint() const noexcept { return !m_lastServerEndpoint.empty(); }
+    bool ReconnectToLastServer() noexcept
+    {
+        if (m_lastServerEndpoint.empty())
+            return false;
+        m_serverPassword = m_lastServerPassword;
+        return Client::Connect(m_lastServerEndpoint);
+    }
+    const uint32_t& GetLocalPlayerId() const noexcept { return m_localPlayerId; }
+
+    [[nodiscard]] double GetMessageReceiveTime() const noexcept;
+    [[nodiscard]] double GetLastPollTime() const noexcept { return m_lastPollTime; }
+
+    void PollWhileSimulationPaused() noexcept;
+    void FlushPausedInboundPackets() noexcept;
+    // Disconnect / full reset: drops everything that was received while paused.
+    void ClearPausedInboundPackets() noexcept;
+    // In-session world reload: drops world-scoped packets but keeps session-scoped ones in order
+    // (CoopWorldStabilizer::MustSurviveWorldReload).
+    void DiscardPausedWorldPacketsForReload() noexcept;
+    [[nodiscard]] size_t GetPausedInboundQueueSize() const noexcept { return m_pausedInboundQueue.size(); }
+
+protected:
+    // Event handlers
+    void HandleUpdate(const UpdateEvent& acEvent) noexcept;
+
+    // Packet handlers
+    void HandleAuthenticationResponse(const AuthenticationResponse& acMessage) noexcept;
+    void HandleNotifySettingsChange(const NotifySettingsChange& acMessage) noexcept;
+
+    void FlushPausedMoveRequest() noexcept;
+
+private:
+    World& m_world;
+    entt::dispatcher& m_dispatcher;
+    bool m_connected;
+    String m_serverPassword{};
+    std::string m_lastServerEndpoint{};
+    std::string m_lastServerPassword{};
+    uint32_t m_localPlayerId{0};
+    double m_lastPollTime{};
+
+    entt::scoped_connection m_updateConnection;
+    entt::scoped_connection m_sendServerMessageConnection;
+    entt::scoped_connection m_settingsChangeConnection;
+    bool m_pollingWhilePaused{false};
+    std::deque<UniquePtr<ServerMessage>> m_pausedInboundQueue{};
+    ServerReferencesMoveRequest m_pausedMoveRequest{};
+    bool m_hasPausedMoveRequest{false};
+    bool m_pausedBackPressureLogged{false};
+    std::function<void(UniquePtr<ServerMessage>&)> m_messageHandlers[kServerOpcodeMax];
+};

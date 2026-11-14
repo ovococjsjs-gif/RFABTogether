@@ -1,0 +1,81 @@
+local function istable(t) return type(t) == 'table' end
+
+local function build_launcher()
+    set_kind("binary")
+    set_group("Client")
+    set_symbols("debug", "hidden")
+
+    add_ldflags(
+        "/FORCE:MULTIPLE",
+        "/IGNORE:4254,4006",
+        "/DYNAMICBASE:NO",
+        "/SAFESEH:NO",
+        "/LARGEADDRESSAWARE",
+        "/INCREMENTAL:NO",
+        "/LAST:.zdata",
+        "/SUBSYSTEM:WINDOWS",
+        "/ENTRY:mainCRTStartup", { force = true })
+    add_includedirs(
+        ".",
+        "../",
+        "../../Libraries/")
+    add_headerfiles("**.h")
+    add_files(
+        "**.cpp",
+        "launcher.rc")
+    add_deps(
+        "ImmersiveElf",
+        "TiltedReverse",
+        "TiltedHooks",
+        "TiltedUi",
+        "ImGuiImpl",
+        "CommonLib")
+    add_links("ntdll_x64")
+    add_linkdirs(".")
+    add_syslinks(
+        "user32",
+        "shell32",
+        "comdlg32",
+        "bcrypt",
+        "ole32",
+        "dxgi",
+        "d3d11",
+        "gdi32",
+        "SetupAPI",
+        "Powrprof",
+        "Cfgmgr32",
+        "Propsys",
+        "delayimp")
+
+    add_packages(
+        "tiltedcore",
+        "spdlog",
+        "minhook",
+        "hopscotch-map",
+        "cryptopp",
+        "glm",
+        "cef",
+        "mem")
+end
+
+target("SkyrimImmersiveLauncher")
+    -- Output native SkyrimSE.exe out of the box (required by drake1ch/RFAB MO2 & SKSE plugins without manual renaming)
+    -- AND emit an identical SkyrimTogether.exe compatibility alias alongside it on every build!
+    set_basename("SkyrimSE")
+    add_defines("TARGET_PREFIX=\"st\"")
+    add_deps("SkyrimTogetherClient")
+    add_ldflags("/WHOLEARCHIVE:SkyrimTogetherClient", { force = true })
+    build_launcher()
+    after_build(function (target)
+        local exe = target:targetfile()
+        if exe and os.isfile(exe) then
+            local alias = path.join(path.directory(exe), "SkyrimTogether.exe")
+            os.cp(exe, alias)
+        end
+    end)
+    after_install(function (target)
+        local installed = path.join(target:installdir(), "bin", "SkyrimSE.exe")
+        if os.isfile(installed) then
+            os.cp(installed, path.join(target:installdir(), "bin", "SkyrimTogether.exe"))
+        end
+    end)

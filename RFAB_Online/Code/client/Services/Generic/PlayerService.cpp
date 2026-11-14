@@ -1,0 +1,535 @@
+#include <Services/PlayerService.h>
+
+#include <World.h>
+
+#include <Events/UpdateEvent.h>
+#include <Events/GridCellChangeEvent.h>
+#include <Events/CellChangeEvent.h>
+#include <Events/PlayerDialogueEvent.h>
+#include <Events/PlayerLevelEvent.h>
+#include <Events/PartyJoinedEvent.h>
+#include <Events/PartyLeftEvent.h>
+#include <Events/BeastFormChangeEvent.h>
+
+#include <Messages/PlayerRespawnRequest.h>
+#include <Messages/NotifyPlayerRespawn.h>
+#include <Messages/ShiftGridCellRequest.h>
+#include <Messages/EnterExteriorCellRequest.h>
+#include <Messages/EnterInteriorCellRequest.h>
+#include <Messages/PlayerDialogueRequest.h>
+#include <Messages/PlayerLevelRequest.h>
+
+#include <Structs/ServerSettings.h>
+
+#include <PlayerCharacter.h>
+#include <Forms/TESObjectCELL.h>
+#include <Forms/TESGlobal.h>
+#include <Games/Overrides.h>
+#include <Games/References.h>
+#include <AI/AIProcess.h>
+#include <EquipManager.h>
+#include <Forms/TESRace.h>
+#include <Games/ActorExtension.h>
+#include <ModCompat/BehaviorVar.h>
+#include <RfabModpackCompat.h>
+
+PlayerService::PlayerService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept
+    : m_world(aWorld)
+    , m_dispatcher(aDispatcher)
+    , m_transport(aTransport)
+{
+    m_updateConnection = m_dispatcher.sink<UpdateEvent>().connect<&PlayerService::OnUpdate>(this);
+    m_settingsConnection = m_dispatcher.sink<ServerSettings>().connect<&PlayerService::OnServerSettingsReceived>(this);
+    m_notifyRespawnConnection = m_dispatcher.sink<NotifyPlayerRespawn>().connect<&PlayerService::OnNotifyPlayerRespawn>(this);
+    m_gridCellChangeConnection = m_dispatcher.sink<GridCellChangeEvent>().connect<&PlayerService::OnGridCellChangeEvent>(this);
+    m_cellChangeConnection = m_dispatcher.sink<CellChangeEvent>().connect<&PlayerService::OnCellChangeEvent>(this);
+    m_playerDialogueConnection = m_dispatcher.sink<PlayerDialogueEvent>().connect<&PlayerService::OnPlayerDialogueEvent>(this);
+    m_playerLevelConnection = m_dispatcher.sink<PlayerLevelEvent>().connect<&PlayerService::OnPlayerLevelEvent>(this);
+    m_partyJoinedConnection = aDispatcher.sink<PartyJoinedEvent>().connect<&PlayerService::OnPartyJoinedEvent>(this);
+    m_partyLeftConnection = aDispatcher.sink<PartyLeftEvent>().connect<&PlayerService::OnPartyLeftEvent>(this);
+}
+
+void PlayerService::OnUpdate(const UpdateEvent&) noexcept
+{
+    RunRespawnUpdates();
+    RunPostDeathUpdates();
+    RunDifficultyUpdates();
+    RunLevelUpdates();
+    RunBeastFormDetection();
+}
+
+namespace
+{
+uint64_t NowSteadyMsForPlayerService() noexcept
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+} // namespace
+
+void PlayerService::OnSessionBegin(const Session::Transition&) noexcept
+{
+    m_respawnTeleportGuard.NotifyConnected(NowSteadyMsForPlayerService());
+
+    if (!m_hasCachedRfabBaseline)
+    {
+        if (float* greetDistance = Settings::GetGreetDistance())
+            m_previousGreetDistance = *greetDistance;
+        if (TESGlobal* pKillMove = Cast<TESGlobal>(TESForm::GetById(0x100F19)))
+            m_previousKillMove = pKillMove->f;
+        if (TESGlobal* pWorldEncountersEnabled = Cast<TESGlobal>(TESForm::GetById(0xB8EC1)))
+            m_previousWorldEncounters = pWorldEncountersEnabled->f;
+        m_hasCachedRfabBaseline = true;
+    }
+
+    if (TESGlobal* pKillMove = Cast<TESGlobal>(TESForm::GetById(0x100F19)))
+        pKillMove->f = 0.f;
+
+    if (TESGlobal* pWorldEncountersEnabled = Cast<TESGlobal>(TESForm::GetById(0xB8EC1)))
+        pWorldEncountersEnabled->f = 0.f;
+
+    // Online, a vanilla death would end in the game-over load, an uncoordinated load that drops the
+    // session; the downed/death systems decide what happens instead. (Previously set by
+    // DownedStateService's connect handler, which ran after the settings were applied - same result.)
+    if (PlayerCharacter* pPlayer = PlayerCharacter::Get())
+        pPlayer->SetPlayerRespawnMode(true);
+}
+
+void PlayerService::RestoreMultiplayerGlobalsAfterWorldReload() noexcept
+{
+    m_respawnTeleportGuard.NotifyConnected(NowSteadyMsForPlayerService());
+    if (m_godmodeStart)
+        PlayerCharacter::SetGodMode(false);
+    m_respawnDeadline = {};
+    m_knockdownStart = false;
+    m_godmodeStart = false;
+    m_cachedMainSpellId = 0;
+    m_cachedSecondarySpellId = 0;
+    m_cachedPowerId = 0;
+
+    if (TESGlobal* pKillMove = Cast<TESGlobal>(TESForm::GetById(0x100F19)))
+        pKillMove->f = 0.f;
+
+    if (TESGlobal* pWorldEncountersEnabled = Cast<TESGlobal>(TESForm::GetById(0xB8EC1)))
+        pWorldEncountersEnabled->f = 0.f;
+
+    const auto& settings = m_world.GetServerSettings();
+    if (!settings.GreetingsEnabled)
+    {
+        if (float* greetDistance = Settings::GetGreetDistance())
+            *greetDistance = 0.f;
+    }
+
+    if (PlayerCharacter* pPlayer = PlayerCharacter::Get())
+    {
+        if (Settings::IsRfabModpackActive())
+        {
+            const int32_t normalized = RfabCompat::NormalizeRfabEngineDifficultyIndex(pPlayer->difficulty);
+            if (pPlayer->difficulty != normalized)
+                pPlayer->SetDifficulty(normalized);
+        }
+        else if (m_serverDifficulty >= 0 && m_serverDifficulty <= 5)
+        {
+            pPlayer->SetDifficulty(m_serverDifficulty);
+        }
+
+        pPlayer->SetPlayerRespawnMode(settings.DownedSystemEnabled || settings.DeathSystemEnabled);
+    }
+
+    m_respawnTeleportGuard.NotifyServerSettings(settings.DeathSystemEnabled, settings.DownedSystemEnabled);
+    ToggleDeathSystem(settings.DeathSystemEnabled && !settings.DownedSystemEnabled);
+}
+
+void PlayerService::OnSessionEnd(const Session::Transition&) noexcept
+{
+    m_respawnTeleportGuard.NotifyDisconnected(NowSteadyMsForPlayerService());
+    if (m_godmodeStart)
+        PlayerCharacter::SetGodMode(false);
+    m_respawnDeadline = {};
+    m_knockdownStart = false;
+    m_godmodeStart = false;
+
+    if (!Settings::IsRfabModpackActive() && m_previousDifficulty >= 0 && m_previousDifficulty <= 5)
+    {
+        if (auto* pPlayer = PlayerCharacter::Get())
+            pPlayer->SetDifficulty(m_previousDifficulty);
+    }
+
+    m_serverDifficulty = m_previousDifficulty = 6;
+
+    m_isDeathSystemEnabled = false;
+    if (PlayerCharacter* pPlayer = PlayerCharacter::Get())
+        pPlayer->SetPlayerRespawnMode(false);
+
+    if (TESGlobal* pKillMove = Cast<TESGlobal>(TESForm::GetById(0x100F19)))
+        pKillMove->f = m_hasCachedRfabBaseline ? m_previousKillMove : 1.f;
+
+    // Restore RFAB's baseline fAIMinGreetingDistance (70.0 in RFAB.esp, never hardcoded vanilla 150.0)
+    if (float* greetDistance = Settings::GetGreetDistance())
+        *greetDistance = m_hasCachedRfabBaseline ? m_previousGreetDistance : 70.f;
+
+    if (TESGlobal* pWorldEncountersEnabled = Cast<TESGlobal>(TESForm::GetById(0xB8EC1)))
+        pWorldEncountersEnabled->f = m_hasCachedRfabBaseline ? m_previousWorldEncounters : 1.f;
+}
+
+void PlayerService::OnServerSettingsReceived(const ServerSettings& acSettings) noexcept
+{
+    if (int32_t* pDiff = Settings::GetDifficulty())
+        m_previousDifficulty = *pDiff;
+    m_serverDifficulty = acSettings.Difficulty;
+
+    if (Settings::IsRfabModpackActive())
+    {
+        // Preserve each player's own RFAB difficulty (Странник / Довакин / Легенда) & Проклятый mark!
+        // Only remap index 2 (Adept, which has no GMST in Skyrim SE) -> 4 (Master / VH).
+        if (auto* pPlayer = PlayerCharacter::Get())
+        {
+            const int32_t normalized = RfabCompat::NormalizeRfabEngineDifficultyIndex(pPlayer->difficulty);
+            if (pPlayer->difficulty != normalized)
+                pPlayer->SetDifficulty(normalized);
+        }
+        spdlog::info(
+            "[RFAB Difficulty] Preserving personal RFAB difficulty & Cursed state (ByPC={:.2f}x, ToPC={:.2f}x).",
+            Settings::GetRfabOutgoingDamageMult(),
+            Settings::GetRfabIncomingDamageMult());
+    }
+    else if (auto* pPlayer = PlayerCharacter::Get())
+    {
+        pPlayer->SetDifficulty(acSettings.Difficulty);
+    }
+
+    if (!acSettings.GreetingsEnabled)
+    {
+        if (float* greetDistance = Settings::GetGreetDistance())
+        {
+            if (!m_hasCachedRfabBaseline)
+                m_previousGreetDistance = *greetDistance;
+            *greetDistance = 0.f;
+        }
+    }
+
+    m_respawnTeleportGuard.NotifyServerSettings(acSettings.DeathSystemEnabled, acSettings.DownedSystemEnabled);
+    ToggleDeathSystem(acSettings.DeathSystemEnabled && !acSettings.DownedSystemEnabled);
+}
+
+void PlayerService::OnNotifyPlayerRespawn(const NotifyPlayerRespawn& acMessage) const noexcept
+{
+    if (PlayerCharacter* pPlayer = PlayerCharacter::Get())
+        pPlayer->PayGold(acMessage.GoldLost);
+
+    std::string message = fmt::format("You died and lost {} gold.", acMessage.GoldLost);
+    Utils::ShowHudMessage(String(message));
+}
+
+void PlayerService::OnGridCellChangeEvent(const GridCellChangeEvent& acEvent) const noexcept
+{
+    uint32_t baseId = 0;
+    uint32_t modId = 0;
+
+    if (m_world.GetModSystem().GetServerModId(acEvent.WorldSpaceId, modId, baseId))
+    {
+        ShiftGridCellRequest request;
+        request.WorldSpaceId = GameId(modId, baseId);
+        request.PlayerCell = acEvent.PlayerCell;
+        request.CenterCoords = acEvent.CenterCoords;
+        request.Cells = acEvent.Cells;
+
+        m_transport.Send(request);
+    }
+}
+
+void PlayerService::OnCellChangeEvent(const CellChangeEvent& acEvent) const noexcept
+{
+    if (acEvent.WorldSpaceId)
+    {
+        EnterExteriorCellRequest message;
+        message.CellId = acEvent.CellId;
+        message.WorldSpaceId = acEvent.WorldSpaceId;
+        message.CurrentCoords = acEvent.CurrentCoords;
+
+        m_transport.Send(message);
+    }
+    else
+    {
+        EnterInteriorCellRequest message;
+        message.CellId = acEvent.CellId;
+
+        m_transport.Send(message);
+    }
+}
+
+void PlayerService::OnPlayerDialogueEvent(const PlayerDialogueEvent& acEvent) const noexcept
+{
+    if (!m_transport.IsConnected())
+        return;
+
+    const auto& partyService = m_world.GetPartyService();
+    if (!partyService.IsInParty())
+        return;
+
+    PlayerDialogueRequest request{};
+    request.Text = acEvent.Text;
+
+    m_transport.Send(request);
+}
+
+void PlayerService::OnPlayerLevelEvent(const PlayerLevelEvent& acEvent) const noexcept
+{
+    if (!m_transport.IsConnected())
+        return;
+
+    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+    if (!pPlayer)
+        return;
+
+    PlayerLevelRequest request{};
+    request.NewLevel = pPlayer->GetLevel();
+
+    m_transport.Send(request);
+}
+
+void PlayerService::OnPartyJoinedEvent(const PartyJoinedEvent& acEvent) noexcept
+{
+    // TODO: this can be done a bit prettier
+    if (acEvent.IsLeader)
+    {
+        if (TESGlobal* pWorldEncountersEnabled = Cast<TESGlobal>(TESForm::GetById(0xB8EC1)))
+            pWorldEncountersEnabled->f = 1.f;
+    }
+
+    if (m_transport.IsConnected())
+    {
+        if (PlayerCharacter* pPlayer = PlayerCharacter::Get())
+        {
+            PlayerLevelRequest request{};
+            request.NewLevel = pPlayer->GetLevel();
+            m_transport.Send(request);
+        }
+    }
+}
+
+void PlayerService::OnPartyLeftEvent(const PartyLeftEvent& acEvent) noexcept
+{
+    // TODO: this can be done a bit prettier
+    if (World::Get().GetTransport().IsConnected())
+    {
+        if (TESGlobal* pWorldEncountersEnabled = Cast<TESGlobal>(TESForm::GetById(0xB8EC1)))
+            pWorldEncountersEnabled->f = 0.f;
+    }
+}
+
+// Timers use the steady clock, not frame deltas: a stutter while dying (long frames clamped by the engine)
+// left the respawn or the post-respawn knockdown pending and the camera stuck (upstream 2e52a704, #878).
+void PlayerService::RunRespawnUpdates() noexcept
+{
+    static bool s_startTimer = false;
+
+    if (!m_transport.IsConnected() || !m_isDeathSystemEnabled || m_world.GetServerSettings().DownedSystemEnabled ||
+        m_respawnTeleportGuard.ShouldSuppressLegacyRespawnTeleport(NowSteadyMsForPlayerService()))
+    {
+        s_startTimer = false;
+        m_respawnDeadline = {};
+        return;
+    }
+
+    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+    if (!pPlayer)
+        return;
+
+    if (!pPlayer->actorState.IsBleedingOut())
+    {
+        m_cachedMainSpellId = pPlayer->magicItems[0] ? pPlayer->magicItems[0]->formID : 0;
+        m_cachedSecondarySpellId = pPlayer->magicItems[1] ? pPlayer->magicItems[1]->formID : 0;
+        m_cachedPowerId = pPlayer->equippedShout ? pPlayer->equippedShout->formID : 0;
+
+        s_startTimer = false;
+        return;
+    }
+
+    if (!s_startTimer)
+    {
+        s_startTimer = true;
+        m_respawnDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        FadeOutGame(true, true, 3.0f, true, 2.0f);
+
+        // If a player dies not by its health reaching 0, getting it up from its bleedout state isn't possible
+        // just by setting its health back to max. Therefore, put it to 0.
+        if (pPlayer->GetActorValue(ActorValueInfo::kHealth) > 0.f)
+            pPlayer->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, ActorValueInfo::kHealth, 0);
+
+        pPlayer->PayCrimeGoldToAllFactions();
+    }
+
+    if (std::chrono::steady_clock::now() >= m_respawnDeadline)
+    {
+        pPlayer->RespawnPlayer();
+
+        m_knockdownDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+        m_knockdownStart = true;
+
+        m_transport.Send(PlayerRespawnRequest());
+
+        s_startTimer = false;
+
+        if (auto* pEquipManager = EquipManager::Get())
+        {
+            if (TESForm* pSpell = TESForm::GetById(m_cachedMainSpellId))
+                pEquipManager->EquipSpell(pPlayer, pSpell, 0);
+            if (TESForm* pSpell = TESForm::GetById(m_cachedSecondarySpellId))
+                pEquipManager->EquipSpell(pPlayer, pSpell, 1);
+            if (TESForm* pSpell = TESForm::GetById(m_cachedPowerId))
+                pEquipManager->EquipShout(pPlayer, pSpell);
+        }
+    }
+}
+
+// Doesn't seem to respawn quite yet
+void PlayerService::RunPostDeathUpdates() noexcept
+{
+    if (!m_transport.IsConnected() || !m_isDeathSystemEnabled || m_world.GetServerSettings().DownedSystemEnabled ||
+        m_respawnTeleportGuard.ShouldSuppressLegacyRespawnTeleport(NowSteadyMsForPlayerService()))
+    {
+        if (m_godmodeStart)
+            PlayerCharacter::SetGodMode(false);
+        m_knockdownStart = false;
+        m_godmodeStart = false;
+        return;
+    }
+
+    // If a player dies in ragdoll, it gets stuck.
+    // This code ragdolls the player again upon respawning.
+    // It also makes the player invincible for 10 seconds.
+    const auto cNow = std::chrono::steady_clock::now();
+    if (m_knockdownStart)
+    {
+        if (cNow >= m_knockdownDeadline)
+        {
+            PlayerCharacter::SetGodMode(true);
+            m_godmodeStart = true;
+            m_godmodeDeadline = cNow + std::chrono::seconds(10);
+
+            if (PlayerCharacter* pPlayer = PlayerCharacter::Get(); pPlayer && pPlayer->currentProcess)
+                pPlayer->currentProcess->KnockExplosion(pPlayer, &pPlayer->position, 0.f);
+
+            FadeOutGame(false, true, 0.5f, true, 2.f);
+
+            m_knockdownStart = false;
+        }
+    }
+
+    if (m_godmodeStart)
+    {
+        if (cNow >= m_godmodeDeadline)
+        {
+            PlayerCharacter::SetGodMode(false);
+
+            m_godmodeStart = false;
+        }
+    }
+}
+
+void PlayerService::RunDifficultyUpdates() const noexcept
+{
+    if (!m_transport.IsConnected())
+        return;
+
+    auto* pPlayer = PlayerCharacter::Get();
+    if (!pPlayer)
+        return;
+
+    if (Settings::IsRfabModpackActive())
+    {
+        const int32_t normalized = RfabCompat::NormalizeRfabEngineDifficultyIndex(pPlayer->difficulty);
+        if (pPlayer->difficulty != normalized)
+            pPlayer->SetDifficulty(normalized);
+        return;
+    }
+
+    pPlayer->SetDifficulty(m_serverDifficulty);
+}
+
+void PlayerService::RunLevelUpdates() const noexcept
+{
+    if (!m_transport.IsConnected())
+        return;
+
+    // The LevelUp hook is kinda weird, so ehh, just check periodically, doesn't really cost anything.
+
+    static std::chrono::steady_clock::time_point lastSendTimePoint;
+    constexpr auto cDelayBetweenUpdates = 1000ms;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastSendTimePoint < cDelayBetweenUpdates)
+        return;
+
+    lastSendTimePoint = now;
+
+    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+    if (!pPlayer)
+        return;
+
+    static uint16_t oldLevel = pPlayer->GetLevel();
+
+    uint16_t newLevel = pPlayer->GetLevel();
+    if (newLevel != oldLevel)
+    {
+        PlayerLevelRequest request{};
+        request.NewLevel = newLevel;
+
+        m_transport.Send(request);
+
+        oldLevel = newLevel;
+    }
+}
+
+void PlayerService::RunBeastFormDetection() const noexcept
+{
+    static uint32_t lastRaceFormID = 0;
+    static bool lastWasBeastForm = false;
+    static std::chrono::steady_clock::time_point lastSendTimePoint;
+    constexpr auto cDelayBetweenUpdates = 250ms;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastSendTimePoint < cDelayBetweenUpdates)
+        return;
+
+    lastSendTimePoint = now;
+
+    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+    if (!pPlayer || !pPlayer->race)
+        return;
+
+    const uint32_t currentRaceFormID = pPlayer->race->formID;
+    if (currentRaceFormID == lastRaceFormID)
+        return;
+
+    const char* pRaceEditorId = pPlayer->race->GetFormEditorID();
+    const bool isBeastForm = RfabCompat::IsBeastFormRace(pRaceEditorId ? pRaceEditorId : "", currentRaceFormID);
+
+    if (lastRaceFormID != 0 && (isBeastForm || lastWasBeastForm))
+    {
+        if (!isBeastForm)
+        {
+            if (auto* pExt = pPlayer->GetExtension())
+                pExt->GraphDescriptorHash = BehaviorVar::GetHumanoidHash();
+        }
+        m_world.GetDispatcher().trigger(BeastFormChangeEvent());
+    }
+
+    lastRaceFormID = currentRaceFormID;
+    lastWasBeastForm = isBeastForm;
+}
+
+void PlayerService::ToggleDeathSystem(bool aSet) noexcept
+{
+    m_isDeathSystemEnabled = aSet;
+
+    if (PlayerCharacter* pPlayer = PlayerCharacter::Get())
+    {
+        const bool keepNativeBleedoutMode =
+            m_transport.IsConnected() && m_world.GetServerSettings().DownedSystemEnabled;
+        pPlayer->SetPlayerRespawnMode(aSet || keepNativeBleedoutMode);
+    }
+}
