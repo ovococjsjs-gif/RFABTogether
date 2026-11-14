@@ -19,6 +19,10 @@ this project actually hit:
   4. Release backup manifests parse and describe assets with sizes and digests.
   5. The release workflow does not hardcode a version tag, so VERSION stays the
      single source of truth.
+  6. The co-op config overlay and the installer undo share one key list.
+  7. The four Tilted* libraries are submodule links pinned to the revisions
+     patch_submodules.py was written against. An import once dropped the links;
+     nothing failed on Linux and the client could not be built at all.
 
 Behaviour of the game itself is covered by the test suites in Code/tests, which
 execute code instead of reading it.
@@ -242,6 +246,49 @@ if overlay_h.is_file() and restore_ps1.is_file():
                 f"{array_name} keys must be lower case (compared case-insensitively on both sides)",
             )
 
+# 7. Submodules are pinned ------------------------------------------------------
+# Build-CloudRelease.ps1 step [1/8] runs `git submodule update --init` and then
+# patch_submodules.py, which replaces exact source fragments of these libraries.
+SUBMODULE_PINS = {
+    "Libraries/TiltedConnect": "e6f5759364a64462e717db1153781a7eae26a13e",
+    "Libraries/TiltedHooks": "d7c175b86975679eb05883c097d7eb1c2165226a",
+    "Libraries/TiltedReverse": "55ee3f29c62fea247148e57b94ec4941055139ed",
+    "Libraries/TiltedUI": "0bec46b174d730832cbe0a10e8162bf6b0d3d66b",
+}
+gitmodules = ROOT / ".gitmodules"
+check(gitmodules.is_file(), ".gitmodules is missing")
+if gitmodules.is_file():
+    declared = set(re.findall(r"^\s*path\s*=\s*(\S+)\s*$", gitmodules.read_text(encoding="utf-8"), re.M))
+    check(
+        declared == set(SUBMODULE_PINS),
+        f".gitmodules declares {sorted(declared)}, the pinned set is {sorted(SUBMODULE_PINS)}; "
+        "update SUBMODULE_PINS in this script together with .gitmodules",
+    )
+
+staged = git("ls-files", "-s", "--", *SUBMODULE_PINS)
+if staged is None:
+    notes.append("git index unavailable, skipped the submodule pin check")
+else:
+    index_entries: dict[str, tuple[str, str]] = {}
+    for line in staged.splitlines():
+        meta, _, path = line.partition("\t")
+        fields = meta.split()
+        if len(fields) >= 2:
+            index_entries[path] = (fields[0], fields[1])
+    for path, pin in SUBMODULE_PINS.items():
+        mode, sha = index_entries.get(path, ("", ""))
+        check(
+            mode == "160000",
+            f"{path} is not a submodule link in the git index, so the Windows build has no sources "
+            f"for it; restore with: git update-index --add --cacheinfo 160000,{pin},{path}",
+        )
+        if mode == "160000":
+            check(
+                sha == pin,
+                f"{path} points at {sha}, expected {pin}; patch_submodules.py is written against "
+                "the pinned revision - move the pin and the patches together",
+            )
+
 # -----------------------------------------------------------------------------
 for note in notes:
     print(f"[release-invariants] note: {note}")
@@ -254,5 +301,6 @@ if failures:
 
 print(
     f"[release-invariants] OK: version {version}, "
-    f"{len(manifests)} backup manifest(s), no build output tracked in git."
+    f"{len(manifests)} backup manifest(s), {len(SUBMODULE_PINS)} submodule pin(s), "
+    "no build output tracked in git."
 )
