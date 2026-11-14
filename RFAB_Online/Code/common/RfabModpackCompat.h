@@ -249,6 +249,287 @@ inline std::string NormalizeSaveSlotStem(std::string_view aRawPathOrName)
     return ToLowerAscii(StripSaveSlotExtensionPreserveCase(aRawPathOrName));
 }
 
+// Strict RFC 3629 UTF-8 validator (rejects overlong forms, UTF-16 surrogates, and > U+10FFFF).
+inline bool IsValidUtf8(std::string_view aBytes) noexcept
+{
+    const size_t n = aBytes.size();
+    size_t i = 0;
+    while (i < n)
+    {
+        const uint8_t b0 = static_cast<uint8_t>(aBytes[i]);
+        if (b0 <= 0x7Fu)
+        {
+            ++i;
+            continue;
+        }
+        if (b0 >= 0xC2u && b0 <= 0xDFu)
+        {
+            if (i + 1 >= n)
+                return false;
+            const uint8_t b1 = static_cast<uint8_t>(aBytes[i + 1]);
+            if ((b1 & 0xC0u) != 0x80u)
+                return false;
+            i += 2;
+            continue;
+        }
+        if (b0 >= 0xE0u && b0 <= 0xEFu)
+        {
+            if (i + 2 >= n)
+                return false;
+            const uint8_t b1 = static_cast<uint8_t>(aBytes[i + 1]);
+            const uint8_t b2 = static_cast<uint8_t>(aBytes[i + 2]);
+            if ((b1 & 0xC0u) != 0x80u || (b2 & 0xC0u) != 0x80u)
+                return false;
+            if (b0 == 0xE0u && b1 < 0xA0u)
+                return false;
+            if (b0 == 0xEDu && b1 >= 0xA0u)
+                return false;
+            i += 3;
+            continue;
+        }
+        if (b0 >= 0xF0u && b0 <= 0xF4u)
+        {
+            if (i + 3 >= n)
+                return false;
+            const uint8_t b1 = static_cast<uint8_t>(aBytes[i + 1]);
+            const uint8_t b2 = static_cast<uint8_t>(aBytes[i + 2]);
+            const uint8_t b3 = static_cast<uint8_t>(aBytes[i + 3]);
+            if ((b1 & 0xC0u) != 0x80u || (b2 & 0xC0u) != 0x80u || (b3 & 0xC0u) != 0x80u)
+                return false;
+            if (b0 == 0xF0u && b1 < 0x90u)
+                return false;
+            if (b0 == 0xF4u && b1 > 0x8Fu)
+                return false;
+            i += 4;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+inline void AppendCodePointUtf8(std::string& aOut, uint32_t aCp)
+{
+    if (aCp <= 0x7Fu)
+    {
+        aOut.push_back(static_cast<char>(aCp));
+    }
+    else if (aCp <= 0x7FFu)
+    {
+        aOut.push_back(static_cast<char>(0xC0u | (aCp >> 6)));
+        aOut.push_back(static_cast<char>(0x80u | (aCp & 0x3Fu)));
+    }
+    else if (aCp <= 0xFFFFu)
+    {
+        aOut.push_back(static_cast<char>(0xE0u | (aCp >> 12)));
+        aOut.push_back(static_cast<char>(0x80u | ((aCp >> 6) & 0x3Fu)));
+        aOut.push_back(static_cast<char>(0x80u | (aCp & 0x3Fu)));
+    }
+    else if (aCp <= 0x10FFFFu)
+    {
+        aOut.push_back(static_cast<char>(0xF0u | (aCp >> 18)));
+        aOut.push_back(static_cast<char>(0x80u | ((aCp >> 12) & 0x3Fu)));
+        aOut.push_back(static_cast<char>(0x80u | ((aCp >> 6) & 0x3Fu)));
+        aOut.push_back(static_cast<char>(0x80u | (aCp & 0x3Fu)));
+    }
+}
+
+// Converts Windows-1251 (Russian locale ANSI) bytes into UTF-8 so SkyrimSE save slot names
+// containing Cyrillic character/location names match files on disk reliably.
+inline std::string ConvertCp1251ToUtf8(std::string_view aBytes)
+{
+    static constexpr uint16_t kCp1251HighTable[128] = {
+        0x0402, 0x0403, 0x201A, 0x0453, 0x201E, 0x2026, 0x2020, 0x2021,
+        0x20AC, 0x2030, 0x0409, 0x2039, 0x040A, 0x040C, 0x040B, 0x040F,
+        0x0452, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+        0x0098, 0x2122, 0x0459, 0x203A, 0x045A, 0x045C, 0x045B, 0x045F,
+        0x00A0, 0x040E, 0x045E, 0x0408, 0x00A4, 0x0490, 0x00A6, 0x00A7,
+        0x0401, 0x00A9, 0x0404, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x0407,
+        0x00B0, 0x00B1, 0x0406, 0x0456, 0x0491, 0x00B5, 0x00B6, 0x00B7,
+        0x0451, 0x2116, 0x0454, 0x00BB, 0x0458, 0x0405, 0x0455, 0x0457,
+        0x0410, 0x0411, 0x0412, 0x0413, 0x0414, 0x0415, 0x0416, 0x0417,
+        0x0418, 0x0419, 0x041A, 0x041B, 0x041C, 0x041D, 0x041E, 0x041F,
+        0x0420, 0x0421, 0x0422, 0x0423, 0x0424, 0x0425, 0x0426, 0x0427,
+        0x0428, 0x0429, 0x042A, 0x042B, 0x042C, 0x042D, 0x042E, 0x042F,
+        0x0430, 0x0431, 0x0432, 0x0433, 0x0434, 0x0435, 0x0436, 0x0437,
+        0x0438, 0x0439, 0x043A, 0x043B, 0x043C, 0x043D, 0x043E, 0x043F,
+        0x0440, 0x0441, 0x0442, 0x0443, 0x0444, 0x0445, 0x0446, 0x0447,
+        0x0448, 0x0449, 0x044A, 0x044B, 0x044C, 0x044D, 0x044E, 0x044F};
+
+    std::string out;
+    out.reserve(aBytes.size() * 2);
+    for (const char ch : aBytes)
+    {
+        const uint8_t b = static_cast<uint8_t>(ch);
+        if (b < 0x80u)
+            out.push_back(ch);
+        else
+            AppendCodePointUtf8(out, kCp1251HighTable[b - 0x80u]);
+    }
+    return out;
+}
+
+// Case-folds ASCII A-Z and UTF-8 Cyrillic (А-Я, Ё) to lowercase for save stem matching.
+inline std::string FoldSaveStemUtf8Lower(std::string_view aUtf8)
+{
+    const std::string stripped = StripSaveSlotExtensionPreserveCase(aUtf8);
+    std::string out;
+    out.reserve(stripped.size());
+    const size_t n = stripped.size();
+    for (size_t i = 0; i < n;)
+    {
+        const uint8_t b0 = static_cast<uint8_t>(stripped[i]);
+        if (b0 < 0x80u)
+        {
+            out.push_back(static_cast<char>(std::tolower(b0)));
+            ++i;
+            continue;
+        }
+        if (b0 == 0xD0u && i + 1 < n)
+        {
+            const uint8_t b1 = static_cast<uint8_t>(stripped[i + 1]);
+            if (b1 == 0x81u) // Ё -> ё (D1 91)
+            {
+                out.push_back(static_cast<char>(0xD1u));
+                out.push_back(static_cast<char>(0x91u));
+                i += 2;
+                continue;
+            }
+            if (b1 >= 0x90u && b1 <= 0x9Fu) // А..П -> а..п (D0 B0..BF)
+            {
+                out.push_back(static_cast<char>(0xD0u));
+                out.push_back(static_cast<char>(b1 + 0x20u));
+                i += 2;
+                continue;
+            }
+            if (b1 >= 0xA0u && b1 <= 0xAFu) // Р..Я -> р..я (D1 80..8F)
+            {
+                out.push_back(static_cast<char>(0xD1u));
+                out.push_back(static_cast<char>(b1 - 0x20u));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(stripped[i]);
+        ++i;
+    }
+    return out;
+}
+
+// Resolves a Skyrim save slot name (ASCII, UTF-8, or CP1251/ANSI) to its existing `.ess` file
+// inside `acSavesDir` (or an immediate character/profile subdirectory). Returns empty path if absent.
+inline std::filesystem::path ResolveExistingEssSlotPath(
+    const std::filesystem::path& acSavesDir,
+    std::string_view aRawSlotName,
+    std::string_view aAlternateAnsiAsUtf8 = {})
+{
+    if (acSavesDir.empty() || aRawSlotName.empty())
+        return {};
+
+    std::error_code ec;
+    if (!std::filesystem::exists(acSavesDir, ec) || ec)
+        return {};
+
+    std::vector<std::string> candidateUtf8Stems;
+    auto pushUniqueStem = [&candidateUtf8Stems](const std::string& acStem)
+    {
+        if (acStem.empty())
+            return;
+        if (std::find(candidateUtf8Stems.begin(), candidateUtf8Stems.end(), acStem) == candidateUtf8Stems.end())
+            candidateUtf8Stems.push_back(acStem);
+    };
+
+    const std::string rawStem = StripSaveSlotExtensionPreserveCase(aRawSlotName);
+    if (!rawStem.empty())
+    {
+        if (IsValidUtf8(rawStem))
+            pushUniqueStem(rawStem);
+        const bool hasNonAscii = std::any_of(rawStem.begin(), rawStem.end(), [](char c) {
+            return static_cast<unsigned char>(c) >= 0x80u;
+        });
+        if (hasNonAscii)
+            pushUniqueStem(ConvertCp1251ToUtf8(rawStem));
+    }
+
+    if (!aAlternateAnsiAsUtf8.empty())
+    {
+        const std::string altStem = StripSaveSlotExtensionPreserveCase(aAlternateAnsiAsUtf8);
+        if (!altStem.empty() && IsValidUtf8(altStem))
+            pushUniqueStem(altStem);
+    }
+
+    if (candidateUtf8Stems.empty())
+        return {};
+
+    auto makeUtf8Path = [](const std::string& acUtf8) -> std::filesystem::path
+    {
+        std::u8string u8(reinterpret_cast<const char8_t*>(acUtf8.data()), acUtf8.size());
+        return std::filesystem::path(u8);
+    };
+
+    for (const auto& stemUtf8 : candidateUtf8Stems)
+    {
+        const std::filesystem::path direct = acSavesDir / makeUtf8Path(stemUtf8 + ".ess");
+        if (std::filesystem::exists(direct, ec) && !ec && std::filesystem::is_regular_file(direct, ec) && !ec)
+            return direct;
+    }
+
+    std::vector<std::string> foldedTargets;
+    foldedTargets.reserve(candidateUtf8Stems.size());
+    for (const auto& stemUtf8 : candidateUtf8Stems)
+        foldedTargets.push_back(FoldSaveStemUtf8Lower(stemUtf8));
+
+    auto matchesTarget = [&foldedTargets](const std::string& acFileNameUtf8) -> bool
+    {
+        if (!EndsWithIgnoreCase(acFileNameUtf8, ".ess"))
+            return false;
+        const std::string folded = FoldSaveStemUtf8Lower(acFileNameUtf8);
+        return std::find(foldedTargets.begin(), foldedTargets.end(), folded) != foldedTargets.end();
+    };
+
+    for (const auto& entry : std::filesystem::directory_iterator(acSavesDir, ec))
+    {
+        if (ec)
+            break;
+
+        std::error_code entryEc;
+        if (entry.is_regular_file(entryEc) && !entryEc)
+        {
+            const auto u8Name = entry.path().filename().u8string();
+            const std::string fn(reinterpret_cast<const char*>(u8Name.data()), u8Name.size());
+            if (matchesTarget(fn))
+                return entry.path();
+        }
+        else if (entry.is_directory(entryEc) && !entryEc)
+        {
+            for (const auto& stemUtf8 : candidateUtf8Stems)
+            {
+                const std::filesystem::path subDirect = entry.path() / makeUtf8Path(stemUtf8 + ".ess");
+                if (std::filesystem::exists(subDirect, entryEc) && !entryEc &&
+                    std::filesystem::is_regular_file(subDirect, entryEc) && !entryEc)
+                {
+                    return subDirect;
+                }
+            }
+            std::error_code subIterEc;
+            for (const auto& subEntry : std::filesystem::directory_iterator(entry.path(), subIterEc))
+            {
+                if (subIterEc)
+                    break;
+                std::error_code subFileEc;
+                if (!subEntry.is_regular_file(subFileEc) || subFileEc)
+                    continue;
+                const auto u8Sub = subEntry.path().filename().u8string();
+                const std::string subFn(reinterpret_cast<const char*>(u8Sub.data()), u8Sub.size());
+                if (matchesTarget(subFn))
+                    return subEntry.path();
+            }
+        }
+    }
+
+    return {};
+}
+
 // Verifies that an `.ess` file on disk has a genuine Skyrim `TESV_SAVEGAME` header, intact screenshot,
 // and complete non-truncated payload (catching 0-byte, header-only, screenshot-only, and ScrapHeap-failed saves).
 inline bool IsValidEssFileOnDisk(const std::filesystem::path& acEssPath) noexcept
@@ -2780,32 +3061,6 @@ namespace Detail
     if (c >= 'A' && c <= 'F')
         return 10 + (c - 'A');
     return -1;
-}
-
-inline void AppendCodePointUtf8(std::string& aOut, uint32_t aCp)
-{
-    if (aCp <= 0x7Fu)
-    {
-        aOut.push_back(static_cast<char>(aCp));
-    }
-    else if (aCp <= 0x7FFu)
-    {
-        aOut.push_back(static_cast<char>(0xC0u | ((aCp >> 6) & 0x1Fu)));
-        aOut.push_back(static_cast<char>(0x80u | (aCp & 0x3Fu)));
-    }
-    else if (aCp <= 0xFFFFu)
-    {
-        aOut.push_back(static_cast<char>(0xE0u | ((aCp >> 12) & 0x0Fu)));
-        aOut.push_back(static_cast<char>(0x80u | ((aCp >> 6) & 0x3Fu)));
-        aOut.push_back(static_cast<char>(0x80u | (aCp & 0x3Fu)));
-    }
-    else if (aCp <= 0x10FFFFu)
-    {
-        aOut.push_back(static_cast<char>(0xF0u | ((aCp >> 18) & 0x07u)));
-        aOut.push_back(static_cast<char>(0x80u | ((aCp >> 12) & 0x3Fu)));
-        aOut.push_back(static_cast<char>(0x80u | ((aCp >> 6) & 0x3Fu)));
-        aOut.push_back(static_cast<char>(0x80u | (aCp & 0x3Fu)));
-    }
 }
 
 [[nodiscard]] inline std::filesystem::path PathFromUtf8Safe(std::string_view aUtf8)

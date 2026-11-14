@@ -74,59 +74,77 @@ struct ScopedCoopPartyTeammateFlags
         if (peerFormIds.empty())
             return;
 
-        std::lock_guard<std::mutex> lock(s_scopedTeammateFlagsMutex);
+        // Acquire GamePtr<Actor> handles OUTSIDE s_scopedTeammateFlagsMutex so any intrusive
+        // refcount manipulation or destruction never runs while holding the global mutex.
+        TiltedPhoques::Vector<std::pair<uint32_t, GamePtr<Actor>>> candidates;
+        candidates.reserve(peerFormIds.size());
         for (const uint32_t formId : peerFormIds)
         {
             if (formId == 0)
                 continue;
 
-            Actor* pPeerActor = Cast<Actor>(TESForm::GetById(formId));
-            if (!pPeerActor)
+            GamePtr<Actor> spPeer(Cast<Actor>(TESForm::GetById(formId)));
+            if (!spPeer || spPeer->IsDeleted() || spPeer->IsStillLoading())
                 continue;
 
-            auto refIt = s_scopedTeammateRefCounts.find(formId);
-            if (refIt != s_scopedTeammateRefCounts.end() && refIt->second > 0)
-            {
-                ++refIt->second;
-                m_modifiedActorFormIds.push_back(formId);
-                continue;
-            }
-
-            const uint32_t prevFlags = AtomicOrActorFlags1(pPeerActor->flags1, Actor::ActorBoolBits::kPlayerTeammate);
-            if ((prevFlags & Actor::ActorBoolBits::kPlayerTeammate) != 0)
-                continue;
-
-            s_scopedTeammateRefCounts[formId] = 1u;
-            m_modifiedActorFormIds.push_back(formId);
+            candidates.emplace_back(formId, std::move(spPeer));
         }
+        if (candidates.empty())
+            return;
+
+        {
+            std::lock_guard<std::mutex> lock(s_scopedTeammateFlagsMutex);
+            for (auto& [formId, spPeer] : candidates)
+            {
+                auto refIt = s_scopedTeammateRefCounts.find(formId);
+                if (refIt != s_scopedTeammateRefCounts.end() && refIt->second > 0)
+                {
+                    ++refIt->second;
+                    m_modifiedActors.emplace_back(formId, std::move(spPeer));
+                    continue;
+                }
+
+                const uint32_t prevFlags = AtomicOrActorFlags1(spPeer->flags1, Actor::ActorBoolBits::kPlayerTeammate);
+                if ((prevFlags & Actor::ActorBoolBits::kPlayerTeammate) != 0)
+                    continue;
+
+                s_scopedTeammateRefCounts[formId] = 1u;
+                m_modifiedActors.emplace_back(formId, std::move(spPeer));
+            }
+        }
+        // Any unused `candidates` GamePtrs are released here after releasing the lock.
     }
 
     ~ScopedCoopPartyTeammateFlags() noexcept
     {
-        if (m_modifiedActorFormIds.empty())
+        if (m_modifiedActors.empty())
             return;
 
-        std::lock_guard<std::mutex> lock(s_scopedTeammateFlagsMutex);
-        for (const uint32_t formId : m_modifiedActorFormIds)
         {
-            auto refIt = s_scopedTeammateRefCounts.find(formId);
-            if (refIt == s_scopedTeammateRefCounts.end())
-                continue;
-
-            if (refIt->second > 1u)
+            std::lock_guard<std::mutex> lock(s_scopedTeammateFlagsMutex);
+            for (auto& [formId, spPeer] : m_modifiedActors)
             {
-                --refIt->second;
-                continue;
-            }
+                auto refIt = s_scopedTeammateRefCounts.find(formId);
+                if (refIt == s_scopedTeammateRefCounts.end())
+                    continue;
 
-            s_scopedTeammateRefCounts.erase(refIt);
-            if (Actor* pActor = Cast<Actor>(TESForm::GetById(formId)))
-                AtomicAndNotActorFlags1(pActor->flags1, Actor::ActorBoolBits::kPlayerTeammate);
+                if (refIt->second > 1u)
+                {
+                    --refIt->second;
+                    continue;
+                }
+
+                s_scopedTeammateRefCounts.erase(refIt);
+                if (spPeer && !spPeer->IsDeleted())
+                    AtomicAndNotActorFlags1(spPeer->flags1, Actor::ActorBoolBits::kPlayerTeammate);
+            }
         }
+        // Release all GamePtr<Actor> references OUTSIDE s_scopedTeammateFlagsMutex.
+        m_modifiedActors.clear();
     }
 
 private:
-    TiltedPhoques::Vector<uint32_t> m_modifiedActorFormIds{};
+    TiltedPhoques::Vector<std::pair<uint32_t, GamePtr<Actor>>> m_modifiedActors{};
 };
 } // namespace
 
@@ -150,23 +168,28 @@ static thread_local bool s_applyHealPerkBonus = false;
 static thread_local bool s_applyStaminaPerkBonus = false;
 static thread_local bool s_remotePreAdjustedPerks = false;
 static thread_local bool s_captureLocalCasterPerkRatio = false;
+static thread_local const EffectItem* s_captureExpectedEffectItem = nullptr;
 static thread_local float s_capturedPerkMagnitudeRatio = 1.0f;
 
 struct ScopedLocalCasterPerkCapture
 {
-    ScopedLocalCasterPerkCapture() noexcept
+    explicit ScopedLocalCasterPerkCapture(const EffectItem* apExpectedEffect) noexcept
         : m_prevCapture(s_captureLocalCasterPerkRatio)
+        , m_prevExpectedEffect(s_captureExpectedEffectItem)
         , m_prevRatio(s_capturedPerkMagnitudeRatio)
     {
         s_captureLocalCasterPerkRatio = true;
+        s_captureExpectedEffectItem = apExpectedEffect;
         s_capturedPerkMagnitudeRatio = 1.0f;
     }
     ~ScopedLocalCasterPerkCapture() noexcept
     {
         s_captureLocalCasterPerkRatio = m_prevCapture;
+        s_captureExpectedEffectItem = m_prevExpectedEffect;
         s_capturedPerkMagnitudeRatio = m_prevRatio;
     }
     bool m_prevCapture{false};
+    const EffectItem* m_prevExpectedEffect{nullptr};
     float m_prevRatio{1.0f};
 };
 
@@ -217,9 +240,8 @@ bool MagicTarget::AddTargetData::ShouldSync()
     if (!pEffectItem || !pEffectItem->pEffectSetting || !pSpell)
         return false;
 
-    // Constant-effect slow time abilities (e.g. Requiem/RFAB Evasion Quick Reflexes) are added and removed locally by
-    // each client's own scripts, so syncing them would leave allies permanently stuck in slow motion.
-    if (pEffectItem->IsSlowEffect() && pSpell->IsConstantEffectSpell())
+    // SlowTime mutates the global engine time scale and must stay strictly local to the caster.
+    if (pEffectItem->IsSlowEffect())
         return false;
 
     // Never sync player-cast `kScript` ActiveMagicEffects unless they are friendly non-SELF party support spells:
@@ -385,7 +407,7 @@ bool TP_MAKE_THISCALL(HookAddTarget, MagicTarget, MagicTarget::AddTargetData& ar
         }
 
         ScopedCoopPartyTeammateFlags teammateGuard(isFriendlySupport);
-        ScopedLocalCasterPerkCapture perkCapture;
+        ScopedLocalCasterPerkCapture perkCapture(arData.pEffectItem);
         bool result = TiltedPhoques::ThisCall(RealAddTarget, apThis, arData);
         if (result)
         {
@@ -472,7 +494,7 @@ bool TP_MAKE_THISCALL(HookAddTarget, MagicTarget, MagicTarget::AddTargetData& ar
                 Actor::ArmLocalPlayerScriptDamageWindow(pTargetActor->formID, durationMs);
             }
 
-            ScopedLocalCasterPerkCapture perkCapture;
+            ScopedLocalCasterPerkCapture perkCapture(arData.pEffectItem);
             bool result = TiltedPhoques::ThisCall(RealAddTarget, apThis, arData);
             if (result)
             {
@@ -566,7 +588,8 @@ void TP_MAKE_THISCALL(HookAdjustForPerks, ActiveEffect, Actor* apCaster, MagicTa
     const float magBefore = apThis ? apThis->fMagnitude : 0.0f;
     TiltedPhoques::ThisCall(RealAdjustForPerks, apThis, apCaster, apTarget);
 
-    if (s_captureLocalCasterPerkRatio && apThis)
+    if (s_captureLocalCasterPerkRatio && apThis &&
+        (s_captureExpectedEffectItem == nullptr || apThis->pEffect == s_captureExpectedEffectItem))
     {
         s_capturedPerkMagnitudeRatio =
             Authority::ComputeCasterOutgoingPerkMultiplier(magBefore, apThis->fMagnitude);

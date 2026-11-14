@@ -1671,6 +1671,81 @@ int main(int argc, char** argv)
         std::filesystem::remove(std::filesystem::current_path() / "Data" / "rfab_checkpoints.bin", removeEc);
     }
 
+    // Scene 7 (v4.1.1 Phase 1 stabilization): Server::World entity-0 sentinel + kAvInfamy == 61 + ghost boss XP.
+    std::printf("v4.1.1 Phase 1 stabilization invariants\n");
+    {
+        GameServer stabServer{registry};
+        World& world = stabServer.GetWorld();
+        constexpr ConnectionId_t kStabConn = 9901;
+
+        Check(!world.valid(static_cast<entt::entity>(0)), "entity 0 sentinel is never reported valid()");
+        world.destroy(static_cast<entt::entity>(0));
+        Check(!world.valid(static_cast<entt::entity>(0)), "destroying entity 0 sentinel is a safe no-op");
+
+        const entt::entity firstCreated = world.create();
+        Check(World::ToInteger(firstCreated) != 0u, "first live entity allocated on fresh Server::World has non-zero ServerId");
+        world.destroy(firstCreated);
+
+        Player* pPlayer = world.GetPlayerManager().Create(kStabConn);
+        const CellIdComponent kStabCell{GameId{0u, 0x000165A8u}, GameId{0u, 0x0000003Cu}, GridCellCoords{0, 0}};
+        pPlayer->SetCellComponent(kStabCell);
+        const entt::entity playerEntity = world.create();
+        pPlayer->SetCharacter(playerEntity);
+        const uint32_t playerServerId = World::ToInteger(playerEntity);
+        Check(playerServerId != 0u, "assigned player character never gets ServerId == 0");
+
+        world.emplace<OwnerComponent>(playerEntity, pPlayer);
+        world.emplace<CellIdComponent>(playerEntity, kStabCell);
+        world.emplace<ActorValuesComponent>(playerEntity);
+
+        // Verify kAvInfamy (61) is stripped on server while kAvVoicePoints (37), kAvDamageResist (39),
+        // and kAvAbsorbChance (83) are accepted cleanly!
+        {
+            RequestActorValueChanges avReq{};
+            avReq.Id = playerServerId;
+            avReq.Values[61u] = 500.0f; // kAvInfamy -> must be dropped (RFAB_XP_Alias local sentinel)
+            avReq.Values[37u] = 100.0f; // kAvVoicePoints -> must be accepted (was wrongly dropped as 37)
+            avReq.Values[39u] = 420.0f; // kAvDamageResist
+            avReq.Values[83u] = 25.0f;  // kAvAbsorbChance
+            Check(DeliverWire(world, avReq, pPlayer), "P1.2 ActorValueChanges with Infamy/VoicePoints/Armor/Absorb round-trips");
+            const auto& stored = world.get<ActorValuesComponent>(playerEntity).CurrentActorValues;
+            Check(stored.ActorValuesList.count(61u) == 0,
+                  "kAvInfamy (61) is filtered out on server so RFAB_XP_Alias sentinel never leaks");
+            Check(stored.ActorValuesList.count(37u) == 1 && stored.ActorValuesList.at(37u) == 100.0f,
+                  "kAvVoicePoints (37) is no longer mistakenly blocked as kAvInfamy");
+            Check(stored.ActorValuesList.count(39u) == 1 && stored.ActorValuesList.at(39u) == 420.0f,
+                  "kAvDamageResist (39) persists on server ActorValuesComponent");
+            Check(stored.ActorValuesList.count(83u) == 1 && stored.ActorValuesList.at(83u) == 25.0f,
+                  "kAvAbsorbChance (83) persists on server ActorValuesComponent");
+        }
+
+        // Verify boss_ghost on valid boss entity (and rejection of entity 0 sentinel).
+        {
+            const entt::entity bossEntity = world.create();
+            const uint32_t bossServerId = World::ToInteger(bossEntity);
+            Check(bossServerId != 0u, "boss entity never gets ServerId == 0");
+            world.emplace<OwnerComponent>(bossEntity, pPlayer);
+            world.emplace<CellIdComponent>(bossEntity, kStabCell);
+
+            SyncRfabProgressionEvent bossGhostZero{};
+            bossGhostZero.Kind = SyncRfabProgressionEvent::EventKind::BossEncounterSync;
+            bossGhostZero.EpochId = world.GetSaveSnapshotService().GetCurrentWorldEpoch();
+            bossGhostZero.SourceKey = "boss_ghost";
+            bossGhostZero.XpDelta = 0;
+            bossGhostZero.GlobalValue = 1.0f;
+            Check(DeliverWire(world, bossGhostZero, pPlayer), "P1.1 boss_ghost with ServerId == 0 is handled safely");
+
+            SyncRfabProgressionEvent bossGhostLive{};
+            bossGhostLive.Kind = SyncRfabProgressionEvent::EventKind::BossEncounterSync;
+            bossGhostLive.EpochId = world.GetSaveSnapshotService().GetCurrentWorldEpoch();
+            bossGhostLive.SourceKey = "boss_ghost";
+            bossGhostLive.XpDelta = static_cast<int32_t>(bossServerId);
+            bossGhostLive.GlobalValue = 1.0f;
+            Check(DeliverWire(world, bossGhostLive, pPlayer), "P1.1 boss_ghost with valid non-zero bossServerId delivers cleanly");
+            world.destroy(bossEntity);
+        }
+    }
+
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures,
                 g_failures == 1 ? "" : "s");
     return g_failures == 0 ? 0 : 1;

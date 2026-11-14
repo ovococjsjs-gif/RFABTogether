@@ -65,6 +65,12 @@ TESNPC* TESNPC::GetLeveledSourceNpc(const TESNPC* apNpc) noexcept
     return (pSourceNpc && !pSourceNpc->IsTemporary()) ? pSourceNpc : nullptr;
 }
 
+void TESNPC::ClearLeveledNpcSourceCache() noexcept
+{
+    std::lock_guard<std::mutex> lock(s_leveledNpcSourceMutex);
+    s_leveledNpcSourceByTempFormId.clear();
+}
+
 TP_THIS_FUNCTION(TSetLeveledNpc, TESNPC*, TESNPC, TESNPC*);
 static TSetLeveledNpc* RealSetLeveledNpc = nullptr;
 

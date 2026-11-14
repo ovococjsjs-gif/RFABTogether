@@ -338,6 +338,7 @@ void CharacterService::OnPlayerCellChanged(const NotifyPlayerCellChanged& acMess
 
 void CharacterService::OnPlayerLeft(const NotifyPlayerLeft& acMessage) noexcept
 {
+    m_playerAppearanceHashes.erase(acMessage.PlayerId);
     if (const auto playerIt = m_playerServerIds.find(acMessage.PlayerId); playerIt != m_playerServerIds.end())
     {
         const uint32_t serverId = playerIt->second;

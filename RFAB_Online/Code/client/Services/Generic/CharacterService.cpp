@@ -1150,6 +1150,8 @@ void CharacterService::DetachAllActorsForEngineLoad() noexcept
     m_playerServerIds.clear();
     m_playerBaseNpcPool.clear();
     m_playerHairColorPool.clear();
+    m_playerAppearanceHashes.clear();
+    TESNPC::ClearLeveledNpcSourceCache();
     m_localAppearanceResync.Reset();
     FaceGenSystem::InvalidateLocalPlayerHairTintIsolation();
     m_createdNetworkFormIds.clear();
@@ -1209,6 +1211,7 @@ void CharacterService::PurgeNetworkActorsOnLiveDisconnect() noexcept
     m_cachedRemoteSpawns.clear();
     m_remoteModels.clear();
     m_playerServerIds.clear();
+    m_playerAppearanceHashes.clear();
     m_weaponDrawUpdates.clear();
     ResetWorldScopedCaches();
 
@@ -1710,17 +1713,43 @@ void CharacterService::OnCharacterSpawn(const CharacterSpawnRequest& acMessage) 
                 if (TESNPC* pBaseNpc = Cast<TESNPC>(pLiveActor->baseForm);
                     pBaseNpc && ((pBaseNpc->formID & 0xFF000000u) == 0xFF000000u))
                 {
-                    pBaseNpc->Deserialize(acMessage.AppearanceBuffer, acMessage.ChangeFlags);
-                    ApplyRemotePlayerHairColorForm(acMessage.PlayerId, pBaseNpc, acMessage.FaceTints);
-                    pBaseNpc->overlayRace = nullptr;
-                    pBaseNpc->actorData.SetEssential(true);
-                    pBaseNpc->SetSkipSaveFlag(true);
-                    pBaseNpc->UnsetChanged(0xFFFFFFFF);
-                    FaceGenSystem::Setup(m_world, entity, acMessage.FaceTints);
-                    if (auto* pFaceGen = m_world.try_get<FaceGenComponent>(entity))
-                        pFaceGen->ResetGenerationState();
-                    m_nextFaceGenMainThreadScheduleMs = 0;
-                    pLiveActor->QueueUpdate();
+                    CoopHairColorSync::Fnv1a64Hasher appHash{};
+                    appHash.MixU32(acMessage.ChangeFlags);
+                    appHash.MixU32(static_cast<uint32_t>(acMessage.AppearanceBuffer.size()));
+                    for (const char ch : acMessage.AppearanceBuffer)
+                        appHash.MixByte(static_cast<uint8_t>(ch));
+                    appHash.MixU32(static_cast<uint32_t>(acMessage.FaceTints.Entries.size()));
+                    for (const auto& tint : acMessage.FaceTints.Entries)
+                    {
+                        appHash.MixU32(tint.Type);
+                        appHash.MixU32(tint.Color);
+                        appHash.MixFloat(tint.Alpha);
+                        for (const char ch : tint.Name)
+                            appHash.MixByte(static_cast<uint8_t>(ch));
+                    }
+                    const uint64_t incomingAppearanceHash = appHash.Finish();
+                    const auto prevHashIt = m_playerAppearanceHashes.find(acMessage.PlayerId);
+                    const bool appearanceChanged =
+                        acMessage.PlayerId == 0 ||
+                        prevHashIt == m_playerAppearanceHashes.end() ||
+                        prevHashIt->second != incomingAppearanceHash;
+
+                    if (appearanceChanged)
+                    {
+                        pBaseNpc->Deserialize(acMessage.AppearanceBuffer, acMessage.ChangeFlags);
+                        ApplyRemotePlayerHairColorForm(acMessage.PlayerId, pBaseNpc, acMessage.FaceTints);
+                        pBaseNpc->overlayRace = nullptr;
+                        pBaseNpc->actorData.SetEssential(true);
+                        pBaseNpc->SetSkipSaveFlag(true);
+                        pBaseNpc->UnsetChanged(0xFFFFFFFF);
+                        if (acMessage.PlayerId != 0)
+                            m_playerAppearanceHashes[acMessage.PlayerId] = incomingAppearanceHash;
+                        FaceGenSystem::Setup(m_world, entity, acMessage.FaceTints);
+                        if (auto* pFaceGen = m_world.try_get<FaceGenComponent>(entity))
+                            pFaceGen->ResetGenerationState();
+                        m_nextFaceGenMainThreadScheduleMs = 0;
+                        pLiveActor->QueueUpdate();
+                    }
                 }
             }
 
@@ -2480,10 +2509,31 @@ Actor* CharacterService::MaterializeRemoteView(
                         ApplyRemotePlayerHairColorForm(acMessage.PlayerId, pNpc, acMessage.FaceTints);
                     pNpc->overlayRace = nullptr;
                     pNpc->actorData.SetEssential(true);
+                    pNpc->SetSkipSaveFlag(true);
+                    pNpc->UnsetChanged(0xFFFFFFFF);
                     m_createdNetworkFormIds.insert(pNpc->formID);
                     if (acMessage.IsPlayer && acMessage.PlayerId != 0)
                         m_playerBaseNpcPool[acMessage.PlayerId] = pNpc->formID;
                 }
+            }
+
+            if (pNpc && acMessage.IsPlayer && acMessage.PlayerId != 0 && !acMessage.AppearanceBuffer.empty())
+            {
+                CoopHairColorSync::Fnv1a64Hasher appHash{};
+                appHash.MixU32(acMessage.ChangeFlags);
+                appHash.MixU32(static_cast<uint32_t>(acMessage.AppearanceBuffer.size()));
+                for (const char ch : acMessage.AppearanceBuffer)
+                    appHash.MixByte(static_cast<uint8_t>(ch));
+                appHash.MixU32(static_cast<uint32_t>(acMessage.FaceTints.Entries.size()));
+                for (const auto& tint : acMessage.FaceTints.Entries)
+                {
+                    appHash.MixU32(tint.Type);
+                    appHash.MixU32(tint.Color);
+                    appHash.MixFloat(tint.Alpha);
+                    for (const char ch : tint.Name)
+                        appHash.MixByte(static_cast<uint8_t>(ch));
+                }
+                m_playerAppearanceHashes[acMessage.PlayerId] = appHash.Finish();
             }
 
             FaceGenSystem::Setup(m_world, aEntity, acMessage.FaceTints);

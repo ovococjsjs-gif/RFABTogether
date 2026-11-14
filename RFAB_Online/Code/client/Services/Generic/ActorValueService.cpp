@@ -5,6 +5,8 @@
 #include <cmath>
 
 #include <Services/ActorValueService.h>
+#include <Services/RfabAdapterService.h>
+#include <Authority/ActorValues.h>
 #include <CoopWorldStabilizer.h>
 #include <World.h>
 #include <Forms/ActorValueInfo.h>
@@ -463,9 +465,15 @@ void ActorValueService::OnHealthChangeBroadcast(const NotifyHealthChangeBroadcas
             else
             {
                 // Authoritative owner of this NPC when a party ally landed the final blow (joint kill!):
-                // credit PlayerCharacter::Get() as killer WITHOUT setting kInfamy = -1 so RFAB_XP_Alias.psc
-                // awards exact 1x RFAB kill XP here and SyncRfabExperienceRequest shares it with the whole party!
-                pActor->Kill(PlayerCharacter::Get());
+                // credit PlayerCharacter::Get() ONLY for genuinely hostile/boss/dragon targets so
+                // RFAB_XP_Alias.psc awards exact 1x RFAB kill XP without ever framing the local player
+                // for murder bounties / Divines karma loss when a peer or monster kills a friendly guard/civilian!
+                PlayerCharacter* pLocalPlayer = PlayerCharacter::Get();
+                const bool isHostileOrBoss =
+                    pActor->IsDragon() ||
+                    m_world.GetRfabAdapterService().IsBossActor(pActor) ||
+                    (pLocalPlayer && pActor->IsHostileToActor(pLocalPlayer));
+                pActor->Kill(isHostileOrBoss ? static_cast<Actor*>(pLocalPlayer) : nullptr);
             }
         }
         return;
@@ -556,21 +564,12 @@ void ActorValueService::OnActorValueChanges(const NotifyActorValueChanges& acMes
     {
         if (key >= ActorValueInfo::kActorValueCount || !std::isfinite(value))
             continue;
-        // Syncing dragon souls triggers "Dragon soul collected" event.
-        // Never overwrite locally computed movement/attack speed multipliers (SpeedMult = 30, WeaponSpeedMult = 85,
-        // LeftWeaponSpeedMult = 132) or kInfamy (37, used by RFAB_XP_Alias.psc as duplicate-XP suppression marker):
-        // SetActorValue mutates the base AV, compounding with RFAB.dll SpeedLimitHandler / AdjustmentHandler / StaminaSystemEventSink
-        // and poisoning swing speed or kill XP on ownership handoff!
-        if (key == ActorValueInfo::kDragonSouls ||
-            key == ActorValueInfo::kSpeedMult ||
-            key == ActorValueInfo::kInfamy ||
-            key == ActorValueInfo::kWeaponSpeedMult ||
-            key == ActorValueInfo::kLeftWeaponSpeedMult)
-        {
-            continue;
-        }
 
-        if (key == ActorValueInfo::kHealth)
+        const auto applyMode = Authority::ClassifyRemoteActorValueApplyMode(key, /*aIsMaxValuePacket=*/false);
+        if (applyMode == Authority::RemoteActorValueApplyMode::kSkip)
+            continue;
+
+        if (applyMode == Authority::RemoteActorValueApplyMode::kHealthSpecial)
         {
             const auto* pExt = pActor->GetExtension();
             const bool isRemoteNonPlayer = pExt && pExt->IsRemote() && !pExt->IsPlayer();
@@ -605,9 +604,11 @@ void ActorValueService::OnActorValueChanges(const NotifyActorValueChanges& acMes
 
         spdlog::debug("Actor value update, server ID: {:X}, key: {}, value: {}", acMessage.Id, key, value);
 
-        if (key >= ActorValueInfo::kDamageResist && key <= ActorValueInfo::kMagicResist)
+        if (applyMode == Authority::RemoteActorValueApplyMode::kTemporaryTotalDelta)
         {
-            pActor->ForceActorValue(ActorValueOwner::ForceMode::PERMANENT, key, value);
+            const float delta = Authority::ComputeTemporaryTotalDelta(pActor->GetActorValue(key), value);
+            if (delta != 0.0f)
+                pActor->actorValueOwner.ForceCurrent(ActorValueOwner::ForceMode::TEMPORARY, key, delta);
             continue;
         }
         pActor->ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, key, value);
@@ -635,14 +636,9 @@ void ActorValueService::OnActorMaxValueChanges(const NotifyActorMaxValueChanges&
         if (key >= ActorValueInfo::kActorValueCount || !std::isfinite(value))
             continue;
 
-        if (key == ActorValueInfo::kDragonSouls ||
-            key == ActorValueInfo::kSpeedMult ||
-            key == ActorValueInfo::kInfamy ||
-            key == ActorValueInfo::kWeaponSpeedMult ||
-            key == ActorValueInfo::kLeftWeaponSpeedMult)
-        {
+        const auto applyMode = Authority::ClassifyRemoteActorValueApplyMode(key, /*aIsMaxValuePacket=*/true);
+        if (applyMode != Authority::RemoteActorValueApplyMode::kPermanentDelta)
             continue;
-        }
 
         spdlog::debug("Actor max value update, server ID: {:X}, key: {}, value: {}", acMessage.Id, key, value);
 

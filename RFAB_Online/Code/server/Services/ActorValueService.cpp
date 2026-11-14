@@ -24,14 +24,15 @@ extern Console::Setting<bool> bEnablePvp;
 #include <Messages/NotifyHealthChangeBroadcast.h>
 #include <Messages/RequestDeathStateChange.h>
 #include <Messages/NotifyDeathStateChange.h>
+#include <Authority/ActorValues.h>
 #include <Authority/Health.h>
 #include <Authority/Hits.h>
 
 namespace
 {
-constexpr uint32_t kHealthActorValueIndex = 24;
-constexpr uint32_t kInfamyActorValueIndex = 37;
-constexpr uint32_t kActorValueCount = 164;
+constexpr uint32_t kHealthActorValueIndex = Authority::kAvHealth;
+constexpr uint32_t kInfamyActorValueIndex = Authority::kAvInfamy;
+constexpr uint32_t kActorValueCount = Authority::kAvCount;
 constexpr float kMaxSanitizedActorValue = 100000.0f;
 
 uint64_t SteadyActorValueNowMs() noexcept

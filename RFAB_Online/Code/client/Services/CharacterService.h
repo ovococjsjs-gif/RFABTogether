@@ -241,6 +241,7 @@ private:
     mutable Map<uint32_t, uint32_t> m_playerServerIds{};
     mutable Map<uint32_t, uint32_t> m_playerBaseNpcPool{};
     mutable Map<uint32_t, uint32_t> m_playerHairColorPool{};
+    mutable Map<uint32_t, uint64_t> m_playerAppearanceHashes{};
     mutable CoopHairColorSync::AppearanceResyncTracker m_localAppearanceResync{};
     mutable std::shared_ptr<std::atomic<bool>> m_spFaceGenMainThreadPending{std::make_shared<std::atomic<bool>>(false)};
     mutable uint64_t m_nextFaceGenMainThreadScheduleMs{0};

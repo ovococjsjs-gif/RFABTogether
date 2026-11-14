@@ -708,7 +708,12 @@ void FaceGenSystem::Update(World& aWorld, Actor* apActor, FaceGenComponent& aFac
                 if (pLightingShader->GetRTTI() == NiMaskedShaderRTTI.Get())
                 {
                     BSMaskedShaderMaterial* pMaterial = static_cast<BSMaskedShaderMaterial*>(pLightingShader->material);
-                    if (pMaterial)
+                    // Only BSLightingShaderMaterialFacegen (type == Lighting, feature == FaceGen == 4) has
+                    // NiPointer<NiTexture> renderedTexture at +0xA0. FaceGenRGBTint (feature == 5) stores
+                    // NiColor floats at +0xA0; writing a texture pointer there corrupts memory & CTDs on unload!
+                    if (pMaterial &&
+                        pMaterial->GetType() == BSMaskedShaderMaterial::kTypeLighting &&
+                        pMaterial->GetFeature() == BSMaskedShaderMaterial::kFeatureFaceGen)
                     {
                         // CRITICAL FIX (Screenshot 4):
                         // Never use an empty "" texture name or mutate pMaterial->renderedTexture in-place!
@@ -719,13 +724,24 @@ void FaceGenSystem::Update(World& aWorld, Actor* apActor, FaceGenComponent& aFac
                         std::snprintf(texNameBuf, sizeof(texNameBuf), "STR_FaceTint_%08X", apActor->formID);
                         BSFixedString name(texNameBuf);
                         auto pTexture = CreateTexture(name);
-                        pTexture->buffer = CreateResourceView(s_textureHolder.Get(), 512, 512);
+                        Ni2DBuffer* pBuffer = pTexture ? CreateResourceView(s_textureHolder.Get(), 512, 512) : nullptr;
+                        if (!pTexture || !pBuffer)
+                        {
+                            pShaderProperty->DecRef();
+                            return;
+                        }
+                        pTexture->buffer = pBuffer;
 
                         auto& tintsEntries = aFaceGenComponent.FaceTints.Entries;
 
                         GameArray<TintMask*> tints;
                         tints.capacity = tints.length = static_cast<uint32_t>(faceTintCount & 0xFFFFFFFFu);
-                        tints.data = (TintMask**)Memory::Allocate(sizeof(TintMask*) * tints.length);
+                        tints.data = static_cast<TintMask**>(Memory::Allocate(sizeof(TintMask*) * tints.length));
+                        if (!tints.data)
+                        {
+                            pShaderProperty->DecRef();
+                            return;
+                        }
 
                         uint32_t dstIdx = 0;
                         for (size_t srcIdx = 0; srcIdx < tintsEntries.size() && dstIdx < tints.length; ++srcIdx)
@@ -733,24 +749,32 @@ void FaceGenSystem::Update(World& aWorld, Actor* apActor, FaceGenComponent& aFac
                             if (Tints::IsHairColorEntry(tintsEntries[srcIdx]))
                                 continue;
 
-                            tints[dstIdx] = Memory::New<TintMask>();
+                            auto* pMask = Memory::New<TintMask>();
+                            auto* pNewTexture = Memory::New<TESTexture>();
+                            if (!pMask || !pNewTexture)
+                            {
+                                if (pNewTexture)
+                                    Memory::Free(pNewTexture);
+                                if (pMask)
+                                    Memory::Free(pMask);
+                                break;
+                            }
 
-                            tints[dstIdx]->alpha = tintsEntries[srcIdx].Alpha;
-                            tints[dstIdx]->color = tintsEntries[srcIdx].Color;
-                            tints[dstIdx]->type = tintsEntries[srcIdx].Type;
+                            pMask->alpha = tintsEntries[srcIdx].Alpha;
+                            pMask->color = tintsEntries[srcIdx].Color;
+                            pMask->type = tintsEntries[srcIdx].Type;
 
-                            auto pNewTexture = Memory::New<TESTexture>();
                             pNewTexture->Construct();
                             pNewTexture->Init();
-
                             pNewTexture->name.Set(tintsEntries[srcIdx].Name.c_str());
 
-                            tints[dstIdx]->texture = pNewTexture;
-                            ++dstIdx;
+                            pMask->texture = pNewTexture;
+                            tints[dstIdx++] = pMask;
                         }
                         tints.length = dstIdx;
 
-                        CreateTints(tints, pTexture);
+                        if (tints.length > 0)
+                            CreateTints(tints, pTexture);
 
                         for (auto i = 0u; i < tints.length; ++i)
                         {
@@ -761,32 +785,40 @@ void FaceGenSystem::Update(World& aWorld, Actor* apActor, FaceGenComponent& aFac
 
                         Memory::Free(tints.data);
 
-                        BSMaskedShaderMaterial* pClonedMaterial = pMaterial->Create();
-                        if (pClonedMaterial)
+                        if (tints.length > 0)
                         {
-                            pClonedMaterial->Copy(pMaterial);
-                            pClonedMaterial->renderedTexture = pTexture;
-
-                            TiltedPhoques::ThisCall(SetShaderMaterial, pLightingShader, pClonedMaterial, true);
-                            TiltedPhoques::ThisCall(InitializeShader, pLightingShader, pTriBasedGeom);
-
-                            // CRITICAL CTD-ON-CELL-CHANGE FIX:
-                            // 1. Only release pClonedMaterial if SetShaderMaterial cloned a separate pooled material instance!
-                            //    If SetShaderMaterial (or FaceGenFixes.dll) adopted pClonedMaterial directly into
-                            //    pLightingShader->material, freeing it here caused an immediate Use-After-Free CTD inside
-                            //    ~BSLightingShaderProperty() the moment a co-op friend unloaded on location/cell change.
-                            // 2. When pClonedMaterial WAS cloned into a separate instance, invoke SkyrimSE.exe's own virtual
-                            //    scalar deleting destructor with flags = 1 (never flags = 0 + manual Memory::Free(..., false)),
-                            //    matching pMaterial->Create()'s exact heap & alignment under EngineFixes MemoryManager true/false.
-                            if (pLightingShader->material != pClonedMaterial)
+                            BSMaskedShaderMaterial* pClonedMaterial = pMaterial->Create();
+                            if (pClonedMaterial)
                             {
-                                using TScalarDtor = void*(__fastcall*)(BSMaskedShaderMaterial*, uint32_t);
-                                void** vtbl = *reinterpret_cast<void***>(pClonedMaterial);
-                                if (vtbl && vtbl[0])
-                                    reinterpret_cast<TScalarDtor>(vtbl[0])(pClonedMaterial, 1);
+                                pClonedMaterial->Copy(pMaterial);
+                                pClonedMaterial->renderedTexture = pTexture;
+
+                                TiltedPhoques::ThisCall(SetShaderMaterial, pLightingShader, pClonedMaterial, true);
+                                TiltedPhoques::ThisCall(InitializeShader, pLightingShader, pTriBasedGeom);
+
+                                // CRITICAL CTD-ON-CELL-CHANGE FIX:
+                                // 1. Only release pClonedMaterial if SetShaderMaterial cloned a separate pooled material instance!
+                                //    If SetShaderMaterial (or FaceGenFixes.dll) adopted pClonedMaterial directly into
+                                //    pLightingShader->material, freeing it here caused an immediate Use-After-Free CTD inside
+                                //    ~BSLightingShaderProperty() the moment a co-op friend unloaded on location/cell change.
+                                // 2. When pClonedMaterial WAS cloned into a separate instance, invoke SkyrimSE.exe's own virtual
+                                //    scalar deleting destructor with flags = 1 (never flags = 0 + manual Memory::Free(..., false)),
+                                //    matching pMaterial->Create()'s exact heap & alignment under EngineFixes MemoryManager true/false.
+                                if (pLightingShader->material != pClonedMaterial)
+                                {
+                                    using TScalarDtor = void*(__fastcall*)(BSMaskedShaderMaterial*, uint32_t);
+                                    void** vtbl = *reinterpret_cast<void***>(pClonedMaterial);
+                                    if (vtbl && vtbl[0])
+                                        reinterpret_cast<TScalarDtor>(vtbl[0])(pClonedMaterial, 1);
+                                }
                             }
                         }
 
+                        aFaceGenComponent.Generated = true;
+                        aFaceGenComponent.LastFaceNode = pCurrentFaceNode;
+                    }
+                    else
+                    {
                         aFaceGenComponent.Generated = true;
                         aFaceGenComponent.LastFaceNode = pCurrentFaceNode;
                     }

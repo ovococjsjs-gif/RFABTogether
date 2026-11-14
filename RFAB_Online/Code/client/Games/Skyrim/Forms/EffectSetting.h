@@ -38,6 +38,7 @@ struct EffectSetting : TESForm
     void* unk80[2];
     uint32_t castType;
     uint32_t deliveryType;
+    int32_t secondaryAV;
     // more stuff
 };
 
@@ -46,3 +47,4 @@ static_assert(offsetof(EffectSetting, eArchetype) == 0xC0);
 static_assert(offsetof(EffectSetting, primaryAV) == 0xC4);
 static_assert(offsetof(EffectSetting, castType) == 0xD8);
 static_assert(offsetof(EffectSetting, deliveryType) == 0xDC);
+static_assert(offsetof(EffectSetting, secondaryAV) == 0xE0);

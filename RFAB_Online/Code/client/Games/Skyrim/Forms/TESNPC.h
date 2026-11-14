@@ -20,6 +20,7 @@ struct TESNPC : TESActorBase
 
     static TESNPC* Create(const String& acBuffer, uint32_t aChangeFlags) noexcept;
     static TESNPC* GetLeveledSourceNpc(const TESNPC* apNpc) noexcept;
+    static void ClearLeveledNpcSourceCache() noexcept;
 
     TESNPC* GetTemplateBase() const noexcept
     {

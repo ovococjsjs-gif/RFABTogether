@@ -199,15 +199,15 @@ void RfabAdapterService::NotifyPartyLeadershipChanged() noexcept
 
 void RfabAdapterService::RefreshCoopCombatSnapshot() noexcept
 {
-    CoopCombatSnapshot next{};
+    auto spNext = std::make_shared<CoopCombatSnapshot>();
     RfabCombatRules::BuildCombatSnapshot(
         m_world,
         m_transport,
         m_allyProtectionEnabled.load(std::memory_order_relaxed),
-        next);
+        *spNext);
 
-    std::lock_guard<std::mutex> lock(m_coopSnapshotMutex);
-    m_coopCombatSnapshot = std::move(next);
+    std::unique_lock<std::shared_mutex> lock(m_coopSnapshotMutex);
+    m_coopCombatSnapshot = std::move(spNext);
 }
 
 GamePtr<Actor> RfabAdapterService::FindBestStandingPlayerTargetFor(Actor* apAttacker) const noexcept
@@ -215,21 +215,30 @@ GamePtr<Actor> RfabAdapterService::FindBestStandingPlayerTargetFor(Actor* apAtta
     if (!apAttacker || !IsCombatRulesFeatureEnabled())
         return nullptr;
 
-    CoopCombatSnapshot snapshot;
+    std::shared_ptr<const CoopCombatSnapshot> spSnapshot;
     {
-        std::lock_guard<std::mutex> lock(m_coopSnapshotMutex);
-        if (!m_coopCombatSnapshot.Connected)
-            return nullptr;
-        snapshot = m_coopCombatSnapshot;
+        std::shared_lock<std::shared_mutex> lock(m_coopSnapshotMutex);
+        spSnapshot = m_coopCombatSnapshot;
     }
+    if (!spSnapshot || !spSnapshot->Connected)
+        return nullptr;
 
-    return RfabCombatRules::SelectBestStandingTarget(snapshot, apAttacker);
+    return RfabCombatRules::SelectBestStandingTarget(*spSnapshot, apAttacker);
 }
 
 void RfabAdapterService::CollectPartyPeerActorFormIds(TiltedPhoques::Vector<uint32_t>& aOutFormIds) const noexcept
 {
-    std::lock_guard<std::mutex> lock(m_coopSnapshotMutex);
-    RfabCombatRules::CollectPartyPeerActorFormIds(m_coopCombatSnapshot, aOutFormIds);
+    std::shared_ptr<const CoopCombatSnapshot> spSnapshot;
+    {
+        std::shared_lock<std::shared_mutex> lock(m_coopSnapshotMutex);
+        spSnapshot = m_coopCombatSnapshot;
+    }
+    if (!spSnapshot)
+    {
+        aOutFormIds.clear();
+        return;
+    }
+    RfabCombatRules::CollectPartyPeerActorFormIds(*spSnapshot, aOutFormIds);
 }
 
 void RfabAdapterService::SetLocalAllyProtectionEnabled(bool aEnabled, bool aShowHudNotification) noexcept
@@ -276,17 +285,17 @@ RfabCompat::CoopAllyActionPolicy RfabAdapterService::EvaluateCoopAction(
     if (!apAttacker || !apTarget || apAttacker == apTarget || !IsCombatRulesFeatureEnabled())
         return {};
 
-    // Read a mutex-protected snapshot built on the World::Update() thread instead of touching
-    // entt::registry views or TiltedPhoques::Vector<uint32_t> directly from combat/magic worker threads.
-    CoopCombatSnapshot snapshot;
+    // Read a COW shared_ptr snapshot under shared_lock instead of deep-copying maps/vectors
+    // on every physical/magic hit across Skyrim's combat worker threads.
+    std::shared_ptr<const CoopCombatSnapshot> spSnapshot;
     {
-        std::lock_guard<std::mutex> lock(m_coopSnapshotMutex);
-        if (!m_coopCombatSnapshot.Connected || !m_coopCombatSnapshot.InParty)
-            return {};
-        snapshot = m_coopCombatSnapshot;
+        std::shared_lock<std::shared_mutex> lock(m_coopSnapshotMutex);
+        spSnapshot = m_coopCombatSnapshot;
     }
+    if (!spSnapshot || !spSnapshot->Connected || !spSnapshot->InParty)
+        return {};
 
-    return RfabCombatRules::EvaluateSnapshotAction(snapshot, apAttacker, apTarget, aIsBeneficialHealOrBuff);
+    return RfabCombatRules::EvaluateSnapshotAction(*spSnapshot, apAttacker, apTarget, aIsBeneficialHealOrBuff);
 }
 
 void RfabAdapterService::OnSessionBegin(const Session::Transition& acTransition) noexcept
@@ -341,6 +350,18 @@ void RfabAdapterService::OnWorldLoadBegin(const Session::Transition&) noexcept
     // Allow 2.0s post-load settle window so BGSSaveLoadManager finishes restoring ESS state
     // and authoritative server resync packets land before we poll local FormLists/TESGlobals again.
     m_pollAccumulatorSec = -2.0;
+    m_snapshotAccumulatorSec = 0.0;
+}
+
+void RfabAdapterService::OnWorldLoadEnd(const Session::Transition& acTransition) noexcept
+{
+    if (!acTransition.Online || !acTransition.Succeeded)
+        return;
+
+    // Immediately re-enforce REQ_Combat_NoDeathHandling == 1.0 as soon as the save finishes loading,
+    // closing the 2.0s post-load window where Requiem's death script could trigger a solo reload.
+    m_xpAndBookSync.EnforceNoDeathHandlingTick(m_formResolver);
+    RefreshCoopCombatSnapshot();
 }
 
 void RfabAdapterService::SelfHealFreeRoamMenuControls() noexcept
@@ -377,16 +398,23 @@ void RfabAdapterService::OnUpdate(const UpdateEvent& acEvent) noexcept
         ClearTacticalHudSnapshot();
     }
 
-    RefreshCoopCombatSnapshot();
-    if (m_tacticalHudFeatureApplied)
-        RefreshTacticalHudSnapshot();
+    // Throttle periodic combat/HUD snapshot rebuilds to 10 Hz (immediate refreshes still fire on
+    // session begin/end, world load end, party join/leave, ally-protection toggles, and player spawn).
+    m_snapshotAccumulatorSec += acEvent.Delta;
+    if (m_snapshotAccumulatorSec >= 0.1)
+    {
+        m_snapshotAccumulatorSec = 0.0;
+        RefreshCoopCombatSnapshot();
+        if (m_tacticalHudFeatureApplied)
+            RefreshTacticalHudSnapshot();
+    }
 
     m_pollAccumulatorSec += acEvent.Delta;
     if (m_pollAccumulatorSec < 0.5)
         return;
     m_pollAccumulatorSec = 0.0;
 
-    m_xpAndBookSync.EnforceNoDeathHandlingTick();
+    m_xpAndBookSync.EnforceNoDeathHandlingTick(m_formResolver);
     PollReadXpBooks();
     PollSyncedGlobals();
     if (m_combatRulesFeatureApplied)
@@ -596,13 +624,14 @@ void RfabAdapterService::ExecuteTacticalChatCommand(const RfabCompat::TacticalCh
 
 void RfabAdapterService::ClearTacticalHudSnapshot() noexcept
 {
-    std::lock_guard<std::mutex> lock(m_tacticalHudSnapshotMutex);
-    m_tacticalHudSnapshot = RfabTacticalHudRenderSnapshot{};
+    auto spEmpty = std::make_shared<RfabTacticalHudRenderSnapshot>();
+    std::unique_lock<std::shared_mutex> lock(m_tacticalHudSnapshotMutex);
+    m_tacticalHudSnapshot = std::move(spEmpty);
 }
 
 void RfabAdapterService::RefreshTacticalHudSnapshot() noexcept
 {
-    RfabTacticalHudRenderSnapshot next{};
+    auto spNext = std::make_shared<RfabTacticalHudRenderSnapshot>();
     m_hudAndPings.BuildHudSnapshot(
         m_world,
         m_transport,
@@ -611,22 +640,23 @@ void RfabAdapterService::RefreshTacticalHudSnapshot() noexcept
         ResolveEffectiveLocalPlayerId(),
         IsAllyProtectionEnabled(),
         IsLocalPlayerAllyProtectionHost(),
-        next);
+        *spNext);
 
-    std::lock_guard<std::mutex> lock(m_tacticalHudSnapshotMutex);
-    m_tacticalHudSnapshot = std::move(next);
+    std::unique_lock<std::shared_mutex> lock(m_tacticalHudSnapshotMutex);
+    m_tacticalHudSnapshot = std::move(spNext);
 }
 
 void RfabAdapterService::OnDrawTacticalHud() noexcept
 {
-    // Runs on D3D11 Render Thread (BSGraphics::Hook_Renderer_End): ONLY reads a lock-copied POD/string snapshot!
-    RfabTacticalHudRenderSnapshot snapshot;
+    // Runs on D3D11 Render Thread (BSGraphics::Hook_Renderer_End): grabs COW shared_ptr with zero deep copy!
+    std::shared_ptr<const RfabTacticalHudRenderSnapshot> spSnapshot;
     {
-        std::lock_guard<std::mutex> lock(m_tacticalHudSnapshotMutex);
-        if (!m_tacticalHudSnapshot.Visible)
-            return;
-        snapshot = m_tacticalHudSnapshot;
+        std::shared_lock<std::shared_mutex> lock(m_tacticalHudSnapshotMutex);
+        spSnapshot = m_tacticalHudSnapshot;
     }
+    if (!spSnapshot || !spSnapshot->Visible)
+        return;
+    const auto& snapshot = *spSnapshot;
 
     auto* pViewport = BSGraphics::GetMainWindow();
     if (!pViewport || pViewport->uiWindowWidth == 0 || pViewport->uiWindowHeight == 0)

@@ -170,7 +170,7 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
 
     case SyncRfabProgressionEvent::EventKind::BossEncounterSync:
     {
-        if (sourceKey == "boss_ghost" && pkt.XpDelta > 0)
+        if (sourceKey == "boss_ghost" && pkt.XpDelta != 0)
         {
             const uint32_t bossServerId = static_cast<uint32_t>(pkt.XpDelta);
             const entt::entity bossEntity = static_cast<entt::entity>(bossServerId);

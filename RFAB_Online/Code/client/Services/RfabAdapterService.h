@@ -7,7 +7,8 @@
 #include <common/Session/Lifecycle.h>
 #include <ThreadAffinity.h>
 #include <atomic>
-#include <mutex>
+#include <memory>
+#include <shared_mutex>
 #include <string>
 
 struct World;
@@ -89,6 +90,7 @@ public:
     void OnSessionBegin(const Session::Transition& acTransition) noexcept override;
     void OnSessionEnd(const Session::Transition& acTransition) noexcept override;
     void OnWorldLoadBegin(const Session::Transition& acTransition) noexcept override;
+    void OnWorldLoadEnd(const Session::Transition& acTransition) noexcept override;
 
 private:
     struct CoopCombatSnapshot : RfabCombatSnapshot
@@ -140,13 +142,15 @@ private:
     bool m_combatRulesFeatureApplied{true};
     bool m_tacticalHudFeatureApplied{true};
     double m_pollAccumulatorSec{0.0};
+    double m_snapshotAccumulatorSec{0.0};
     double m_controlMapHealAccumulatorSec{0.0};
 
-    mutable std::mutex m_coopSnapshotMutex{};
-    CoopCombatSnapshot m_coopCombatSnapshot{};
+    mutable std::shared_mutex m_coopSnapshotMutex{};
+    std::shared_ptr<const CoopCombatSnapshot> m_coopCombatSnapshot{std::make_shared<CoopCombatSnapshot>()};
 
-    mutable std::mutex m_tacticalHudSnapshotMutex{};
-    RfabTacticalHudRenderSnapshot m_tacticalHudSnapshot{};
+    mutable std::shared_mutex m_tacticalHudSnapshotMutex{};
+    std::shared_ptr<const RfabTacticalHudRenderSnapshot> m_tacticalHudSnapshot{
+        std::make_shared<RfabTacticalHudRenderSnapshot>()};
 
     entt::scoped_connection m_partyJoinedConnection;
     entt::scoped_connection m_partyLeftConnection;

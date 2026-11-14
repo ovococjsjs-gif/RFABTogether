@@ -373,7 +373,12 @@ TEST_CASE("v4.1.0 main-thread queue: many engine threads, one main thread, nothi
 {
     constexpr int kProducers = 6;
     constexpr int kPerProducer = 4000;
-    MainThreadQueue queue;
+    // 6 producers push ~8000 tasks into kAlways concurrently (exceeding the default 4096 burst cap
+    // if the drainer thread is temporarily descheduled by the OS). Size the test queue to hold the
+    // full burst so the ordering/accounting assertions stay deterministic under CI/sanitizer load.
+    MainThreadQueue queue(
+        MainThreadQueue::kDefaultSimulationCapacity,
+        static_cast<size_t>(kProducers) * kPerProducer);
 
     std::vector<std::vector<int>> seen(kProducers);
     std::atomic<int> started{0};

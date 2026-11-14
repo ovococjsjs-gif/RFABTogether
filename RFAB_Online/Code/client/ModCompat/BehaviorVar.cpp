@@ -94,12 +94,15 @@ void ProcessVariableSet(
 
     for (const auto& item : acVariables)
     {
+        if (item.empty())
+            continue;
+
         auto foundForm = item;
         auto found = acReverseMap.find(item);
         if (found == acReverseMap.end())
         {
             // Check if first letter incorrectly lowercase.
-            foundForm[0] = std::toupper(item[0]);
+            foundForm[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(item[0])));
             found = acReverseMap.find(foundForm);
         }
 
@@ -343,18 +346,33 @@ const AnimationGraphDescriptor* BehaviorVar::Patch(BSAnimationGraphManager* apMa
         return nullptr;
 
     auto hash = pExtendedActor->GraphDescriptorHash;
+    int dumpGraphIndex = -1;
     const AnimationGraphDescriptor* pGraph = AnimationGraphDescriptorManager::Get().GetDescriptor(hash);
 
-    // If it is the player-character AND they are in 1st person, we don't have the data to mod them;
-    // Use the base game animation graphs until a Master Behavior actor enters the room. Could be an NPC,
-    // but will always happen no later than when the 2nd person joins the server and room.
-    // Remote players are ALWAYS in 3rd person by definition
+    // Remote players are ALWAYS in 3rd person (graph 0 = Master_Behavior). When the local player (0x14)
+    // plays in 1st person (graph 1), inspect graph 0 directly so Nemesis/MCO/TUDM modded Master_Behavior
+    // descriptors are still discovered and synced accurately instead of falling back to vanilla indices!
     if (hexFormID == 0x14)
     {
         if (auto* pCam = PlayerCamera::Get(); pCam && pCam->IsFirstPerson())
         {
-            hash = AnimationGraphDescriptor_Master_Behavior::m_key;
-            pGraph = AnimationGraphDescriptorManager::Get().GetDescriptor(hash);
+            dumpGraphIndex = 0;
+            const uint64_t thirdPersonHash = apManager->GetDescriptorKey(0);
+            if (thirdPersonHash != 0)
+            {
+                hash = thirdPersonHash;
+                pGraph = AnimationGraphDescriptorManager::Get().GetDescriptor(hash);
+            }
+            if (!pGraph && m_humanoidGraphDescriptorHash != 0)
+            {
+                hash = m_humanoidGraphDescriptorHash;
+                pGraph = AnimationGraphDescriptorManager::Get().GetDescriptor(hash);
+            }
+            if (!pGraph && thirdPersonHash == 0)
+            {
+                hash = AnimationGraphDescriptor_Master_Behavior::m_key;
+                pGraph = AnimationGraphDescriptorManager::Get().GetDescriptor(hash);
+            }
         }
     }
 
@@ -386,7 +404,7 @@ const AnimationGraphDescriptor* BehaviorVar::Patch(BSAnimationGraphManager* apMa
     spdlog::info(__FUNCTION__ ": actor with formID {:x} with hash of {} has modded (or not synced) behavior", hexFormID, hash);
 
     // Get all animation variables for this actor, then create a acReverseMap to go from strings to animation enum.
-    auto pDumpVar = apManager->DumpAnimationVariables(false);
+    auto pDumpVar = apManager->DumpAnimationVariables(false, dumpGraphIndex);
     TiltedPhoques::Map<TiltedPhoques::String, uint32_t> reverseMap;
     spdlog::info("Known behavior variables for formID {:x}:", hexFormID);
     for (auto& item : pDumpVar)

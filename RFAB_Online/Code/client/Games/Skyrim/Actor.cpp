@@ -4,6 +4,7 @@
 #include <Misc/MiddleProcess.h>
 #include <Havok/bhkCharacterController.h>
 #include <CoopOwnership.h>
+#include <Authority/ActorValues.h>
 #include <Authority/Health.h>
 #include <Sync/HitImpact.h>
 #include <Authority/ScriptDamage.h>
@@ -965,18 +966,20 @@ ActorValues Actor::GetEssentialActorValues() const noexcept
         actorValues.ActorMaxValuesList.insert({i, maxValue});
     }
 
-    // Sync armor rating (kDamageResist = 39) & magic/elemental resistances (40..44) via PERMANENT so
-    // RFAB.dll ProcessHit / Shield Bash flat-damage armor mitigation and spell damage match across peers!
+    // Sync armor rating (kDamageResist = 39), magic/elemental resistances (40..44), and Spell Absorption (83)
+    // as current effective values so remote peers apply them via ForceMode::TEMPORARY delta without
+    // mutating PERMANENT/base AVs or compounding across ownership handoffs and .ess saves.
     const int defenseValues[] = {
         ActorValueInfo::kDamageResist,
         ActorValueInfo::kPoisonResist,
         ActorValueInfo::kFireResist,
         ActorValueInfo::kElectricResist,
         ActorValueInfo::kFrostResist,
-        ActorValueInfo::kMagicResist};
+        ActorValueInfo::kMagicResist,
+        ActorValueInfo::kAbsorbChance};
     for (int av : defenseValues)
     {
-        actorValues.ActorMaxValuesList.insert({av, actorValueOwner.GetValue(av)});
+        actorValues.ActorValuesList.insert({av, actorValueOwner.GetValue(av)});
     }
 
     return actorValues;
@@ -1143,13 +1146,6 @@ void Actor::SetMagicEquipment(const MagicEquipment& acEquipment) noexcept
 void Actor::SetActorValues(const ActorValues& acActorValues) noexcept
 {
     ScopedActorValueOverride avOverride;
-    auto isLocallyDerivedSpeedAv = [](uint32_t aAvId) constexpr noexcept
-    {
-        return aAvId == ActorValueInfo::kSpeedMult ||
-               aAvId == ActorValueInfo::kWeaponSpeedMult ||
-               aAvId == ActorValueInfo::kLeftWeaponSpeedMult ||
-               aAvId == ActorValueInfo::kInfamy;
-    };
 
     const bool keepAlive = !IsDead();
     const auto maxHpIt = acActorValues.ActorMaxValuesList.find(ActorValueInfo::kHealth);
@@ -1185,18 +1181,24 @@ void Actor::SetActorValues(const ActorValues& acActorValues) noexcept
 
     for (auto& value : acActorValues.ActorMaxValuesList)
     {
-        if (isLocallyDerivedSpeedAv(value.first) || value.first == ActorValueInfo::kHealth)
-            continue;
-
-        ForceActorValue(ActorValueOwner::ForceMode::PERMANENT, value.first, value.second);
+        const auto mode = Authority::ClassifyRemoteActorValueApplyMode(value.first, /*aIsMaxValuePacket=*/true);
+        if (mode == Authority::RemoteActorValueApplyMode::kPermanentDelta)
+            ForceActorValue(ActorValueOwner::ForceMode::PERMANENT, value.first, value.second);
     }
 
     for (auto& value : acActorValues.ActorValuesList)
     {
-        if (isLocallyDerivedSpeedAv(value.first) || value.first == ActorValueInfo::kHealth)
-            continue;
-
-        ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, value.first, value.second);
+        const auto mode = Authority::ClassifyRemoteActorValueApplyMode(value.first, /*aIsMaxValuePacket=*/false);
+        if (mode == Authority::RemoteActorValueApplyMode::kTemporaryTotalDelta)
+        {
+            const float delta = Authority::ComputeTemporaryTotalDelta(GetActorValue(value.first), value.second);
+            if (delta != 0.0f)
+                actorValueOwner.ForceCurrent(ActorValueOwner::ForceMode::TEMPORARY, value.first, delta);
+        }
+        else if (mode == Authority::RemoteActorValueApplyMode::kDamageDelta)
+        {
+            ForceActorValue(ActorValueOwner::ForceMode::DAMAGE, value.first, value.second);
+        }
     }
 }
 
@@ -1620,6 +1622,36 @@ struct ScopedNativeBleedoutNudgeGuard
     bool m_prev{false};
 };
 
+namespace
+{
+// Single lock-free enemy scaling predicate shared 1:1 by HookDamageActor and HookRestoreActorValue
+// so damage-estimate overkill/bleedout checks never diverge from actual 1/M RestoreActorValue scaling,
+// and unaggressive friendly town guards / civilians / remote peers' followers are never scaled as enemies.
+[[nodiscard]] bool ShouldScaleEnemyHealthTarget(Actor* apActor) noexcept
+{
+    if (!apActor)
+        return false;
+
+    const auto* pExt = apActor->GetExtension();
+    if (!pExt)
+        return false;
+
+    const bool isPlayerOrSummon = pExt->IsPlayer() || apActor->IsPlayerSummon() || pExt->IsPlayerSummonFlag();
+    const bool isHostileOrBoss =
+        apActor->IsDragon() ||
+        apActor->GetActorValue(ActorValueInfo::kAggression) >= 1.0f ||
+        (!apActor->IsEssential() && apActor->GetActorPermanentValue(ActorValueInfo::kHealth) >= 800.0f);
+
+    return Authority::ShouldScaleIncomingEnemyDamage(
+        pExt->IsPlayer(),
+        apActor->IsPlayerTeammate(),
+        isPlayerOrSummon,
+        apActor->IsCommandedActor(),
+        apActor->IsMount(),
+        isHostileOrBoss);
+}
+} // namespace
+
 // TODO: this is flawed, since it does not account for invulnerable actors
 bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bool aKillMove)
 {
@@ -1646,15 +1678,7 @@ bool TP_MAKE_THISCALL(HookDamageActor, Actor, float aDamage, Actor* apHitter, bo
     if (apHitter)
         World::Get().GetRunner().Trigger(HitEvent(apHitter->formID, apThis->formID));
 
-    const auto* pTargetExtForScale = apThis->GetExtension();
-    const bool scaleTargetIncomingDamage =
-        pTargetExtForScale &&
-        Authority::ShouldScaleIncomingEnemyDamage(
-            pTargetExtForScale->IsPlayer(),
-            apThis->IsPlayerTeammate(),
-            apThis->IsPlayerSummon(),
-            apThis->IsCommandedActor(),
-            apThis->IsMount());
+    const bool scaleTargetIncomingDamage = ShouldScaleEnemyHealthTarget(apThis);
 
     const float currentHealth = apThis->GetActorValue(ActorValueInfo::kHealth);
     const float rawEstimatedDamage = GameplayFormulas::CalculateRealDamage(apThis, aDamage, aKillMove);
@@ -1933,34 +1957,26 @@ void TP_MAKE_THISCALL(HookRestoreActorValue, Actor, ActorValueOwner::ForceMode a
         const float rawDeltaValue = aValue;
         if (!ScopedActorValueOverride::IsOverriden() && aValue != 0.0f)
         {
-            if (const auto* pScaleExt = apThis->GetExtension())
+            const bool shouldScaleEnemyTarget = ShouldScaleEnemyHealthTarget(apThis);
+            const float enemyMult = World::GetEnemyHealthMultiplierCached();
+            if (aValue < 0.0f)
             {
-                const bool shouldScaleEnemyTarget = Authority::ShouldScaleIncomingEnemyDamage(
-                    pScaleExt->IsPlayer(),
-                    apThis->IsPlayerTeammate(),
-                    apThis->IsPlayerSummon(),
-                    apThis->IsCommandedActor(),
-                    apThis->IsMount());
-                const float enemyMult = World::GetEnemyHealthMultiplierCached();
-                if (aValue < 0.0f)
-                {
-                    aValue = Authority::ScaleIncomingEnemyDamageDelta(
-                        aValue,
-                        enemyMult,
-                        shouldScaleEnemyTarget);
-                }
-                else
-                {
-                    const float nativeMaxHp = std::max(
-                        apThis->GetActorPermanentValue(ActorValueInfo::kHealth),
-                        apThis->GetActorValue(ActorValueInfo::kHealth));
-                    aValue = Authority::ScaleIncomingEnemyHealDelta(
-                        aValue,
-                        nativeMaxHp,
-                        enemyMult,
-                        shouldScaleEnemyTarget,
-                        s_inApplyActorEffect);
-                }
+                aValue = Authority::ScaleIncomingEnemyDamageDelta(
+                    aValue,
+                    enemyMult,
+                    shouldScaleEnemyTarget);
+            }
+            else
+            {
+                const float nativeMaxHp = std::max(
+                    apThis->GetActorPermanentValue(ActorValueInfo::kHealth),
+                    apThis->GetActorValue(ActorValueInfo::kHealth));
+                aValue = Authority::ScaleIncomingEnemyHealDelta(
+                    aValue,
+                    nativeMaxHp,
+                    enemyMult,
+                    shouldScaleEnemyTarget,
+                    s_inApplyActorEffect);
             }
         }
 

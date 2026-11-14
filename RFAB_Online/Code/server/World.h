@@ -64,7 +64,24 @@ struct World : entt::registry
 
     [[nodiscard]] static uint32_t ToInteger(entt::entity aEntity) { return to_integral(aEntity); }
 
+    // Reserve EnTT entity 0 so no real character/object/player ever receives ServerId == 0
+    // (which many client/server/protocol paths treat as "no entity / unassigned sentinel").
+    [[nodiscard]] bool valid(entt::entity aEntity) const noexcept
+    {
+        return aEntity != m_reservedZeroEntity && entt::registry::valid(aEntity);
+    }
+
+    auto destroy(entt::entity aEntity)
+    {
+        if (aEntity == m_reservedZeroEntity)
+            return version_type{};
+        return entt::registry::destroy(aEntity);
+    }
+
+    [[nodiscard]] entt::entity GetReservedZeroEntity() const noexcept { return m_reservedZeroEntity; }
+
 private:
+    entt::entity m_reservedZeroEntity{entt::null};
     entt::dispatcher m_dispatcher;
 
     TiltedPhoques::SharedPtr<AdminService> m_spAdminService;

@@ -165,7 +165,7 @@ bool PatchRelativeCallSite(uintptr_t aCallSiteAddr, void* apDetourFn, TFn** appO
 bool TP_MAKE_THISCALL(HookLoadEntry, BGSSaveLoadManager, void* apFileEntry, uint64_t aArg2, uint64_t aArg3, uint64_t aArg4, uint64_t aArg5)
 {
     RFAB_EXPECT_MAIN_THREAD("HookLoadEntry");
-    if (!s_universalHooksInstalled.load(std::memory_order_acquire))
+    if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealLoadEntry, apThis, apFileEntry, aArg2, aArg3, aArg4, aArg5);
 
     const char* saveName = ExtractSaveNameFromFileEntry(apFileEntry);
@@ -179,6 +179,9 @@ bool TP_MAKE_THISCALL(HookLoadEntry, BGSSaveLoadManager, void* apFileEntry, uint
 bool TP_MAKE_THISCALL(HookLoadCallSite, BGSSaveLoadManager, uint64_t* apUnk0, uint32_t aUnk1, uint32_t aUnk2, void* apUnk3)
 {
     RFAB_EXPECT_MAIN_THREAD("HookLoadCallSite");
+    if (!World::IsCreated())
+        return TiltedPhoques::ThisCall(RealLoadCallSite, apThis, apUnk0, aUnk1, aUnk2, apUnk3);
+
     const char* saveName = ExtractSaveNameFromContext(apUnk0);
     auto& coord = World::Get().GetCoordinatedSaveService();
 
@@ -194,7 +197,7 @@ bool TP_MAKE_THISCALL(HookLoadCallSite, BGSSaveLoadManager, uint64_t* apUnk0, ui
 bool TP_MAKE_THISCALL(HookSaveImpl, BGSSaveLoadManager, int32_t aDeviceId, uint32_t aOutputStats, const char* acpFileName)
 {
     RFAB_EXPECT_MAIN_THREAD("HookSaveImpl");
-    if (!s_universalHooksInstalled.load(std::memory_order_acquire))
+    if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealSaveImpl, apThis, aDeviceId, aOutputStats, acpFileName);
 
     if (s_inDirectProcessEventsSave)
@@ -216,7 +219,7 @@ bool TP_MAKE_THISCALL(HookSaveImpl, BGSSaveLoadManager, int32_t aDeviceId, uint3
 bool TP_MAKE_THISCALL(HookSaveGame2, BGSSaveLoadManager, uint64_t aArg1, uint64_t aArg2, uint64_t aArg3)
 {
     RFAB_EXPECT_MAIN_THREAD("HookSaveGame2");
-    if (!s_universalHooksInstalled.load(std::memory_order_acquire))
+    if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealSaveGame2, apThis, aArg1, aArg2, aArg3);
 
     auto& coord = World::Get().GetCoordinatedSaveService();
@@ -233,7 +236,7 @@ bool TP_MAKE_THISCALL(HookSaveGame2, BGSSaveLoadManager, uint64_t aArg1, uint64_
 bool TP_MAKE_THISCALL(HookLoadImpl, BGSSaveLoadManager, const char* acpFileName, int32_t aDeviceId, uint32_t aOutputStats, bool aCheckForMods)
 {
     RFAB_EXPECT_MAIN_THREAD("HookLoadImpl");
-    if (!s_universalHooksInstalled.load(std::memory_order_acquire))
+    if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealLoadImpl, apThis, acpFileName, aDeviceId, aOutputStats, aCheckForMods);
 
     if (!World::Get().GetCoordinatedSaveService().HandleEngineLoadAttempt(acpFileName))
@@ -245,7 +248,7 @@ bool TP_MAKE_THISCALL(HookLoadImpl, BGSSaveLoadManager, const char* acpFileName,
 bool TP_MAKE_THISCALL(HookLoadMostRecent, BGSSaveLoadManager)
 {
     RFAB_EXPECT_MAIN_THREAD("HookLoadMostRecent");
-    if (!s_universalHooksInstalled.load(std::memory_order_acquire))
+    if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealLoadMostRecent, apThis);
 
     if (!World::Get().GetCoordinatedSaveService().HandleEngineLoadAttempt(""))
@@ -257,7 +260,7 @@ bool TP_MAKE_THISCALL(HookLoadMostRecent, BGSSaveLoadManager)
 void TP_MAKE_THISCALL(HookQueueSaveLoadTask, BGSSaveLoadManager, uint32_t aTaskMask)
 {
     RFAB_EXPECT_MAIN_THREAD("HookQueueSaveLoadTask");
-    if (!s_universalHooksInstalled.load(std::memory_order_acquire))
+    if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
     {
         TiltedPhoques::ThisCall(RealQueueSaveLoadTask, apThis, aTaskMask);
         return;
@@ -301,7 +304,7 @@ void TP_MAKE_THISCALL(HookProcessEvents, BGSSaveLoadManager)
     RFAB_EXPECT_MAIN_THREAD("HookProcessEvents");
     TiltedPhoques::ThisCall(RealProcessEvents, apThis);
 
-    if (!s_universalHooksInstalled.load(std::memory_order_acquire))
+    if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return;
 
     World::Get().GetCoordinatedSaveService().ProcessReadyDeferredSaveOrLoad(apThis);
@@ -414,10 +417,6 @@ bool BGSSaveLoadManager::VerifySavedSlotOnDisk(const char* acpFileName) noexcept
     if (!acpFileName || acpFileName[0] == '\0')
         return false;
 
-    const std::string stem = RfabCompat::Detail::StripSaveSlotExtensionPreserveCase(acpFileName);
-    if (stem.empty())
-        return false;
-
     try
     {
         const std::filesystem::path savesDir = ResolveLocalSavesDirectory();
@@ -428,42 +427,39 @@ bool BGSSaveLoadManager::VerifySavedSlotOnDisk(const char* acpFileName) noexcept
         if (!std::filesystem::exists(savesDir, ec) || ec)
             return true;
 
-        const std::string targetNorm = RfabCompat::Detail::NormalizeSaveSlotStem(stem);
-        const std::wstring wStem(stem.begin(), stem.end());
-        const std::filesystem::path directCandidate = savesDir / (wStem + L".ess");
-        if (std::filesystem::exists(directCandidate, ec) && !ec)
-            return RfabCompat::Detail::IsValidEssFileOnDisk(directCandidate);
-
-        for (const auto& entry : std::filesystem::directory_iterator(savesDir, ec))
+        std::string altAnsiAsUtf8;
+#ifdef _WIN32
+        const int rawLen = static_cast<int>(std::strlen(acpFileName));
+        if (rawLen > 0)
         {
-            if (ec)
-                break;
-
-            std::error_code entryEc;
-            if (entry.is_regular_file(entryEc) && !entryEc)
+            const int wLen = MultiByteToWideChar(CP_ACP, 0, acpFileName, rawLen, nullptr, 0);
+            if (wLen > 0)
             {
-                const auto u8Name = entry.path().filename().u8string();
-                const std::string fn(reinterpret_cast<const char*>(u8Name.data()), u8Name.size());
-                if (RfabCompat::Detail::EndsWithIgnoreCase(fn, ".ess") &&
-                    RfabCompat::Detail::NormalizeSaveSlotStem(fn) == targetNorm)
+                std::wstring wide(static_cast<size_t>(wLen), L'\0');
+                if (MultiByteToWideChar(CP_ACP, 0, acpFileName, rawLen, wide.data(), wLen) > 0)
                 {
-                    return RfabCompat::Detail::IsValidEssFileOnDisk(entry.path());
+                    const int u8Len = WideCharToMultiByte(CP_UTF8, 0, wide.data(), wLen, nullptr, 0, nullptr, nullptr);
+                    if (u8Len > 0)
+                    {
+                        altAnsiAsUtf8.resize(static_cast<size_t>(u8Len));
+                        (void)WideCharToMultiByte(
+                            CP_UTF8, 0, wide.data(), wLen, altAnsiAsUtf8.data(), u8Len, nullptr, nullptr);
+                    }
                 }
             }
-            else if (entry.is_directory(entryEc) && !entryEc)
-            {
-                const std::filesystem::path subCandidate = entry.path() / (wStem + L".ess");
-                if (std::filesystem::exists(subCandidate, entryEc) && !entryEc)
-                    return RfabCompat::Detail::IsValidEssFileOnDisk(subCandidate);
-            }
         }
+#endif
+        const std::filesystem::path resolved = RfabCompat::Detail::ResolveExistingEssSlotPath(
+            savesDir, std::string_view(acpFileName), altAnsiAsUtf8);
+        if (resolved.empty())
+            return false;
+
+        return RfabCompat::Detail::IsValidEssFileOnDisk(resolved);
     }
     catch (...)
     {
         return false;
     }
-
-    return false;
 }
 
 size_t BGSSaveLoadManager::QuarantineCorruptSavesOnce() noexcept

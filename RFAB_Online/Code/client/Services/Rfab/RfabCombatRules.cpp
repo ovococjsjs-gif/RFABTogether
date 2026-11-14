@@ -475,7 +475,7 @@ void RfabCombatRules::ApplyBossEncounterSyncEvent(
     const NotifyRfabProgressionEvent& acMessage) noexcept
 {
     const std::string sourceKey(acMessage.SourceKey.c_str(), acMessage.SourceKey.size());
-    if (sourceKey == "boss_ghost" && acMessage.XpDelta > 0)
+    if (sourceKey == "boss_ghost" && acMessage.XpDelta != 0)
     {
         const uint32_t bossServerId = static_cast<uint32_t>(acMessage.XpDelta);
         const bool isGhost = (acMessage.GlobalValue >= 0.5f);

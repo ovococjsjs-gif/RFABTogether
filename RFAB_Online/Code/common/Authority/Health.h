@@ -36,9 +36,10 @@ namespace Authority
     bool aIsPlayerTeammate,
     bool aIsPlayerSummon,
     bool aIsCommandedActor,
-    bool aIsMount) noexcept
+    bool aIsMount,
+    bool aIsHostileOrBoss = true) noexcept
 {
-    return !aIsPlayer && !aIsPlayerTeammate && !aIsPlayerSummon && !aIsCommandedActor && !aIsMount;
+    return aIsHostileOrBoss && !aIsPlayer && !aIsPlayerTeammate && !aIsPlayerSummon && !aIsCommandedActor && !aIsMount;
 }
 
 [[nodiscard]] inline float ScaleIncomingEnemyDamageDelta(

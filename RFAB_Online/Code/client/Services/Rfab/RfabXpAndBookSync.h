@@ -35,7 +35,7 @@ public:
 
     void ApplySessionNoDeathHandling(RfabFormResolver& aResolver) noexcept;
     void RestoreSessionNoDeathHandling() noexcept;
-    void EnforceNoDeathHandlingTick() noexcept;
+    void EnforceNoDeathHandlingTick(RfabFormResolver& aResolver) noexcept;
 
     void SeedReadBooksOnConnect(RfabFormResolver& aResolver) noexcept;
     void ResetRuntimeWatches() noexcept;

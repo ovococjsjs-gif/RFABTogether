@@ -83,8 +83,18 @@ void RfabXpAndBookSync::RestoreSessionNoDeathHandling() noexcept
     m_pNoDeathHandlingGlobal = nullptr;
 }
 
-void RfabXpAndBookSync::EnforceNoDeathHandlingTick() noexcept
+void RfabXpAndBookSync::EnforceNoDeathHandlingTick(RfabFormResolver& aResolver) noexcept
 {
+    if (!m_pNoDeathHandlingGlobal)
+    {
+        m_pNoDeathHandlingGlobal = aResolver.ResolveNoDeathHandlingGlobal();
+        if (m_pNoDeathHandlingGlobal && !m_hasSavedNoDeathHandlingValue)
+        {
+            m_savedNoDeathHandlingValue = m_pNoDeathHandlingGlobal->f;
+            m_hasSavedNoDeathHandlingValue = true;
+        }
+    }
+
     if (m_pNoDeathHandlingGlobal && m_pNoDeathHandlingGlobal->f < 1.0f)
         m_pNoDeathHandlingGlobal->f = 1.0f;
 }

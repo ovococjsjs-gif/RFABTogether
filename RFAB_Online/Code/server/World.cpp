@@ -23,6 +23,9 @@
 
 World::World()
 {
+    // Claim entity 0 up front before any service or checkpoint hydration creates entities.
+    m_reservedZeroEntity = create();
+
     m_spAdminService = std::make_shared<AdminService>(*this, m_dispatcher);
     spdlog::default_logger()->sinks().push_back(std::static_pointer_cast<spdlog::sinks::sink>(m_spAdminService));
 

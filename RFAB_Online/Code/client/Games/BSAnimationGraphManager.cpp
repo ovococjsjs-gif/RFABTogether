@@ -7,14 +7,15 @@
 
 #include <TiltedCore/Hash.hpp>
 
-SortedMap<uint32_t, String> BSAnimationGraphManager::DumpAnimationVariables(bool aPrintVariables)
+SortedMap<uint32_t, String> BSAnimationGraphManager::DumpAnimationVariables(bool aPrintVariables, int aForceIndex)
 {
     BSSpinLockGuard _{lock};
     SortedMap<uint32_t, String> variables;
 
-    if (animationGraphIndex < animationGraphs.size)
+    const uint32_t targetIdx = aForceIndex == -1 ? animationGraphIndex : static_cast<uint32_t>(aForceIndex);
+    if (targetIdx < animationGraphs.size)
     {
-        const auto pGraph = animationGraphs.Get(animationGraphIndex);
+        const auto pGraph = animationGraphs.Get(targetIdx);
         if (pGraph && pGraph->hkxDB && pGraph->behaviorGraph)
         {
             const auto pDb = pGraph->hkxDB;

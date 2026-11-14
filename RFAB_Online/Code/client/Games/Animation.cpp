@@ -61,12 +61,12 @@ uint8_t TP_MAKE_THISCALL(HookPerformAction, ActorMediator, TESActionData* apActi
         action.IdleId = apAction->idleForm ? apAction->idleForm->formID : 0;
 
         // Save for later (thread-safe sharded store: HookPerformAction executes on Skyrim AI worker threads!)
-        if (res && pActor->formID != 0)
+        if (res)
         {
-            ActorExtension::SetLatestAnimation(pActor->formID, action);
+            if (pActor->formID != 0)
+                ActorExtension::SetLatestAnimation(pActor->formID, action);
+            World::Get().GetRunner().Trigger(action);
         }
-
-        World::Get().GetRunner().Trigger(action);
 
         return res;
     }
