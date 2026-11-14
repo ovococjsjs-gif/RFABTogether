@@ -1,0 +1,274 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="700" viewBox="0 0 900 700" role="img" aria-label="Пеликан на велосипеде">
+  <title>Пеликан на велосипеде</title>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8fd3f4"/>
+      <stop offset="0.55" stop-color="#cdebfb"/>
+      <stop offset="1" stop-color="#f2fbff"/>
+    </linearGradient>
+    <radialGradient id="sunGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0.45" stop-color="#fff0b8" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#fff0b8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="bodyGrad" x1="0.15" y1="0" x2="0.7" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.6" stop-color="#f7fafc"/>
+      <stop offset="1" stop-color="#dee7ef"/>
+    </linearGradient>
+    <linearGradient id="beakGrad" x1="0" y1="0" x2="0.2" y2="1">
+      <stop offset="0" stop-color="#ffd073"/>
+      <stop offset="1" stop-color="#f39c12"/>
+    </linearGradient>
+    <linearGradient id="pouchGrad" x1="0.1" y1="0" x2="0.45" y2="1">
+      <stop offset="0" stop-color="#f9ad52"/>
+      <stop offset="1" stop-color="#dc6d1a"/>
+    </linearGradient>
+    <linearGradient id="frameGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#48c6b4"/>
+      <stop offset="1" stop-color="#1b7f74"/>
+    </linearGradient>
+    <linearGradient id="roadGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8593a1"/>
+      <stop offset="1" stop-color="#596674"/>
+    </linearGradient>
+    <linearGradient id="meadowGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9dd99b"/>
+      <stop offset="1" stop-color="#72bc7d"/>
+    </linearGradient>
+    <linearGradient id="hillGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#aadeb9"/>
+      <stop offset="1" stop-color="#7cc898"/>
+    </linearGradient>
+    <linearGradient id="wingGrad" x1="0.1" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.7" stop-color="#eaf0f6"/>
+      <stop offset="1" stop-color="#cdd9e3"/>
+    </linearGradient>
+  </defs>
+
+  <!-- ===== Фон ===== -->
+  <rect width="900" height="700" fill="url(#sky)"/>
+
+  <circle cx="762" cy="118" r="120" fill="url(#sunGlow)"/>
+  <circle cx="762" cy="118" r="52" fill="#ffe9a3"/>
+
+  <g fill="#ffffff" opacity="0.92">
+    <path d="M120 168c-4-22 14-38 34-34 8-16 32-20 44-8 18-8 40 4 40 22 16-2 26 10 24 22H120z"/>
+    <path d="M392 96c-2-16 12-28 26-25 6-12 24-15 33-6 14-6 30 3 30 17 12-2 20 7 18 16H392z" opacity="0.85"/>
+    <path d="M648 258c-3-17 11-30 27-27 6-13 25-16 34-6 15-6 31 4 31 18 12-2 21 8 18 17H648z" opacity="0.75"/>
+  </g>
+
+  <g stroke="#84b6cf" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.8">
+    <path d="M150 212q10-8 20 0"/>
+    <path d="M186 198q9-7 18 0"/>
+    <path d="M214 222q8-6 16 0"/>
+  </g>
+
+  <!-- холмы -->
+  <path d="M0 470V432c60-36 118-46 176-22 44 18 78 20 118 6 46-16 92-14 134 6 54 26 112 26 170 2 50-20 102-16 152 4 46 18 96 18 150 0v42z" fill="url(#hillGrad)"/>
+
+  <!-- луг -->
+  <rect y="464" width="900" height="118" fill="url(#meadowGrad)"/>
+
+  <!-- дорога -->
+  <rect y="578" width="900" height="122" fill="url(#roadGrad)"/>
+  <path d="M0 578h900" stroke="#4d5966" stroke-width="4" opacity="0.55"/>
+  <g stroke="#f4f7f9" stroke-width="8" stroke-linecap="round" opacity="0.75">
+    <path d="M40 654h76"/>
+    <path d="M168 654h76"/>
+    <path d="M296 654h76"/>
+    <path d="M424 654h76"/>
+    <path d="M552 654h76"/>
+    <path d="M680 654h76"/>
+    <path d="M808 654h76"/>
+  </g>
+
+  <!-- травяные кустики -->
+  <g stroke="#4f9a5c" stroke-width="6" stroke-linecap="round" fill="none">
+    <path d="M46 566q-4-22 6-34"/>
+    <path d="M60 566q2-20 14-28"/>
+    <path d="M76 566q10-16 22-18"/>
+    <path d="M806 566q-4-22 6-34"/>
+    <path d="M822 566q2-20 14-28"/>
+    <path d="M838 566q10-16 22-18"/>
+  </g>
+
+  <!-- линии скорости -->
+  <g stroke="#ffffff" stroke-width="9" stroke-linecap="round" opacity="0.75">
+    <path d="M92 300h92"/>
+    <path d="M64 350h74"/>
+    <path d="M110 400h84"/>
+  </g>
+
+  <!-- тень -->
+  <ellipse cx="466" cy="596" rx="258" ry="17" fill="#3b4a56" opacity="0.18"/>
+
+  <!-- пыль из-под колёс -->
+  <g fill="#eef3f7" opacity="0.9">
+    <circle cx="236" cy="556" r="15"/>
+    <circle cx="204" cy="538" r="11"/>
+    <circle cx="178" cy="560" r="8"/>
+  </g>
+
+  <!-- ===== Дальняя нога, дальний шатун и педаль (за рамой) ===== -->
+  <g id="leg-far">
+    <path d="M398 330 386 406 410 470" fill="none" stroke="#22303c" stroke-width="21" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M398 330 386 406 410 470" fill="none" stroke="#d98811" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+    <g fill="#c97c10" stroke="#22303c" stroke-width="4" stroke-linejoin="round">
+      <path d="M400 466c12-8 30-6 42 4-9 3-15 8-18 15-7-7-16-11-24-11 0-4 0-6 0-8z"/>
+    </g>
+  </g>
+
+  <!-- ===== Велосипед ===== -->
+  <g id="bicycle">
+    <!-- заднее колесо -->
+    <g id="wheel-rear">
+      <circle cx="300" cy="505" r="88" fill="none" stroke="#26333d" stroke-width="15"/>
+      <circle cx="300" cy="505" r="76" fill="none" stroke="#dde5ec" stroke-width="6"/>
+      <g stroke="#b3c0cb" stroke-width="4" stroke-linecap="round">
+        <g transform="translate(300 505)">
+          <line x1="0" y1="-73" x2="0" y2="73"/>
+          <line x1="0" y1="-73" x2="0" y2="73" transform="rotate(30)"/>
+          <line x1="0" y1="-73" x2="0" y2="73" transform="rotate(60)"/>
+          <line x1="0" y1="-73" x2="0" y2="73" transform="rotate(90)"/>
+          <line x1="0" y1="-73" x2="0" y2="73" transform="rotate(120)"/>
+          <line x1="0" y1="-73" x2="0" y2="73" transform="rotate(150)"/>
+        </g>
+      </g>
+      <circle cx="300" cy="505" r="13" fill="#6e7d8a" stroke="#26333d" stroke-width="4"/>
+      <circle cx="300" cy="505" r="17" fill="none" stroke="#8c9aa6" stroke-width="4"/>
+    </g>
+
+    <!-- переднее колесо -->
+    <g id="wheel-front">
+      <circle cx="620" cy="505" r="88" fill="none" stroke="#26333d" stroke-width="15"/>
+      <circle cx="620" cy="505" r="76" fill="none" stroke="#dde5ec" stroke-width="6"/>
+      <g stroke="#b3c0cb" stroke-width="4" stroke-linecap="round">
+        <g transform="translate(620 505)">
+          <line x1="0" y1="-73" x2="0" y2="73"/>
+          <line x1="0" y1="-73" x2="0" y2="73" transform="rotate(30)"/>
+          <line x1="0" y1="-73" x2="0" y2="73" transform="rotate(60)"/>
+          <line x1="0" y1="-73" x2="0" y2="73" transform="rotate(90)"/>
+          <line x1="0" y1="-73" x2="0" y2="73" transform="rotate(120)"/>
+          <line x1="0" y1="-73" x2="0" y2="73" transform="rotate(150)"/>
+        </g>
+      </g>
+      <circle cx="620" cy="505" r="13" fill="#6e7d8a" stroke="#26333d" stroke-width="4"/>
+    </g>
+
+    <!-- цепь -->
+    <g stroke="#4a5a66" stroke-width="5" stroke-linecap="round" fill="none">
+      <path d="M455 474 300 489"/>
+      <path d="M455 526 300 521"/>
+    </g>
+
+    <!-- дальняя педаль -->
+    <rect x="386" y="472" width="50" height="12" rx="6" fill="#3c4b57" transform="rotate(26 411 478)"/>
+
+    <!-- рама -->
+    <g fill="none" stroke="url(#frameGrad)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M455 500 390 352"/>
+      <path d="M455 500 600 405"/>
+      <path d="M390 352 585 370"/>
+      <path d="M600 405 620 505"/>
+      <path d="M455 500 302 505"/>
+      <path d="M390 352 302 505"/>
+      <path d="M585 370 600 405"/>
+    </g>
+
+    <!-- подседельный штырь и седло -->
+    <path d="M392 348 402 322" stroke="#5a6a77" stroke-width="10" stroke-linecap="round"/>
+    <path d="M336 330c-12-6-14-20 2-24l64-2c16 2 22 16 8 24-18 10-52 10-74 2z" fill="#7a4b36" stroke="#26333d" stroke-width="5" stroke-linejoin="round"/>
+
+    <!-- руль -->
+    <path d="M585 370 574 330" fill="none" stroke="#26333d" stroke-width="9" stroke-linecap="round"/>
+    <path d="M544 330q30-16 58 4" fill="none" stroke="#4a5a66" stroke-width="9" stroke-linecap="round"/>
+    <path d="M534 326 546 330" stroke="#22303c" stroke-width="15" stroke-linecap="round"/>
+    <circle cx="584" cy="352" r="7" fill="#ffcf5c" stroke="#22303c" stroke-width="3"/>
+
+    <!-- звезда и шатуны -->
+    <circle cx="455" cy="500" r="27" fill="none" stroke="#5a6a77" stroke-width="7"/>
+    <circle cx="455" cy="500" r="9" fill="#6e7d8a" stroke="#26333d" stroke-width="4"/>
+    <path d="M455 500 410 478" stroke="#5a6a77" stroke-width="9" stroke-linecap="round"/>
+    <path d="M455 500 498 521" stroke="#3c4b57" stroke-width="9" stroke-linecap="round"/>
+  </g>
+
+  <!-- ===== Пеликан ===== -->
+  <g id="pelican">
+    <!-- хвост -->
+    <g fill="#eef3f7" stroke="#22303c" stroke-width="5" stroke-linejoin="round">
+      <path d="M324 268C296 254 268 236 246 216c30 0 62 16 88 38z"/>
+      <path d="M328 282c-32-8-64-18-88-30 26-6 62 2 96 16z"/>
+      <path d="M332 296c-28 0-58-4-80-14 24-10 58-6 88 2z"/>
+    </g>
+
+    <!-- тело -->
+    <ellipse cx="390" cy="276" rx="96" ry="74" fill="url(#bodyGrad)" stroke="#22303c" stroke-width="6" transform="rotate(-8 390 276)"/>
+
+    <!-- перья на груди -->
+    <g fill="none" stroke="#d3dde7" stroke-width="4" stroke-linecap="round">
+      <path d="M404 314q16-6 32 0"/>
+      <path d="M414 332q14-5 28 0"/>
+      <path d="M350 328q14-4 26 2"/>
+    </g>
+
+    <!-- шея -->
+    <g fill="none" stroke-linecap="round">
+      <path d="M436 250c10-52 38-84 78-96" stroke="#22303c" stroke-width="48"/>
+      <path d="M436 250c10-52 38-84 78-96" stroke="#f8fbfd" stroke-width="36"/>
+    </g>
+
+    <!-- голова -->
+    <circle cx="524" cy="150" r="34" fill="#fafcfe" stroke="#22303c" stroke-width="6"/>
+    <!-- хохолок -->
+    <path d="M506 118c-10-8-14-20-10-30 8 8 16 12 26 12-4 8-10 14-16 18z" fill="#f2f6fa" stroke="#22303c" stroke-width="4" stroke-linejoin="round"/>
+
+    <!-- клюв: надклювье -->
+    <path d="M552 138c48 4 106 20 148 50-14 10-42 14-72 12l-66-16c-14-12-16-30-10-46z" fill="url(#beakGrad)" stroke="#22303c" stroke-width="5" stroke-linejoin="round"/>
+    <path d="M578 156l14 2" stroke="#b9710d" stroke-width="4" stroke-linecap="round"/>
+
+    <!-- клюв: горловой мешок -->
+    <path d="M560 184c62 14 108 18 140 4-8 54-48 84-88 78-36-6-58-42-52-82z" fill="url(#pouchGrad)" stroke="#22303c" stroke-width="5" stroke-linejoin="round"/>
+    <g fill="none" stroke="#c96a17" stroke-width="4" stroke-linecap="round" opacity="0.6">
+      <path d="M606 210c4 26 16 44 34 52"/>
+      <path d="M636 214c6 24 16 38 30 44"/>
+    </g>
+
+    <!-- глаз -->
+    <circle cx="527" cy="142" r="12" fill="#ffffff" stroke="#22303c" stroke-width="3"/>
+    <circle cx="530" cy="143" r="6" fill="#22303c"/>
+    <circle cx="532" cy="140" r="2.2" fill="#ffffff"/>
+    <path d="M512 124q12-8 24-2" fill="none" stroke="#22303c" stroke-width="4" stroke-linecap="round"/>
+
+    <!-- ближнее крыло -->
+    <path d="M446 234c58 4 110 48 130 88 5 10-4 18-14 13l-20-11 10 18c-5 5-15 2-21-5l-10 3c-20-11-48-33-66-58-16-22-19-48 1-48z" fill="url(#wingGrad)" stroke="#22303c" stroke-width="6" stroke-linejoin="round"/>
+    <g fill="none" stroke="#c3d0dc" stroke-width="4" stroke-linecap="round">
+      <path d="M486 258c26 18 50 40 62 62"/>
+      <path d="M462 280c22 16 42 36 54 56"/>
+      <path d="M520 292c16 12 28 26 36 42"/>
+    </g>
+    <g fill="#33424e">
+      <path d="M556 320c8-2 15 3 18 10-7 2-14 1-20-4z"/>
+      <path d="M540 310c8-3 15 1 18 8-7 3-14 2-20-3z"/>
+    </g>
+
+    <!-- ближняя нога -->
+    <path d="M432 332 470 416 498 512" fill="none" stroke="#22303c" stroke-width="23" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M432 332 470 416 498 512" fill="none" stroke="#f59c14" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="470" cy="416" r="9" fill="#f59c14" stroke="#22303c" stroke-width="4"/>
+
+    <!-- ближняя педаль и лапа -->
+    <rect x="470" y="515" width="56" height="12" rx="6" fill="#3c4b57" transform="rotate(6 498 521)"/>
+    <path d="M484 512c14-10 34-6 46 6-10 3-16 9-19 17-7-9-16-14-27-14z" fill="#f59c14" stroke="#22303c" stroke-width="4" stroke-linejoin="round"/>
+    <g stroke="#d98811" stroke-width="3" stroke-linecap="round">
+      <path d="M500 512v14"/>
+      <path d="M512 514v12"/>
+    </g>
+  </g>
+
+  <!-- блики на дороге -->
+  <g stroke="#ffffff" stroke-width="3" stroke-linecap="round" opacity="0.18">
+    <path d="M120 600h180"/>
+    <path d="M560 612h220"/>
+  </g>
+</svg>
