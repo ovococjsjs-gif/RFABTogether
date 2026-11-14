@@ -6,6 +6,7 @@
 #include <Structs/Inventory.h>
 #include <Structs/LockData.h>
 #include <TiltedCore/Stl.hpp>
+#include <World/UnlockMemory.h>
 
 struct World;
 struct PlayerLeaveCellEvent;
@@ -30,6 +31,10 @@ public:
         const LockData& acLockData,
         const Inventory& acInventory) noexcept;
 
+    // The world went back to an earlier moment (checkpoint or pre-join reload): unlocks reported
+    // for objects nobody has registered since then never happened.
+    void ForgetUnregisteredUnlocks() noexcept { m_unlockMemory.Clear(); }
+
 private:
     static constexpr uint64_t PackGameIdKey(const GameId& acId) noexcept
     {
@@ -46,6 +51,8 @@ private:
 
     World& m_world;
     TiltedPhoques::Map<uint64_t, entt::entity> m_objectEntityByKey;
+    // Unlocks reported for objects no client has registered yet (work plan 5.4, defect M23).
+    WorldObjects::UnlockMemory<> m_unlockMemory;
 
     entt::scoped_connection m_objectRemovedConnection;
     entt::scoped_connection m_leaveCellConnection;

@@ -15,6 +15,18 @@
 #include <Messages/ScriptAnimationRequest.h>
 #include <Messages/NotifyScriptAnimation.h>
 
+#include <Setting.h>
+
+// Work plan 5.4 / defect M23. A client registers the doors and containers of the cell its player
+// stands in and reports every lock change; a lock picked across an exterior cell border reaches
+// the server for an object it has no record of. On: the unlock is remembered and the player who
+// registers the object first is told it is unlocked. Off = 4.1.0: the unlock is relayed to the
+// players in range and forgotten, and the first registration decides.
+Console::Setting bEnableUnlockMemory{
+    "Gameplay:bEnableUnlockMemory",
+    "(RFAB) An unlock of a door or container the server has not registered yet is remembered for whoever registers it (off = 4.1.0: relayed to players in range and forgotten)",
+    true};
+
 namespace
 {
 constexpr size_t kMaxUntouchedCachedObjects = 16384;
@@ -153,6 +165,8 @@ void ObjectService::OnAssignObjectsRequest(const PacketEvent<AssignObjectsReques
         return;
 
     AssignObjectsResponse response;
+    // Objects this registration created whose lock a party member had already opened.
+    TiltedPhoques::Vector<NotifyLockChange> rememberedUnlocks;
 
     for (const ObjectData& object : acMessage.Packet.Objects)
     {
@@ -219,6 +233,25 @@ void ObjectService::OnAssignObjectsRequest(const PacketEvent<AssignObjectsReques
             auto& objectComponent = m_world.emplace<ObjectComponent>(cEntity);
             objectComponent.CurrentLockData = object.CurrentLockData;
 
+            if (bEnableUnlockMemory)
+            {
+                const auto lock = WorldObjects::ResolveRegistrationLock(
+                    object.CurrentLockData.IsLocked, object.CurrentLockData.LockLevel, m_unlockMemory.Take(key));
+                if (lock.TellRegistrant)
+                {
+                    objectComponent.CurrentLockData.IsLocked = lock.IsLocked;
+                    objectComponent.CurrentLockData.LockLevel = lock.LockLevel;
+                    // Server-held state from now on: kept in checkpoints, never pruned as untouched.
+                    objectComponent.HasAuthoritativeMutation = true;
+
+                    NotifyLockChange unlock{};
+                    unlock.Id = object.Id;
+                    unlock.IsLocked = false;
+                    unlock.LockLevel = lock.LockLevel;
+                    rememberedUnlocks.push_back(unlock);
+                }
+            }
+
             GameId worldSpaceId = object.WorldSpaceId;
             GridCellCoords coords = object.CurrentCoords;
             if (!worldSpaceId && acMessage.pPlayer->GetCellComponent().WorldSpaceId)
@@ -246,6 +279,11 @@ void ObjectService::OnAssignObjectsRequest(const PacketEvent<AssignObjectsReques
 
     if (!response.Objects.empty())
         acMessage.pPlayer->Send(response);
+
+    // After the response, so the registrant knows the object when it is told to unlock it. The
+    // registrant keeps its own contents (it is the first to register); only the lock differs.
+    for (const NotifyLockChange& unlock : rememberedUnlocks)
+        acMessage.pPlayer->Send(unlock);
 }
 
 void ObjectService::OnActivate(const PacketEvent<ActivateRequest>& acMessage) const noexcept
@@ -285,14 +323,19 @@ void ObjectService::OnLockChange(const PacketEvent<LockChangeRequest>& acMessage
 
     const uint64_t key = PackGameIdKey(acMessage.Packet.Id);
     const auto mapIt = m_objectEntityByKey.find(key);
-    if (mapIt != m_objectEntityByKey.end() && m_world.valid(mapIt->second))
+    auto* pObjectComponent =
+        (mapIt != m_objectEntityByKey.end() && m_world.valid(mapIt->second)) ? m_world.try_get<ObjectComponent>(mapIt->second) : nullptr;
+    if (pObjectComponent)
     {
-        if (auto* pObjectComponent = m_world.try_get<ObjectComponent>(mapIt->second))
-        {
-            pObjectComponent->CurrentLockData.IsLocked = acMessage.Packet.IsLocked;
-            pObjectComponent->CurrentLockData.LockLevel = acMessage.Packet.LockLevel;
-            pObjectComponent->HasAuthoritativeMutation = true;
-        }
+        pObjectComponent->CurrentLockData.IsLocked = acMessage.Packet.IsLocked;
+        pObjectComponent->CurrentLockData.LockLevel = acMessage.Packet.LockLevel;
+        pObjectComponent->HasAuthoritativeMutation = true;
+    }
+    else if (bEnableUnlockMemory && acMessage.Packet.Id.ModId != 0xFFFFFFFFu)
+    {
+        // Nobody has registered this object: it is in a cell no player stands in. Keep the
+        // unlock for the registration that will come (a lock report only cancels it).
+        (void)m_unlockMemory.Note(key, acMessage.Packet.IsLocked, acMessage.Packet.LockLevel);
     }
 
     for (Player* pPlayer : m_world.GetPlayerManager())

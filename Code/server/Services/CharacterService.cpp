@@ -51,6 +51,16 @@
 #include <CoopOwnership.h>
 #include <chrono>
 
+// Work plan 5.1 / defect M22. A boss fight locked to its simulating player is granted the boss
+// lease (15 s). On: every renewal of that lease keeps the boss window too, so the boss stays
+// with its owner for the 15 s the claim promised. Off: what every build since the boss window
+// was introduced has done - renewals use the ordinary 8 s window, so the boss window lasts only
+// until the owner's next packet. (v4.1.0 had no boss window: 8 s for every NPC.)
+Console::Setting bEnableBossLeaseRenewal{
+    "Gameplay:bEnableBossLeaseRenewal",
+    "(RFAB) A boss fight locked to its simulating player keeps the 15 s boss lease on every renewal (off: renewals shorten it to the ordinary 8 s)",
+    true};
+
 namespace
 {
 constexpr uint32_t kHealthActorValueIndex = 24;
@@ -63,13 +73,32 @@ uint64_t SteadyClockMs() noexcept
             .count());
 }
 
-Authority::Policy SelectEntityLeasePolicy(const CharacterComponent& acChar, bool aIsBossLocked = false) noexcept
+Authority::EntityTraits LeaseTraitsOf(const CharacterComponent& acChar, bool aIsBossLocked) noexcept
 {
-    if (acChar.IsPlayer() || acChar.IsPlayerSummon() || acChar.IsMount())
-        return Authority::Policy{};
-    if (aIsBossLocked || (acChar.IsDragon() && acChar.IsWeaponDrawn()))
-        return Authority::BossEncounterLeasePolicy();
-    return Authority::WorldNpcLeasePolicy();
+    Authority::EntityTraits traits{};
+    traits.IsPlayerAvatar = acChar.IsPlayer();
+    traits.IsPlayerSummon = acChar.IsPlayerSummon();
+    traits.IsMount = acChar.IsMount();
+    traits.IsDragonInCombat = acChar.IsDragon() && acChar.IsWeaponDrawn();
+    traits.IsBossEncounterLocked = aIsBossLocked;
+    return traits;
+}
+
+// The policy at a claim: the caller has already looked the lock up for the Subject it builds.
+Authority::Policy SelectEntityLeasePolicy(const CharacterComponent& acChar, bool aIsBossLocked) noexcept
+{
+    return Authority::SelectLeasePolicy(LeaseTraitsOf(acChar, aIsBossLocked));
+}
+
+// The policy everywhere else - renewals, sweeps, server-side grants - for the lease as held by
+// `aOwnerPlayerId`. One function, so a renewal can no longer forget the lock the claim honoured.
+Authority::Policy LeasePolicyFor(World& aWorld, entt::entity aEntity, const CharacterComponent& acChar,
+                                 uint32_t aOwnerPlayerId) noexcept
+{
+    const bool bossLocked =
+        bEnableBossLeaseRenewal &&
+        aWorld.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(World::ToInteger(aEntity), aOwnerPlayerId);
+    return Authority::SelectLeasePolicy(LeaseTraitsOf(acChar, bossLocked));
 }
 }
 
@@ -470,7 +499,7 @@ void CharacterService::ReconcileAllEntitiesForObserver(Player* apObserver) const
 
                     const auto adoption = Authority::Claim(mutableOwner.GetLease(), Authority::Subject{},
                                                            Authority::OwnerState{false, false}, observer, nowMs,
-                                                           SelectEntityLeasePolicy(charComp));
+                                                           LeasePolicyFor(m_world, entity, charComp, apObserver->GetId()));
                     const uint64_t newEpoch = mutableOwner.Apply(adoption, apObserver);
                     mutableOwner.InvalidOwners.Clear();
                     m_interestRegistry.UnmarkInRange(apObserver->GetId(), serverId);
@@ -868,7 +897,9 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
                 // WakeDormantCharactersInActiveRanges or ReconcileAllEntitiesForObserver pre-assigned this player
                 // as owner before their AssignCharacterRequest arrived: confirm ownership instead of replying Owner=false!
                 existingOwnerComp.InvalidOwners.Clear();
-                existingOwnerComp.RefreshLease(SteadyClockMs(), SelectEntityLeasePolicy(characterComponent));
+                existingOwnerComp.RefreshLease(
+                    SteadyClockMs(),
+                    LeasePolicyFor(m_world, existingEntity, characterComponent, acMessage.pPlayer->GetId()));
                 m_interestRegistry.UnmarkInRange(acMessage.pPlayer->GetId(), World::ToInteger(existingEntity));
                 isOwner = true;
             }
@@ -1242,7 +1273,7 @@ void CharacterService::OnOwnershipTransferEvent(const OwnershipTransferEvent& ac
         candidates,
         declined,
         reassignNowMs,
-        SelectEntityLeasePolicy(characterComponent));
+        LeasePolicyFor(m_world, acEvent.Entity, characterComponent, Authority::kNoOwner));
 
     Player* pSelectedOwner = nullptr;
     if (reassignment.Result == Authority::Outcome::kGranted)
@@ -1827,7 +1858,8 @@ void CharacterService::TransferOwnership(Player* apPlayer, const uint32_t acServ
     Player* pPreviousOwner = characterOwnerComponent.GetOwner();
     const uint64_t nowMs = SteadyClockMs();
     const auto* pTargetChar = m_world.try_get<CharacterComponent>(*it);
-    const Authority::Policy transferPolicy = pTargetChar ? SelectEntityLeasePolicy(*pTargetChar) : Authority::Policy{};
+    const Authority::Policy transferPolicy =
+        pTargetChar ? LeasePolicyFor(m_world, *it, *pTargetChar, GetOwnerPlayerId(apPlayer)) : Authority::Policy{};
     const uint64_t newEpoch = characterOwnerComponent.SetOwner(apPlayer, nowMs, transferPolicy);
     characterOwnerComponent.InvalidOwners.Clear();
 
@@ -2035,18 +2067,26 @@ void CharacterService::NotePlayerSimulationActivity(Player* apPlayer, uint64_t a
 
         const auto& charComp = view.get<CharacterComponent>(entity);
         ownerComp.InvalidOwners.ForgetPlayer(playerId);
-        ownerComp.RefreshLease(aNowMs, SelectEntityLeasePolicy(charComp));
+        ownerComp.RefreshLease(aNowMs, LeasePolicyFor(m_world, entity, charComp, playerId));
     }
 }
 
 void CharacterService::SweepExpiredWorldNpcLeases(uint64_t aNowMs) const noexcept
 {
-    if (m_lastExpiredLeaseSweepMs != 0 && aNowMs > m_lastExpiredLeaseSweepMs &&
-        (aNowMs - m_lastExpiredLeaseSweepMs) < 500ull)
-    {
+    const Authority::SweepPolicy sweepPolicy{};
+    if (!Authority::IsSweepDue(m_lastExpiredLeaseSweepMs, aNowMs, sweepPolicy.ExpiredLeaseSweepIntervalMs))
         return;
-    }
     m_lastExpiredLeaseSweepMs = aNowMs;
+
+    const auto activityOf = [this](uint32_t aPlayerId) noexcept {
+        Authority::PeerActivity activity{};
+        if (const auto it = m_lastPlayerSimulationActivityMs.find(aPlayerId); it != m_lastPlayerSimulationActivityMs.end())
+        {
+            activity.Known = true;
+            activity.LastAtMs = it->second;
+        }
+        return activity;
+    };
 
     auto view = m_world.view<OwnerComponent, CharacterComponent, CellIdComponent>();
     for (auto entity : view)
@@ -2060,16 +2100,15 @@ void CharacterService::SweepExpiredWorldNpcLeases(uint64_t aNowMs) const noexcep
         if (charComp.IsPlayer() || charComp.IsPlayerSummon() || charComp.IsMount())
             continue;
 
-        if (!ownerComp.GetLease().IsExpired(aNowMs))
-            continue;
-
         const uint32_t currentOwnerId = pCurrentOwner->GetId();
-        if (const auto actIt = m_lastPlayerSimulationActivityMs.find(currentOwnerId);
-            actIt != m_lastPlayerSimulationActivityMs.end() &&
-            aNowMs >= actIt->second &&
-            (aNowMs - actIt->second) < Authority::kWorldNpcLeaseDurationMs)
+        const Authority::Policy ownerPolicy = LeasePolicyFor(m_world, entity, charComp, currentOwnerId);
+        const auto lapsed =
+            Authority::EvaluateLapsedLease(ownerComp.GetLease(), activityOf(currentOwnerId), aNowMs, ownerPolicy);
+        if (lapsed == Authority::LapsedLeaseAction::kNothing)
+            continue;
+        if (lapsed == Authority::LapsedLeaseAction::kRefreshForActiveOwner)
         {
-            ownerComp.RefreshLease(aNowMs, SelectEntityLeasePolicy(charComp));
+            ownerComp.RefreshLease(aNowMs, ownerPolicy);
             continue;
         }
 
@@ -2087,13 +2126,8 @@ void CharacterService::SweepExpiredWorldNpcLeases(uint64_t aNowMs) const noexcep
             if (!pCandidate->GetCellComponent().IsInRange(cellComp, charComp.IsDragon()))
                 continue;
 
-            const auto peerActIt = m_lastPlayerSimulationActivityMs.find(pCandidate->GetId());
-            if (peerActIt == m_lastPlayerSimulationActivityMs.end() ||
-                aNowMs < peerActIt->second ||
-                (aNowMs - peerActIt->second) > Authority::kActivePeerSimulationWindowMs)
-            {
+            if (!Authority::IsPeerActivelySimulating(activityOf(pCandidate->GetId()), aNowMs, sweepPolicy))
                 continue;
-            }
 
             Authority::Candidate candidate{};
             candidate.PlayerId = pCandidate->GetId();
@@ -2121,7 +2155,7 @@ void CharacterService::SweepExpiredWorldNpcLeases(uint64_t aNowMs) const noexcep
             candidates,
             declined,
             aNowMs,
-            SelectEntityLeasePolicy(charComp));
+            LeasePolicyFor(m_world, entity, charComp, Authority::kNoOwner));
         if (reassignment.Result != Authority::Outcome::kGranted)
             continue;
 
@@ -2166,7 +2200,7 @@ void CharacterService::SweepExpiredWorldNpcLeases(uint64_t aNowMs) const noexcep
 void CharacterService::WakeDormantCharactersInActiveRanges() const noexcept
 {
     const uint64_t nowMs = SteadyClockMs();
-    if (m_lastWakeSweepMs != 0 && nowMs > m_lastWakeSweepMs && (nowMs - m_lastWakeSweepMs) < 1000ull)
+    if (!Authority::IsSweepDue(m_lastWakeSweepMs, nowMs, Authority::SweepPolicy{}.DormantWakeSweepIntervalMs))
         return;
     m_lastWakeSweepMs = nowMs;
 
@@ -2212,7 +2246,8 @@ void CharacterService::WakeDormantCharactersInActiveRanges() const noexcept
             pBestObserver->Send(spawnMsg);
         }
 
-        const uint64_t newEpoch = ownerComp.SetOwner(pBestObserver, nowMs, SelectEntityLeasePolicy(charComp));
+        const uint64_t newEpoch =
+            ownerComp.SetOwner(pBestObserver, nowMs, LeasePolicyFor(m_world, entity, charComp, pBestObserver->GetId()));
         ownerComp.InvalidOwners.Clear();
         m_interestRegistry.UnmarkInRange(pBestObserver->GetId(), serverId);
 

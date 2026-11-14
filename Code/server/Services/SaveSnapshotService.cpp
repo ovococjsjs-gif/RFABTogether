@@ -1606,6 +1606,7 @@ void SaveSnapshotService::ApplyWorldSnapshot(const WorldSnapshot& acSnapshot, bo
                 m_world.destroy(entity);
             }
         }
+        m_world.GetObjectService().ForgetUnregisteredUnlocks();
         for (const auto& objRec : acSnapshot.TrackedObjects)
         {
             m_world.GetObjectService().UpsertRestoredObject(
@@ -1868,6 +1869,7 @@ bool SaveSnapshotService::TriggerRollbackToLatest(bool aIsPartyWipe) noexcept
                 m_world.destroy(entity);
         }
     }
+    m_world.GetObjectService().ForgetUnregisteredUnlocks();
 
     BeginWorldReloadBarrier(0, preJoinSlot, nowMs);
 
