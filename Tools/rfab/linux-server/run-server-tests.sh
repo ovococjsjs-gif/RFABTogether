@@ -114,3 +114,8 @@ fi
 if [[ "${SANITIZE}" == "1" ]]; then
     echo "[RFAB_RESULT] sanitizers: AddressSanitizer + UndefinedBehaviorSanitizer reported nothing (mimalloc blocks tracked)"
 fi
+
+# The server executable's crash record (Code/server_runner) is not part of the harness binary; its
+# portable half is checked here, with a program of its own.
+echo "==> the server's crash record"
+"${REPO_ROOT}/Tools/rfab/linux-server/crash-record-self-test.sh"

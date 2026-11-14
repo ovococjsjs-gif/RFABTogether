@@ -355,6 +355,8 @@ _SHORT_RECORD = re.compile(
 _FRAME = re.compile(r"\[unwind #(?P<n>\d+)\]\s+(?P<module>[^\s\[+]+)(?P<tramp>\[TiltedTrampoline\])?\+0x(?P<rva>[0-9A-Fa-f]+)")
 _CPP = re.compile(r"Type=\[(?P<type>[^\]]*)\]\s+what\(\)=\[\"(?P<what>.*?)\"\]")
 _TIMESTAMP = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\]")
+# The server's second kind of record (Code/server_runner/CrashRecord.cpp): std::terminate was called.
+_TERMINATE = re.compile(r"^(?:\[(?P<stamp>[^\]]+)\]\s+)?\[TERMINATE\]\s+(?P<text>.*?)(?:;\s*what\(\)=\[\"(?P<what>.*)\"\])?\s*$")
 _ADDRESS = re.compile(r"^(?P<module>[^+]+)\+(?:0x)?(?P<rva>[0-9A-Fa-f]+)$")
 # Breadcrumbs (Code/common/Diag/Breadcrumbs.h): what the client did just before the fault.
 _CRUMB = re.compile(
@@ -519,16 +521,42 @@ def render_record(number: int, record: CrashRecord, maps: list[LinkerMap], game:
     return out
 
 
+def render_terminations(text: str, last: int = 0) -> list[str]:
+    """The [TERMINATE] lines of a server crash log: the process ended itself, with the exception's text."""
+    found = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        match = _TERMINATE.match(line)
+        if match:
+            found.append(match)
+    if not found:
+        return []
+    first = max(0, len(found) - last) if last > 0 else 0
+    out = ["", f"=== std::terminate: {len(found)} record(s)" + (f", showing the last {len(found) - first}" if first else "")]
+    for match in found[first:]:
+        stamp = match.group("stamp") or "?"
+        what = match.group("what")
+        out.append(f"    {stamp}  {match.group('text')}")
+        if what is not None:
+            out.append(f"            what(): {what if what else '(empty)'}")
+    out.append("    An exception left main, a thread or a noexcept function. On Windows the record above it")
+    out.append("    (code 0xE06D7363, same second) carries the call stack of the throw.")
+    return out
+
+
 def symbolize_text(text: str, maps: list[LinkerMap], game: GameIdMap, last: int = 0) -> list[str]:
     records = parse_records(text)
+    terminations = render_terminations(text, last)
     if not records:
-        return ["no crash record found (looked for [UNHANDLED_CRASH] and 'Unhandled crash:' lines)"]
+        if terminations:
+            return terminations
+        return ["no crash record found (looked for [UNHANDLED_CRASH], [TERMINATE] and 'Unhandled crash:' lines)"]
     out: list[str] = []
     first = max(0, len(records) - last) if last > 0 else 0
     if first:
         out.append(f"{len(records)} crash records, showing the last {len(records) - first}")
     for number, record in enumerate(records[first:], first + 1):
         out.extend(render_record(number, record, maps, game))
+    out.extend(terminations)
     return out
 
 
@@ -577,21 +605,34 @@ def symbolize_report(folder: Path, extra_maps: list[LinkerMap], game: GameIdMap,
 
     crash_logs = sorted(folder.rglob("RFAB_Online_Crash.log"))
     sources = crash_logs if crash_logs else sorted(folder.rglob("tp_client*.log*"))
+    # The server writes its own log (logs/STServer_Crash.log): crash records in the client's layout
+    # and [TERMINATE] lines.
+    server_logs = sorted(folder.rglob("STServer_Crash.log"))
+    sources = sources + server_logs
     records: list[CrashRecord] = []
     seen: set[tuple] = set()
+    terminations: list[str] = []
     for source in sources:
-        for record in parse_records(source.read_text(encoding="utf-8", errors="replace")):
+        text = source.read_text(encoding="utf-8", errors="replace")
+        for record in parse_records(text):
             if record.key() not in seen:
                 seen.add(record.key())
                 records.append(record)
+        if source in server_logs:
+            terminations.extend(render_terminations(text, last))
     records.sort(key=lambda r: r.stamp)
     if not records:
-        out.append("  no crash record in " + (", ".join(str(s.relative_to(folder)) for s in sources) if sources else "the folder (no RFAB_Online_Crash.log, no tp_client log)"))
+        if terminations:
+            out.append("  no crash record with a call stack; the server ended itself:")
+            out.extend(terminations)
+            return out
+        out.append("  no crash record in " + (", ".join(str(s.relative_to(folder)) for s in sources) if sources else "the folder (no RFAB_Online_Crash.log, no STServer_Crash.log, no tp_client log)"))
         return out
     first = max(0, len(records) - last) if last > 0 else 0
     out.append(f"  {len(records)} crash record(s)" + (f", showing the last {len(records) - first}" if first else ""))
     for number, record in enumerate(records[first:], first + 1):
         out.extend(render_record(number, record, maps, game))
+    out.extend(terminations)
     return out
 
 
@@ -755,12 +796,52 @@ def self_test() -> int:
         (root / "client" / "RFAB_Online_Symbols.gz").unlink()
         expect("NO SYMBOLS in the report" in "\n".join(symbolize_report(root, [], game, 10)), "folder: missing symbols are called out")
 
+    # The server's crash log: a record in the client's layout inside STServer.dll, and a [TERMINATE] line.
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "STServer.map").write_text(
+            " STServer\n\n Timestamp is 6736b000 (Thu Nov 14 21:00:00 2026)\n\n Preferred load address is 0000000180000000\n\n"
+            " Start         Length     Name                   Class\n"
+            " 0001:00000000 00100000H .text                   CODE\n\n"
+            "  Address         Publics by Value              Rva+Base               Lib:Object\n\n"
+            " 0001:00002000       ?RfabServerCrashSelfTestFault@@YAXXZ 0000000180003000 f   STServer.lib:main.obj\n"
+            " 0001:00004000       ?Update@GameServer@@QEAAXXZ 0000000180005000 f   STServer.lib:GameServer.obj\n",
+            encoding="utf-8")
+        server_map = parse_map(Path(tmp) / "STServer.map")
+    expect(server_map.module == "STServer" and len(server_map.symbols) == 2, f"server: the server's map is read ({server_map.module}, {len(server_map.symbols)} symbols)")
+    server_log = (
+        "[2026-11-14 22:00:01.250] [UNHANDLED_CRASH] TID=11 Code=0xC0000005 RIP=0x7FFA00003010 FaultAddr=0x0 "
+        "Module='C:\\RFAB\\RFAB_Online_Server\\STServer.dll' Base=0x7FFA00000000 RVA=+0x3010 RSP=0x1 RBP=0x2 RAX=0x0 RBX=0x0 RCX=0x0 RDX=0x0 "
+        "PeTimestamp=0x6736B000 Process=[server]\r\n"
+        "    [unwind #0] STServer.dll+0x3010 (0x7FFA00003010)\r\n"
+        "    [unwind #1] SkyrimTogetherServer.exe+0x1234 (0x7FF600001234)\r\n"
+        "[2026-11-14 22:05:00.000] [UNHANDLED_CRASH] TID=11 Code=0xE06D7363 RIP=0x7FF8BBBB0000 FaultAddr=0x0 "
+        "Module='C:\\Windows\\System32\\KERNELBASE.dll' Base=0x7FF8BBB00000 RVA=+0xB0000 RSP=0x1 RBP=0x2 RAX=0x0 RBX=0x0 RCX=0x0 RDX=0x0 "
+        "PeTimestamp=0x11111111 Process=[server] | Type=[.?AVruntime_error@std@@] what()=[\"bad file name\"]\r\n"
+        "    [unwind #0] KERNELBASE.dll+0xB0000 (0x7FF8BBBB0000)\r\n"
+        "    [unwind #1] STServer.dll+0x5020 (0x7FFA00005020)\r\n"
+        "[2026-11-14 22:05:00.010] [TERMINATE] the server stopped itself: std::terminate was called; what()=[\"bad file name\"]\r\n")
+    server_report = "\n".join(symbolize_text(server_log, [server_map], game))
+    expect("OURS  RfabServerCrashSelfTestFault +0x10" in server_report, "server: a fault inside STServer.dll is named by the server's symbols")
+    expect("OURS  GameServer::Update +0x20" in server_report, "server: the frame that threw is named")
+    expect("C++ type" in server_report and "bad file name" in server_report, "server: the thrown type and text are shown")
+    expect("=== std::terminate: 1 record(s)" in server_report and "what(): bad file name" in server_report, "server: the terminate record is shown")
+    only_terminate = "\n".join(symbolize_text("[2026-11-14 22:05:00.010] [TERMINATE] the server stopped itself: std::terminate was called; what()=[\"\"]\n", [], game))
+    expect("std::terminate: 1 record(s)" in only_terminate and "what(): (empty)" in only_terminate, "server: a terminate record alone is still reported")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "server" / "logs").mkdir(parents=True)
+        (root / "server" / "logs" / "STServer_Crash.log").write_text(server_log, encoding="utf-8")
+        (root / "server" / "RFAB_Online_Server_Symbols.gz").write_bytes(export_compact(server_map))
+        folder_report = "\n".join(symbolize_report(root, [], game, 10))
+        expect("2 crash record(s)" in folder_report and "RfabServerCrashSelfTestFault" in folder_report and "std::terminate: 1 record(s)" in folder_report,
+               "folder: the server's crash log is read and named with the server's symbols")
+
     if failures:
         print("symbolize_crash self-test FAILED:")
         for failure in failures:
             print(f"  - {failure}")
         return 1
-    print("symbolize_crash self-test: map parsing, game ids, both record formats, C++ exceptions, breadcrumbs")
+    print("symbolize_crash self-test: map parsing, game ids, both record formats, C++ exceptions, breadcrumbs, the server's crash log")
     return 0
 
 

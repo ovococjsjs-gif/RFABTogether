@@ -72,6 +72,16 @@ GS_EXPORT bool CheckBuildTag(const char* apBuildTag)
     return std::strcmp(apBuildTag, kBuildTag) == 0;
 }
 
+// A deliberate fault inside this library (work plan 4.5). The runner's hidden switch
+// `--rfab-crash-self-test fault` calls it; the release pipeline then checks that the crash record
+// in logs/STServer_Crash.log leads back to this function through the packaged symbol table.
+// Never called while a server runs.
+GS_EXPORT void RfabServerCrashSelfTestFault()
+{
+    volatile int* volatile pNowhere = nullptr;
+    *pNowhere = 0x52464142;
+}
+
 GS_EXPORT UniquePtr<IGameServerInstance> CreateGameServer(Console::ConsoleRegistry& aConReg, const std::function<void()>& aCallback)
 {
     BASE_ASSERT(aCallback, "CreateGameServer(): Callback was not provided");

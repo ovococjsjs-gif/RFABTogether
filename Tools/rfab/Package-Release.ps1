@@ -324,6 +324,64 @@ foreach ($sym in @(
     }
 }
 
+# The server's crash record (work plan 4.5). The packaged server is made to die on purpose, twice:
+# an access violation inside STServer.dll and an exception that nobody catches. A build is not
+# shipped unless the server wrote both into logs\STServer_Crash.log - and, when the symbol table
+# was packaged, unless that table names the function the fault happened in. This is the whole chain
+# a host's report goes through, run on the binaries of this very build.
+$CrashDir = Join-Path $env:TEMP ("rfab_srv_crash_" + [Guid]::NewGuid().ToString("N"))
+Invoke-RobocopySafe -Src $StageServer -Dst $CrashDir -ExtraArgs @("/E")
+$CrashExpected = @{ "fault" = 70; "terminate" = 71 }
+foreach ($crashMode in @("fault", "terminate")) {
+    $crashProc = Start-Process -FilePath (Join-Path $CrashDir "SkyrimTogetherServer.exe") `
+                               -ArgumentList @("--rfab-crash-self-test", $crashMode) `
+                               -WorkingDirectory $CrashDir `
+                               -RedirectStandardOutput (Join-Path $CrashDir "crash_stdout_$crashMode.txt") `
+                               -RedirectStandardError  (Join-Path $CrashDir "crash_stderr_$crashMode.txt") `
+                               -PassThru -NoNewWindow
+    # Touch the handle now: without it Windows PowerShell forgets the exit code of a process that
+    # has already ended by the time it is asked.
+    $null = $crashProc.Handle
+    if (-not $crashProc.WaitForExit(60000)) {
+        Stop-Process -Id $crashProc.Id -Force -ErrorAction SilentlyContinue
+        throw "Server crash self-test '$crashMode': the process did not end within 60 seconds (a crash dialog is waiting?)"
+    }
+    $crashProc.WaitForExit()
+    $crashExit = $crashProc.ExitCode
+    if ($crashExit -ne $CrashExpected[$crashMode]) {
+        $crashErr = Get-Content -LiteralPath (Join-Path $CrashDir "crash_stderr_$crashMode.txt") -Raw -ErrorAction SilentlyContinue
+        throw "Server crash self-test '$crashMode': exit code $crashExit, expected $($CrashExpected[$crashMode]) (the record was not written before the process ended). STDERR: $crashErr"
+    }
+}
+$CrashLog = Join-Path $CrashDir "logs\STServer_Crash.log"
+if (-not (Test-Path -LiteralPath $CrashLog)) { throw "Server crash self-test: the server wrote no logs\STServer_Crash.log!" }
+$CrashText = [System.IO.File]::ReadAllText($CrashLog)
+$CrashHead = $CrashText.Substring(0, [Math]::Min(600, $CrashText.Length))
+if ($CrashText -notmatch '\[UNHANDLED_CRASH\][^\r\n]*Code=0xC0000005[^\r\n]*STServer\.dll') {
+    throw "Server crash self-test: no access-violation record inside STServer.dll in the crash log. It starts: $CrashHead"
+}
+if ($CrashText -notmatch '\[unwind #1\]') {
+    throw "Server crash self-test: the access-violation record has no call stack. It starts: $CrashHead"
+}
+if ($CrashText -notmatch '\[TERMINATE\][^\r\n]*RFAB crash self-test: this text must reach the crash log') {
+    throw "Server crash self-test: the uncaught exception left no [TERMINATE] record with its text. The log starts: $CrashHead"
+}
+$ServerSymbols = Join-Path $StageServer "RFAB_Online_Server_Symbols.gz"
+if (Test-Path -LiteralPath $ServerSymbols) {
+    $ErrorActionPreference = "Continue"
+    $CrashNamed = (& python (Join-Path $RepoRoot "Tools\rfab\symbolize_crash.py") $CrashLog --map $ServerSymbols 2>&1 | Out-String)
+    $namedCode = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($namedCode -ne 0 -or $CrashNamed -notmatch 'OURS\s+RfabServerCrashSelfTestFault') {
+        $namedHead = $CrashNamed.Substring(0, [Math]::Min(900, $CrashNamed.Length))
+        throw "Server crash self-test: the packaged symbol table does not name the faulting function (symbolize_crash.py exit $namedCode). Output starts: $namedHead"
+    }
+    Write-Host "[RFAB_RESULT] server crash record: an access violation inside STServer.dll and an uncaught exception were both recorded; the packaged symbols name the faulting function"
+} else {
+    Write-Host "[RFAB_RESULT] server crash record: both deaths were recorded; no symbol table was packaged, so the function name was not checked"
+}
+Remove-Item -LiteralPath $CrashDir -Recurse -Force -ErrorAction SilentlyContinue
+
 Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
 $InstallerZip = Join-Path $OutDir "RFAB_Online_${VersionTag}_Full_Installer.zip"
 $QuickUpdZip  = Join-Path $OutDir "RFAB_Online_${VersionTag}_Quick_Update.zip"
