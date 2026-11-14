@@ -1,5 +1,9 @@
 # RFAB Online
 
+> **Это репозиторий RFAB Together** — ветка разработки поверх [`Riyozaki/RFAB_Online`](https://github.com/Riyozaki/RFAB_Online) `v4.1.0`.
+> Версия здесь — **`4.1.1`, в разработке, без плейтеста**. Состояние и план работ: [`docs/WORK_PLAN.md`](docs/WORK_PLAN.md); сборка и CI: [`docs/CI.md`](docs/CI.md).
+> Текст ниже — описание апстрима: ссылки на скачивание в нём ведут на его релизы, а не на сборки этого репозитория.
+
 <div align="center">
 
 ### 🎮 Кооперативный мультиплеер для Skyrim SE `1.5.97.0.8` + [Requiem for a Balance (RFAB)](https://github.com/drake1ch/RFAB)
