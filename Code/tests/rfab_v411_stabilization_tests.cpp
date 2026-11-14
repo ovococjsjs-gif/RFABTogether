@@ -214,12 +214,21 @@ TEST_CASE("P1.3 UTF-8 and CP1251 save slot resolution handles Cyrillic Skyrim sa
     WriteDummyValidEss(rootSave);
     WriteDummyValidEss(subSave);
 
-    CHECK(ResolveExistingEssSlotPath(tempDir, expectedUtf8) == rootSave);
-    CHECK(ResolveExistingEssSlotPath(tempDir, "Saves\\" + expectedUtf8 + ".ESS") == rootSave);
-    CHECK(ResolveExistingEssSlotPath(tempDir, upperCyrillic) == rootSave);
-    CHECK(ResolveExistingEssSlotPath(tempDir, cp1251Sample) == rootSave);
-    CHECK(ResolveExistingEssSlotPath(tempDir, "nonmatching_raw", expectedUtf8) == rootSave);
-    CHECK(ResolveExistingEssSlotPath(tempDir, subSaveStemUtf8) == subSave);
+    // What matters is that the lookup names the same FILE. NTFS is case-insensitive, so a lookup
+    // may come back spelled the way it was asked for; comparing paths with == failed on Windows for
+    // that reason alone. (And a failed == makes Catch print both paths, which throws on a system
+    // whose ANSI code page has no Cyrillic - the first Windows run of this suite.)
+    const auto sameFile = [](const std::filesystem::path& acFound, const std::filesystem::path& acExpected) {
+        std::error_code compareEc;
+        return !acFound.empty() && std::filesystem::equivalent(acFound, acExpected, compareEc) && !compareEc;
+    };
+    CHECK(sameFile(ResolveExistingEssSlotPath(tempDir, expectedUtf8), rootSave));
+    CHECK(sameFile(ResolveExistingEssSlotPath(tempDir, "Saves\\" + expectedUtf8 + ".ESS"), rootSave));
+    CHECK(sameFile(ResolveExistingEssSlotPath(tempDir, upperCyrillic), rootSave));
+    CHECK(sameFile(ResolveExistingEssSlotPath(tempDir, cp1251Sample), rootSave));
+    CHECK(sameFile(ResolveExistingEssSlotPath(tempDir, "nonmatching_raw", expectedUtf8), rootSave));
+    CHECK(sameFile(ResolveExistingEssSlotPath(tempDir, subSaveStemUtf8), subSave));
+    CHECK_FALSE(sameFile(ResolveExistingEssSlotPath(tempDir, subSaveStemUtf8), rootSave));
     CHECK(IsValidEssFileOnDisk(ResolveExistingEssSlotPath(tempDir, cp1251Sample)));
     CHECK(ResolveExistingEssSlotPath(tempDir, "DoesNotExist_Slot").empty());
 
