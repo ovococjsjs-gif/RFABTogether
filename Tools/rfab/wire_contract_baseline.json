@@ -78,6 +78,12 @@
       "subject": "SyncRfabProgressionEvent::EventKind::DragonSoulSync",
       "detail": "never referenced by the sender (Code/client)",
       "reason": "Reserved, not a defect (DEFECT_REGISTRY M2): a 4.1.0 client reports dead dragons with this kind and the server ignores it, because the server now takes a dragon's death from its own alive-to-dead transition (RfabProgressionService::OnDragonSlain). The 4.1.1 client no longer sends it. The enumerator keeps its number so that 4.1.x peers still decode each other; it goes away with the next protocol version."
+    },
+    {
+      "rule": "W3",
+      "subject": "SyncRfabProgressionEvent::EventKind::LedgerXpGrant",
+      "detail": "never referenced by the sender (Code/client)",
+      "reason": "Reserved, not a defect (DEFECT_REGISTRY M17): no client has ever sent a keyed XP grant - every construction of the message assigns another kind. RFAB XP is shared by SyncRfabExperienceRequest, which now feeds the party total. The server names the kind and ignores it; it is the default (zero) of the message and keeps its number."
     }
   ]
 }

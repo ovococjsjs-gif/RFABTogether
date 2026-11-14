@@ -22,6 +22,7 @@
 #include <Messages/SyncExperienceRequest.h>
 #include <Messages/SyncRfabExperienceRequest.h>
 #include <Services/InventoryService.h>
+#include <Services/RfabProgressionService.h>
 #include <Setting.h>
 #include <World.h>
 #include <common/CoopExperienceLedger.h>
@@ -266,6 +267,9 @@ void CharacterService::OnSyncRfabExperienceRequest(const PacketEvent<SyncRfabExp
     const uint32_t experience = std::min(acMessage.Packet.Experience, CoopExperienceLedger::kMaxRfabXpDelta);
     if (experience == 0)
         return;
+
+    // The party total and who already holds it (late-join catch-up).
+    m_world.GetRfabProgressionService().OnSharedRfabXpRelayed(experience);
 
     NotifySyncRfabExperience notify;
     notify.Experience = experience;

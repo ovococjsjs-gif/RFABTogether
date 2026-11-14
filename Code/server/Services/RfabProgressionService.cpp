@@ -113,35 +113,10 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
     }
 
     case SyncRfabProgressionEvent::EventKind::LedgerXpGrant:
-    {
-        const int32_t clampedXp = std::clamp(pkt.XpDelta, 0, kMaxSingleXpGrant);
-        if (clampedXp <= 0)
-            return;
-
-        const auto outcome = m_ledger.TryGrantXp(sourceKey, clampedXp);
-        if (outcome.Accepted)
-        {
-            NotifyRfabProgressionEvent broadcast{};
-            broadcast.Kind = NotifyRfabProgressionEvent::EventKind::LedgerXpGrant;
-            broadcast.EpochId = currentEpoch;
-            broadcast.SourceKey = pkt.SourceKey;
-            broadcast.XpDelta = outcome.AppliedDelta;
-            broadcast.AuthoritativeTotalXp = outcome.AuthoritativeTotalXp;
-            GameServer::Get()->SendToPlayers(broadcast, pSender);
-            CreditConnectedPlayers(outcome.AppliedDelta, outcome.AuthoritativeTotalXp);
-        }
-        else if (outcome.DuplicateRebateDelta < 0)
-        {
-            NotifyRfabProgressionEvent rebate{};
-            rebate.Kind = NotifyRfabProgressionEvent::EventKind::LedgerXpRebate;
-            rebate.EpochId = currentEpoch;
-            rebate.SourceKey = pkt.SourceKey;
-            rebate.XpDelta = outcome.DuplicateRebateDelta;
-            rebate.AuthoritativeTotalXp = outcome.AuthoritativeTotalXp;
-            pSender->Send(rebate);
-        }
+        // No client has ever sent a keyed XP grant: RFAB XP is shared by the wallet relay
+        // (SyncRfabExperienceRequest), which feeds the party total through OnSharedRfabXpRelayed.
+        // The kind is also the default of this message, so it is named here and ignored.
         break;
-    }
 
     case SyncRfabProgressionEvent::EventKind::GlobalValueSync:
     {
@@ -522,6 +497,17 @@ void RfabProgressionService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexce
 
     // Sync authoritative Host-controlled Co-Op Ally Protection («Единство в битве») state & Host ID.
     SendAllyProtectionStateToPlayer(pNewPlayer, false);
+}
+
+void RfabProgressionService::OnSharedRfabXpRelayed(const uint32_t aBaseXp) noexcept
+{
+    // The relay carries an amount and no source, so nothing can be deduplicated here: the party
+    // total grows by what was relayed, and everyone connected holds it (the sender earned it, the
+    // others were sent it). Only a player who is away misses it.
+    const auto clampedXp = static_cast<int32_t>(std::min<uint32_t>(aBaseXp, static_cast<uint32_t>(kMaxSingleXpGrant)));
+    const auto outcome = m_ledger.TryGrantXp({}, clampedXp);
+    if (outcome.Accepted)
+        CreditConnectedPlayers(outcome.AppliedDelta, outcome.AuthoritativeTotalXp);
 }
 
 void RfabProgressionService::OnDragonSlain(const entt::entity aDragon, Player* apKiller) noexcept

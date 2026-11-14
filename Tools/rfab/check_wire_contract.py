@@ -19,7 +19,9 @@ What is checked (sources only, comments stripped; tests and the harness do not c
         Code/client, or a raw `m_messageHandlers[T::Opcode]` / `CastUnique<T>` on either side.
   W3  Every enumerator of an enum declared inside a message struct (EventKind and friends) is
       referenced by the sending side and by the receiving side. The enumerator a member defaults
-      to in the message header counts as sent: the sender produces it by not assigning the field.
+      to in the message header counts as sent only if the sender builds the message somewhere
+      without assigning that member; when every construction assigns it, nothing ever sends the
+      default (this is how SyncRfabProgressionEvent::LedgerXpGrant went unnoticed).
       An enumerator handled by a final `else` or `default:` is invisible to this rule and has to
       be listed in the baseline with that reason.
 
@@ -108,6 +110,8 @@ class Message:
         self.enums: dict[str, list[str]] = {}
         self.scoped: dict[str, bool] = {}
         self.defaults: set[tuple[str, str]] = set()
+        # enum name -> names of the members of that enum type (`EventKind Kind{...}` -> "Kind")
+        self.default_members: dict[str, set[str]] = {}
 
     @property
     def sender(self) -> str:
@@ -139,11 +143,13 @@ def parse_messages(messages_dir: Path) -> list[Message]:
                     # `EventKind Kind{EventKind::LedgerXpGrant};`  `StatusCode Status = Started;`
                     for value in enumerators:
                         default = re.compile(
-                            r"\b" + re.escape(name) + r"\s+[A-Za-z_]\w*\s*(?:\{|=)\s*(?:" + re.escape(name) + r"\s*::\s*)?"
+                            r"\b" + re.escape(name) + r"\s+([A-Za-z_]\w*)\s*(?:\{|=)\s*(?:" + re.escape(name) + r"\s*::\s*)?"
                             + re.escape(value) + r"\s*[\};]"
                         )
-                        if default.search(text, decl.end()):
+                        declared = default.search(text, decl.end())
+                        if declared:
                             message.defaults.add((name, value))
+                            message.default_members.setdefault(name, set()).add(declared.group(1))
             found.append(message)
     return found
 
@@ -181,6 +187,33 @@ def handled(message: Message, sources: dict[Path, str]) -> bool:
     raw = r"\bm_messageHandlers\s*\[\s*" + name + r"\s*::\s*Opcode\s*\]|\bCastUnique\s*<\s*" + name + r"\s*>"
     pattern = re.compile(typed + "|" + raw)
     return any(message.name in text and pattern.search(text) for text in sources.values())
+
+
+def default_is_sent(message: Message, enum: str, sources: dict[Path, str]) -> bool:
+    """True if the sender builds the message at least once without assigning the enum member.
+
+    A construction is `T name{...};`, `T name;` or `T name = ...;`. The member counts as assigned
+    when `name.Member =` follows within the next 60 lines (one function). A message that is built
+    in a way this cannot follow (a temporary, a container element) keeps the benefit of the doubt.
+    """
+    members = message.default_members.get(enum, set())
+    if not members:
+        return True
+    construction = re.compile(r"\b" + re.escape(message.name) + r"\s+([A-Za-z_]\w*)\s*(?:\{[^;]*\}|=[^;]*)?\s*;")
+    seen_any = False
+    for text in sources.values():
+        if message.name not in text:
+            continue
+        for built in construction.finditer(text):
+            seen_any = True
+            variable = built.group(1)
+            window = "\n".join(text[built.end():].split("\n", 61)[:60])
+            assigned = any(
+                re.search(r"\b" + re.escape(variable) + r"\s*\.\s*" + re.escape(member) + r"\s*=[^=]", window) for member in members
+            )
+            if not assigned:
+                return True
+    return not seen_any
 
 
 def enumerator_referenced(message: Message, enum: str, value: str, sources: dict[Path, str]) -> bool:
@@ -245,7 +278,7 @@ def find_violations(root: Path) -> list[dict[str, str]]:
                     # A side that does not exist at all is one finding (W1/W2), not one per enumerator.
                     if not (has_sender if role == "sender" else has_receiver):
                         continue
-                    if role == "sender" and (enum, value) in message.defaults:
+                    if role == "sender" and (enum, value) in message.defaults and default_is_sent(message, enum, side_sources[side]):
                         continue
                     if not enumerator_referenced(message, enum, value, side_sources[side]):
                         report(
@@ -394,6 +427,33 @@ def self_test() -> int:
             ),
         },
         {"W3 Event::Kind::B"},
+    )
+    defaulted_h = (
+        "struct Event final : ClientMessage {\n"
+        "    enum class Kind : uint8_t { A = 0, B = 1 };\n"
+        "    Kind Kind{Kind::A};\n};\n"
+    )
+    defaulted_server = (
+        "void H() { aDispatcher.sink<PacketEvent<Event>>().connect<&S::On>(this); }\n"
+        "void On(const PacketEvent<Event>& m) { switch (m.Packet.Kind) { case Event::Kind::A: case Event::Kind::B: break; } }\n"
+    )
+    expect(
+        "W3: a default kind is sent when some construction leaves the member alone",
+        {
+            "Code/encoding/Messages/Event.h": defaulted_h,
+            "Code/client/A.cpp": "void F() { Event e; m_transport.Send(e); }\nvoid G() { Event other{}; other.Kind = Event::Kind::B; m_transport.Send(other); }\n",
+            "Code/server/B.cpp": defaulted_server,
+        },
+        set(),
+    )
+    expect(
+        "W3: a default kind that every construction overwrites is never sent (the LedgerXpGrant case)",
+        {
+            "Code/encoding/Messages/Event.h": defaulted_h,
+            "Code/client/A.cpp": "void F() { Event e{}; e.Id = 1; e.Kind = Event::Kind::B; m_transport.Send(e); }\n",
+            "Code/server/B.cpp": defaulted_server,
+        },
+        {"W3 Event::Kind::A"},
     )
     expect(
         "shared code may construct a message for either side",

@@ -350,6 +350,10 @@ private:
     void OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept;
     void OnPlayerLeave(const PlayerLeaveEvent& acEvent) noexcept;
 public:
+    // RFAB XP was relayed to the party (CharacterService::OnSyncRfabExperienceRequest). This is how
+    // shared XP really travels, so it is what the party total and the per-player credits count.
+    void OnSharedRfabXpRelayed(uint32_t aBaseXp) noexcept;
+
     // A dragon went from alive to dead on the server (ActorValueService, the one place where that
     // transition is decided). `apKiller` is the player whose death report was accepted.
     void OnDragonSlain(entt::entity aDragon, Player* apKiller) noexcept;

@@ -72,6 +72,8 @@
 #include <Messages/RequestOwnershipTransfer.h>
 #include <Messages/RequestResync.h>
 #include <Messages/SyncRfabProgressionEvent.h>
+#include <Messages/NotifySyncRfabExperience.h>
+#include <Messages/SyncRfabExperienceRequest.h>
 #include <Messages/NotifyInventoryChanges.h>
 #include <Messages/NotifyWorldItemDespawn.h>
 #include <Messages/NotifyWorldItemSnapshot.h>
@@ -1927,13 +1929,13 @@ int main(int argc, char** argv)
             aWorld.GetDispatcher().trigger(PlayerLeaveEvent{apPlayer});
             aWorld.GetPlayerManager().Remove(apPlayer);
         };
-        const auto earn = [](World& aWorld, Player* apPlayer, const char* acSource, int32_t aXp) {
-            SyncRfabProgressionEvent grant{};
-            grant.Kind = SyncRfabProgressionEvent::EventKind::LedgerXpGrant;
-            grant.EpochId = aWorld.GetSaveSnapshotService().GetCurrentWorldEpoch();
-            grant.SourceKey = acSource;
-            grant.XpDelta = aXp;
-            return DeliverWire(aWorld, grant, apPlayer);
+        // The packet a client really sends when its RFAB XP wallet grows: the relay to the party.
+        // (No client sends a keyed LedgerXpGrant; the first version of this scene used one and
+        // proved the accounting on a path nothing feeds.)
+        const auto earn = [](World& aWorld, Player* apPlayer, uint32_t aXp) {
+            SyncRfabExperienceRequest relay{};
+            relay.Experience = aXp;
+            return DeliverWire(aWorld, relay, apPlayer);
         };
         // Catch-up XP the server sent to this connection since the outbox was last cleared.
         const auto catchUpSentTo = [](TiltedPhoques::ConnectionId_t aConn) {
@@ -1955,7 +1957,12 @@ int main(int argc, char** argv)
             Player* pGuest = joinAs(world, 0x9002u, "GuestS9");
             Check(catchUpSentTo(0x9002u) == 0, "a player who joins before any XP is earned is owed nothing");
 
-            Check(earn(world, pHost, "s9-kill-1", 1000) && ledger.GetTotalSharedXp() == 1000, "the party earns 1000 XP while both are connected");
+            Harness::ClearOutbox();
+            Check(earn(world, pHost, 1000) && ledger.GetTotalSharedXp() == 1000, "the party earns 1000 XP while both are connected");
+            {
+                const auto relayed = DecodeOutboxMessagesFor<NotifySyncRfabExperience>(0x9002u);
+                Check(relayed.size() == 1 && relayed[0].Experience == 1000, "the guest is sent the 1000 XP by the ordinary relay");
+            }
 
             // The defect: Player::GetId() is new on every connection, so this paid 1000 again.
             leave(world, pGuest);
@@ -1963,7 +1970,7 @@ int main(int argc, char** argv)
             Check(catchUpSentTo(0x9003u) == 0, "a reconnect pays nothing to a player who was there when the XP was earned");
 
             leave(world, pGuest);
-            Check(earn(world, pHost, "s9-kill-2", 500) && ledger.GetTotalSharedXp() == 1500, "the host earns 500 XP while the guest is away");
+            Check(earn(world, pHost, 500) && ledger.GetTotalSharedXp() == 1500, "the host earns 500 XP while the guest is away");
             pGuest = joinAs(world, 0x9004u, "  guests9 ");
             Check(catchUpSentTo(0x9004u) == 500, "the returning guest is paid exactly what was earned while away (name compared without case and padding)");
             leave(world, pGuest);
