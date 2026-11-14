@@ -106,20 +106,17 @@ bool InventoryService::ApplyInventoryDelta(Player* apSender, uint32_t aServerId,
     }
     else if (pChar && pOwner && (!apSender || pOwner->GetOwner() != apSender))
     {
-        // RFAB mount saddlebag guard: block bystanders from mutating a mount's saddlebag while
-        // another player owns or is actively riding that horse (prevents saddlebag dupes/theft).
-        if (pChar->IsMount())
+        // A saddlebag is closed to others only while a different player is riding the horse (and
+        // only with the ride guard on). Who SIMULATES the horse says nothing about whose it is: a
+        // player's own horse is routinely simulated by whoever stood closer, and the earlier rule
+        // ("the simulating player or nobody") refused that player's own saddlebag.
+        if (pChar->IsMount() && m_world.GetCharacterService().IsMountHeldByOtherRider(aServerId, apSender))
         {
-            const uint32_t senderId = apSender ? apSender->GetId() : 0u;
-            const uint32_t ownerId = pOwner->GetOwner() ? pOwner->GetOwner()->GetId() : 0u;
-            if (!m_world.GetCharacterService().GetMountGuard().CanMutateMountSaddlebag(aServerId, senderId, ownerId))
-            {
-                spdlog::warn(
-                    "[RFAB Mounts] Rejected bystander saddlebag mutation on mount {:X} from player {}",
-                    aServerId,
-                    senderId);
-                return false;
-            }
+            spdlog::warn(
+                "[RFAB Mounts] Rejected saddlebag change on mount {:X} from player {}: another player is riding it",
+                aServerId,
+                apSender ? apSender->GetId() : 0u);
+            return false;
         }
 
         // A different peer may interact with an owned NPC (pickpocket or loot it) only while the

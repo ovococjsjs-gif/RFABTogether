@@ -2,9 +2,10 @@
 
 /**
  * Pure, deterministic RFAB world immersion & multiplayer isolation policies (Phase 3 Group C):
- *  1. MountOwnershipGuard: tracks active mount riders and enforces saddlebag ownership isolation
- *     so peers cannot hijack an actively ridden RFAB horse mid-gallop or duplicate saddlebag loot,
- *     and automatically frees mounts on dismount or rider disconnect.
+ *  1. MountOwnershipGuard: remembers which player is riding which mount, so that the server can
+ *     refuse a second rider, a takeover of the simulation or a saddlebag change while the ride
+ *     lasts. Only the start of a ride is reported by clients; how a ride ends is described at
+ *     IsRiderStillAtMount and IsMountExitAnimationEvent.
  *  2. PersonalBlessingCrimePolicy: isolates personal Divine Shrine blessings, Requiem SaveBlessing
  *     flags, and CrimeGold / bounty globals so one player's theft or shrine visit never strips a
  *     teammate's Divine Blessing or corrupts their crime state.
@@ -16,6 +17,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -48,10 +50,46 @@ public:
         return it != m_activeRiderByMountId.end() ? it->second.RiderPlayerId : 0u;
     }
 
-    [[nodiscard]] uint32_t GetMountedHorseForPlayer(uint32_t aPlayerId) const noexcept
+    [[nodiscard]] std::optional<ActiveRide> GetActiveRide(uint32_t aMountServerId) const noexcept
     {
-        const auto it = m_activeMountByPlayerId.find(aPlayerId);
-        return it != m_activeMountByPlayerId.end() ? it->second : 0u;
+        const auto it = m_activeRiderByMountId.find(aMountServerId);
+        if (it == m_activeRiderByMountId.end())
+            return std::nullopt;
+        return it->second;
+    }
+
+    // The server is told when a ride starts and never when it ends: no client sends a dismount.
+    // A ride is therefore over as soon as the rider is further from the mount than someone
+    // sitting on it can be. 1024 units is about 15 metres: far more than the lag between the two
+    // position reports at a gallop, far less than "walked away from the horse".
+    static constexpr float kMaxRiderToMountDistance = 1024.0f;
+
+    [[nodiscard]] static bool IsRiderStillAtMount(float aDistanceSquared) noexcept
+    {
+        return std::isfinite(aDistanceSquared) &&
+               aDistanceSquared <= kMaxRiderToMountDistance * kMaxRiderToMountDistance;
+    }
+
+    // The animation events a player's own graph sends when it gets off a horse or a dragon. The
+    // server sees them in the rider's action stream, which is the earliest sign that a ride ended.
+    [[nodiscard]] static bool IsMountExitAnimationEvent(std::string_view aEventName) noexcept
+    {
+        static constexpr std::string_view kExitEvents[] = {
+            "horseexit", "horseexitout", "dragonmountexit", "dragonmountexitout"};
+        for (const std::string_view exitEvent : kExitEvents)
+        {
+            if (aEventName.size() != exitEvent.size())
+                continue;
+            bool same = true;
+            for (size_t i = 0; i < exitEvent.size() && same; ++i)
+            {
+                const char ch = aEventName[i];
+                same = ((ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch) == exitEvent[i];
+            }
+            if (same)
+                return true;
+        }
+        return false;
     }
 
     // Attempts to bind `aMountServerId` to `aRiderPlayerId`.
@@ -105,29 +143,6 @@ public:
             m_activeRiderByMountId.erase(it->second);
             m_activeMountByPlayerId.erase(it);
         }
-    }
-
-    // Voluntary mount ownership transfer is blocked only while a DIFFERENT player is actively riding it.
-    [[nodiscard]] bool CanTransferMountOwnership(uint32_t aMountServerId, uint32_t aChallengerPlayerId) const noexcept
-    {
-        const uint32_t activeRider = GetActiveRiderPlayerId(aMountServerId);
-        return activeRider == 0 || activeRider == aChallengerPlayerId;
-    }
-
-    // RFAB horse saddlebag access guard: prevents a bystander from mutating a mount's saddlebag
-    // inventory while another player is actively riding that horse (eliminates mid-ride theft/dupes).
-    [[nodiscard]] bool CanMutateMountSaddlebag(
-        uint32_t aMountServerId,
-        uint32_t aMutatorPlayerId,
-        uint32_t aMountOwnerPlayerId) const noexcept
-    {
-        if (aMutatorPlayerId == 0)
-            return false;
-        const uint32_t activeRider = GetActiveRiderPlayerId(aMountServerId);
-        if (activeRider != 0)
-            return activeRider == aMutatorPlayerId;
-        // When nobody is actively riding the horse, the current mount owner (or unowned horse) may access it.
-        return aMountOwnerPlayerId == 0 || aMountOwnerPlayerId == aMutatorPlayerId;
     }
 
 private:

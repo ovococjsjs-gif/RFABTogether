@@ -106,6 +106,7 @@ extern Console::Setting<bool> bEnableSelfHealingResync;
 extern Console::Setting<bool> bEnableServerOwnedWorldItems;
 extern Console::Setting<bool> bEnableLateJoinCatchUpXp;
 extern Console::Setting<bool> bEnableSharedDragonSouls;
+extern Console::Setting<bool> bEnableMountRideGuard;
 
 namespace
 {
@@ -1875,59 +1876,7 @@ int main(int argc, char** argv)
                   "personal SaveBlessing/CrimeGold global is NEVER replicated to teammates");
         }
 
-        // 8.5 Mount Hijack & Saddlebag Anti-Dupe protection
-        {
-            const entt::entity horse = world.create();
-            const uint32_t horseId = World::ToInteger(horse);
-            world.emplace<OwnerComponent>(horse, pHost);
-            world.emplace<CellIdComponent>(horse, kCell);
-            auto& horseChar = world.emplace<CharacterComponent>(horse);
-            horseChar.SetMount(true);
-            world.emplace<InventoryComponent>(horse);
-
-            Inventory::Entry apple{};
-            apple.BaseId = GameId{0u, 0x00064B2Eu};
-            apple.Count = 5;
-            world.get<InventoryComponent>(horse).Content.AddOrRemoveEntry(apple);
-
-            // Host mounts the horse
-            MountRequest hostMount{};
-            hostMount.RiderId = World::ToInteger(hostChar);
-            hostMount.MountId = horseId;
-            Check(DeliverWire(world, hostMount, pHost), "Host mounts horse cleanly");
-            Check(world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseId) == pHost->GetId(),
-                  "MountGuard binds horse to Host while mounted");
-
-            // Guest tries to hijack the horse mid-ride -> rejected!
-            Harness::ClearOutbox();
-            MountRequest guestHijack{};
-            guestHijack.RiderId = World::ToInteger(guestChar);
-            guestHijack.MountId = horseId;
-            Check(DeliverWire(world, guestHijack, pGuest), "Guest hijack attempt processed");
-            Check(world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseId) == pHost->GetId(),
-                  "Guest cannot hijack an actively ridden horse");
-            Check(world.get<OwnerComponent>(horse).GetOwner() == pHost,
-                  "Horse ownership remains with Host rider");
-
-            // Guest tries to steal from Host's horse saddlebag -> rejected!
-            Inventory::Entry stealApple{};
-            stealApple.BaseId = apple.BaseId;
-            stealApple.Count = -1;
-            Check(!world.GetInventoryService().ApplyInventoryDelta(pGuest, horseId, stealApple, false, false, true),
-                  "Bystander saddlebag mutation is blocked while Host owns/rides horse");
-
-            // Host dismounts -> Guest can now mount cleanly!
-            MountRequest hostDismount{};
-            hostDismount.RiderId = World::ToInteger(hostChar);
-            hostDismount.MountId = 0;
-            Check(DeliverWire(world, hostDismount, pHost), "Host dismounts cleanly");
-            Check(world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseId) == 0u,
-                  "MountGuard releases horse immediately upon dismount");
-
-            Check(DeliverWire(world, guestHijack, pGuest), "Guest can mount horse after Host dismounts");
-            Check(world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseId) == pGuest->GetId(),
-                  "MountGuard transfers active rider to Guest after dismount");
-        }
+        // 8.5 The mount ride guard has its own scene (11), driven by the packets a client really sends.
 
         // 8.6 EncounterCoordinator edge-case hardening (duplicate revive anti-reset + last-player disconnect cleanup)
         {
@@ -2210,6 +2159,179 @@ int main(int argc, char** argv)
               "when the whole party is at the dragon nobody is sent a soul");
 
         bEnableSharedDragonSouls = false;
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+    }
+
+    // Scene 11: the mount ride guard (M3). Clients report the start of a ride and never its end,
+    // so the scene ends rides the three ways they really end: the rider's dismount animation, the
+    // rider walking away, the rider leaving the server. Every step is a packet a client sends.
+    {
+        std::printf("[scene 11] mount ride guard: a ride ends without a dismount packet\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xB001u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xB002u;
+        const GameId kStableCell{0u, 0x000B1001u};
+        const GameId kHorseBase{0u, 0x000109E3u};
+        const GameId kApple{0u, 0x00064B2Eu};
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 10.0f;
+        t0.Day = 3;
+        t0.Month = 3;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+        pHost->SetCellComponent(CellIdComponent{kStableCell});
+        pGuest->SetCellComponent(CellIdComponent{kStableCell});
+
+        uint32_t nextCookie = 700u;
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kGuardBase{0u, 0x000B4001u};
+        const auto assign = [&](Player* apOwner, TiltedPhoques::ConnectionId_t aConn, const GameId& acRefId, bool aIsMount, const glm::vec3& acPosition) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            request.ReferenceId = acRefId;
+            // A client sends no base form for its own character (the server refuses one).
+            if (acRefId != kPlayerRef)
+                request.FormId = aIsMount ? kHorseBase : kGuardBase;
+            request.CellId = kStableCell;
+            request.Position = acPosition;
+            request.CurrentActorData.BaseId = request.FormId;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[24] = 300.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 300.0f;
+            if (aIsMount)
+            {
+                Inventory::Entry apples{};
+                apples.BaseId = kApple;
+                apples.Count = 5;
+                request.CurrentActorData.InitialInventory.AddOrRemoveEntry(apples);
+            }
+            request.IsMount = aIsMount;
+            (void)DeliverWire(world, request, apOwner);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const auto requestMount = [&](Player* apRider, uint32_t aRiderId, uint32_t aMountId) {
+            Harness::ClearOutbox();
+            MountRequest request{};
+            request.RiderId = aRiderId;
+            request.MountId = aMountId;
+            return DeliverWire(world, request, apRider);
+        };
+        // The other player is told about a mount only when the server accepted the request.
+        const auto wasToldAboutMount = [](TiltedPhoques::ConnectionId_t aConn, uint32_t aRiderId, uint32_t aMountId) {
+            for (const auto& notify : DecodeOutboxMessagesFor<NotifyMount>(aConn))
+                if (notify.RiderId == aRiderId && notify.MountId == aMountId)
+                    return true;
+            return false;
+        };
+        const auto wasGrantedSimulation = [](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& grant : DecodeOutboxMessagesFor<NotifyOwnershipTransfer>(aConn))
+                if (grant.ServerId == aServerId)
+                    return true;
+            return false;
+        };
+        // One movement report for an entity the sender simulates, optionally with an animation event.
+        const auto reportMovement = [&](Player* apSender, uint32_t aServerId, const glm::vec3& acPosition, const char* acAnimationEvent) {
+            ClientReferencesMoveRequest request{};
+            request.Tick = 1000u;
+            ReferenceUpdate update{};
+            update.UpdatedMovement.CellId = kStableCell;
+            update.UpdatedMovement.Position = acPosition;
+            if (acAnimationEvent != nullptr)
+            {
+                ActionEvent action{};
+                action.ActorId = aServerId;
+                action.EventName = acAnimationEvent;
+                update.ActionEvents.push_back(action);
+            }
+            request.Updates[aServerId] = update;
+            Harness::ClearOutbox();
+            Deliver(world, request, apSender);
+        };
+        const auto takeApple = [&](Player* apTaker, uint32_t aHorseId) {
+            Harness::ClearOutbox();
+            RequestInventoryChanges request{};
+            request.ServerId = aHorseId;
+            request.Item.BaseId = kApple;
+            request.Item.Count = -1;
+            request.UpdateClients = true;
+            return DeliverWire(world, request, apTaker);
+        };
+        const auto applesLeft = [&](uint32_t aHorseId) {
+            GameId apple = kApple;
+            return world.get<InventoryComponent>(static_cast<entt::entity>(aHorseId)).Content.GetEntryCountById(apple);
+        };
+
+        const glm::vec3 kAtStable{100.0f, 100.0f, 0.0f};
+        const uint32_t hostChar = assign(pHost, kHostConn, kPlayerRef, false, kAtStable);
+        const uint32_t guestChar = assign(pGuest, kGuestConn, kPlayerRef, false, kAtStable);
+        const uint32_t horseA = assign(pHost, kHostConn, GameId{0u, 0x000B2001u}, true, kAtStable);
+        const uint32_t horseB = assign(pHost, kHostConn, GameId{0u, 0x000B2002u}, true, kAtStable);
+        Check(hostChar != 0xFFFFFFFFu && guestChar != 0xFFFFFFFFu && horseA != 0xFFFFFFFFu && horseB != 0xFFFFFFFFu,
+              "two player characters and two horses are registered");
+
+        // --- Off (the default): the behaviour of 4.1.0, whoever mounts takes the horse over.
+        Check(requestMount(pHost, hostChar, horseA) && wasToldAboutMount(kGuestConn, hostChar, horseA),
+              "the host mounts a horse and the guest is told");
+        Check(requestMount(pGuest, guestChar, horseA) && wasToldAboutMount(kHostConn, guestChar, horseA) &&
+                  wasGrantedSimulation(kGuestConn, horseA),
+              "with Gameplay:bEnableMountRideGuard off (the default) a second mount request is honoured as in 4.1.0");
+        Check(takeApple(pHost, horseA) && applesLeft(horseA) == 4,
+              "with the guard off a player who does not simulate the horse can still use its saddlebag");
+
+        // --- On.
+        bEnableMountRideGuard = true;
+        reportMovement(pGuest, guestChar, kAtStable, "HorseExit");
+        Check(requestMount(pHost, hostChar, horseA) && wasToldAboutMount(kGuestConn, hostChar, horseA) &&
+                  wasGrantedSimulation(kHostConn, horseA),
+              "with the guard on the host mounts horse A");
+        Check(requestMount(pGuest, guestChar, horseA) && !wasToldAboutMount(kHostConn, guestChar, horseA) &&
+                  !wasGrantedSimulation(kGuestConn, horseA),
+              "the guest cannot mount the horse the host is riding");
+        Check(takeApple(pGuest, horseA) && applesLeft(horseA) == 4, "the guest cannot change the saddlebag of the horse the host is riding");
+        Check(takeApple(pHost, horseA) && applesLeft(horseA) == 3, "the rider can use the saddlebag of the horse they ride");
+
+        // 1. The rider's own animation: the only dismount report a client produces.
+        reportMovement(pHost, hostChar, kAtStable, "HorseExit");
+        Check(takeApple(pGuest, horseA) && applesLeft(horseA) == 2, "after the host's dismount animation the saddlebag is open to the guest");
+        Check(requestMount(pGuest, guestChar, horseA) && wasToldAboutMount(kHostConn, guestChar, horseA) &&
+                  wasGrantedSimulation(kGuestConn, horseA),
+              "after the host's dismount animation the guest can mount the horse");
+
+        // 2. No animation event arrives (lost, or the game used another one): the rider walks away.
+        reportMovement(pGuest, guestChar, kAtStable, "HorseExit");
+        Check(requestMount(pHost, hostChar, horseB), "the host mounts horse B");
+        reportMovement(pHost, hostChar, {100.0f + 400.0f, 100.0f, 0.0f}, nullptr);
+        Check(requestMount(pGuest, guestChar, horseB) && !wasToldAboutMount(kHostConn, guestChar, horseB),
+              "a rider whose position report lags a little behind the horse is still riding");
+        reportMovement(pHost, hostChar, {100.0f + 5000.0f, 100.0f, 0.0f}, nullptr);
+        Check(requestMount(pGuest, guestChar, horseB) && wasToldAboutMount(kHostConn, guestChar, horseB),
+              "once the rider is far from the horse the ride is over, without any dismount report");
+
+        // 3. An NPC the host simulates mounts a horse: no ride is recorded under the host's name.
+        reportMovement(pGuest, guestChar, kAtStable, "HorseExit");
+        reportMovement(pHost, hostChar, kAtStable, nullptr);
+        const uint32_t hostNpc = assign(pHost, kHostConn, GameId{0u, 0x000B3001u}, false, kAtStable);
+        Check(requestMount(pHost, hostChar, horseA), "the host mounts horse A again");
+        Check(hostNpc != 0xFFFFFFFFu && requestMount(pHost, hostNpc, horseB) && wasToldAboutMount(kGuestConn, hostNpc, horseB),
+              "an NPC simulated by the host mounts horse B");
+        Check(requestMount(pGuest, guestChar, horseA) && !wasToldAboutMount(kHostConn, guestChar, horseA),
+              "the NPC's mount did not overwrite the host's own ride: horse A is still the host's");
+
+        // 4. The rider leaves the server.
+        world.GetDispatcher().trigger(PlayerLeaveEvent{pHost});
+        Check(requestMount(pGuest, guestChar, horseA) && world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseA) == pGuest->GetId(),
+              "after the rider left the server the guest can mount the horse");
+
+        bEnableMountRideGuard = false;
         std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
     }
 

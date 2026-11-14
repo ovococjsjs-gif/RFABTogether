@@ -17,6 +17,7 @@
 #include <Structs/Inventory.h>
 
 #include <filesystem>
+#include <limits>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -533,19 +534,52 @@ TEST_CASE("Late-join catch-up XP is counted per persistent identity, not per con
 TEST_CASE("3C RFAB World Immersion: Mount Ownership, Personal Blessings/CrimeGold, and TrueHUD Synergy", "[rfab][phase3][immersion]")
 {
     // 1. MountOwnershipGuard
-    RfabWorldImmersion::MountOwnershipGuard mountGuard;
+    using MountGuard = RfabWorldImmersion::MountOwnershipGuard;
+    MountGuard mountGuard;
     REQUIRE(mountGuard.TryAcquireRide(500u, 1u, 10u));
-    // Peer 2 cannot hijack horse 500 while Player 1 is riding it!
+    // Peer 2 cannot take horse 500 while Player 1 is riding it.
     REQUIRE_FALSE(mountGuard.TryAcquireRide(500u, 2u, 20u));
-    REQUIRE_FALSE(mountGuard.CanTransferMountOwnership(500u, 2u));
-    REQUIRE_FALSE(mountGuard.CanMutateMountSaddlebag(500u, 2u, 1u));
-    REQUIRE(mountGuard.CanMutateMountSaddlebag(500u, 1u, 1u));
+    REQUIRE(mountGuard.GetActiveRiderPlayerId(500u) == 1u);
+    {
+        const auto ride = mountGuard.GetActiveRide(500u);
+        REQUIRE(ride.has_value());
+        CHECK(ride->RiderPlayerId == 1u);
+        CHECK(ride->RiderServerEntityId == 10u);
+        CHECK_FALSE(mountGuard.GetActiveRide(501u).has_value());
+    }
 
-    // Player 1 disconnects -> horse 500 is immediately released and mountable by Player 2!
+    // Player 1 disconnects -> horse 500 is free for Player 2.
     mountGuard.ReleaseAllForPlayer(1u);
-    REQUIRE(mountGuard.CanTransferMountOwnership(500u, 2u));
+    REQUIRE(mountGuard.GetActiveRiderPlayerId(500u) == 0u);
     REQUIRE(mountGuard.TryAcquireRide(500u, 2u, 20u));
     REQUIRE(mountGuard.GetActiveRiderPlayerId(500u) == 2u);
+
+    // Mounting another animal ends the previous ride of the same player.
+    REQUIRE(mountGuard.TryAcquireRide(600u, 2u, 20u));
+    CHECK(mountGuard.GetActiveRiderPlayerId(500u) == 0u);
+    CHECK(mountGuard.GetActiveRiderPlayerId(600u) == 2u);
+
+    // The mount is gone (dead, removed, or the ride was found to be over): whoever rode it is free.
+    mountGuard.ReleaseMountEntity(600u);
+    CHECK(mountGuard.GetActiveRiderPlayerId(600u) == 0u);
+    REQUIRE(mountGuard.TryAcquireRide(700u, 2u, 20u));
+
+    // No client reports a dismount. A ride ends when the rider is no longer where the mount is...
+    CHECK(MountGuard::IsRiderStillAtMount(0.0f));
+    CHECK(MountGuard::IsRiderStillAtMount(300.0f * 300.0f)); // position reports lag at a gallop
+    CHECK(MountGuard::IsRiderStillAtMount(MountGuard::kMaxRiderToMountDistance * MountGuard::kMaxRiderToMountDistance));
+    CHECK_FALSE(MountGuard::IsRiderStillAtMount(1100.0f * 1100.0f));
+    CHECK_FALSE(MountGuard::IsRiderStillAtMount(std::numeric_limits<float>::quiet_NaN()));
+    CHECK_FALSE(MountGuard::IsRiderStillAtMount(std::numeric_limits<float>::infinity()));
+
+    // ...or when the rider's own animation says so.
+    CHECK(MountGuard::IsMountExitAnimationEvent("HorseExit"));
+    CHECK(MountGuard::IsMountExitAnimationEvent("horseexitout"));
+    CHECK(MountGuard::IsMountExitAnimationEvent("DragonMountExitOut"));
+    CHECK_FALSE(MountGuard::IsMountExitAnimationEvent("HorseEnter"));
+    CHECK_FALSE(MountGuard::IsMountExitAnimationEvent("HorseExitOutExtra"));
+    CHECK_FALSE(MountGuard::IsMountExitAnimationEvent("NPCHorseExit")); // an NPC rider holds no lock
+    CHECK_FALSE(MountGuard::IsMountExitAnimationEvent(""));
 
     // 2. PersonalBlessingCrimePolicy
     REQUIRE(RfabWorldImmersion::IsPersonalCrimeOrBlessingGlobal("RFAB_SaveBlessing"));

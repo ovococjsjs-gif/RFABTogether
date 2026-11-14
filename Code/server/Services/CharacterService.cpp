@@ -1373,10 +1373,9 @@ void CharacterService::OnOwnershipClaimRequest(const PacketEvent<RequestOwnershi
         !pOwnerComp->GetLease().IsExpired(nowMs))
     {
         // Simulation Authority != Combat Target: while the current owner is connected, in range, and its lease is live,
-        // only allow mounting an un-ridden horse (`IsMount()` && `CanTransferMountOwnership`) or calm non-combat takeover by the party leader.
+        // only allow taking a horse that nobody else is riding (`IsMount()`) or calm non-combat takeover by the party leader.
         const bool canTakeMount =
-            pCharComp->IsMount() &&
-            m_mountGuard.CanTransferMountOwnership(acMessage.Packet.ServerId, acMessage.pPlayer->GetId());
+            pCharComp->IsMount() && !IsMountHeldByOtherRider(acMessage.Packet.ServerId, acMessage.pPlayer);
         const bool allowedVoluntaryTakeover =
             canTakeMount ||
             (m_world.GetPartyService().IsPlayerLeader(acMessage.pPlayer) && !pCharComp->IsWeaponDrawn());
@@ -1597,6 +1596,20 @@ void CharacterService::OnReferencesMoveRequest(const PacketEvent<ClientReference
 
             animationComponent.CurrentAction = action;
             acceptedActions.push_back(animationComponent.CurrentAction);
+        }
+
+        // A player getting off a mount: the only report of a dismount there is.
+        if (characterComponent.IsPlayer())
+        {
+            for (const auto& action : acceptedActions)
+            {
+                if (RfabWorldImmersion::MountOwnershipGuard::IsMountExitAnimationEvent(
+                        std::string_view(action.EventName.c_str(), action.EventName.size())))
+                {
+                    m_mountGuard.ReleaseAllForPlayer(acMessage.pPlayer->GetId());
+                    break;
+                }
+            }
         }
 
         animationComponent.ActionsReplayCache.AppendAll(acceptedActions);
