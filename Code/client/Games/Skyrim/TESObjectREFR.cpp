@@ -1246,10 +1246,8 @@ bool TESObjectREFR::PlayAnimationAndWait(BSFixedString* apAnimation, BSFixedStri
 
     PAPYRUS_FUNCTION(bool, ObjectReference, PlayAnimationAndWait, BSFixedString*, BSFixedString*);
 
-    s_cancelAnimationWaitEvent = true;
-    bool result = s_pPlayAnimationAndWait(this, apAnimation, apEventName);
-    s_cancelAnimationWaitEvent = false;
-    return result;
+    ScopedTlsValue<bool> applyingRemoteAnimation(s_cancelAnimationWaitEvent, true);
+    return s_pPlayAnimationAndWait(this, apAnimation, apEventName);
 }
 
 #define OBJECT_ANIM_SYNC 1
@@ -1287,10 +1285,8 @@ bool TESObjectREFR::PlayAnimation(BSFixedString* apEventName) noexcept
 
     PAPYRUS_FUNCTION(bool, ObjectReference, PlayAnimation, BSFixedString*);
 
-    s_cancelAnimationEvent = true;
-    bool result = s_pPlayAnimation(this, apEventName);
-    s_cancelAnimationEvent = false;
-    return result;
+    ScopedTlsValue<bool> applyingRemoteAnimation(s_cancelAnimationEvent, true);
+    return s_pPlayAnimation(this, apEventName);
 }
 
 bool TESObjectREFR::SendAnimationEvent(BSFixedString* apEventName) noexcept

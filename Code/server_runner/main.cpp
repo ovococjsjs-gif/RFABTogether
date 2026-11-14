@@ -14,6 +14,7 @@
 #include <base/threading/ThreadUtils.h>
 
 #include "DediRunner.h"
+#include <common/Compat/SafeFs.h>
 
 #ifdef _WIN32
 #include <base/dialogues/win/TaskDialog.h>
@@ -138,7 +139,7 @@ static bool ShowEULADialog()
 static bool IsEULAAccepted()
 {
     std::error_code ec;
-    const auto cfgDir = fs::current_path() / kConfigPathName;
+    const auto cfgDir = Compat::SafeFs::CurrentPathOr(fs::path(".")) / kConfigPathName;
     fs::create_directories(cfgDir, ec);
     const auto path = cfgDir / kEULAName;
 

@@ -4,8 +4,10 @@
 #include <SaveLoad.h>
 #include <common/CoopWorldStabilizer.h>
 #include <common/RfabModpackCompat.h>
+#include <common/Compat/SafeFs.h>
 #include <Games/IFormFactory.h>
 #include <Games/Memory.h>
+#include <Games/Overrides.h>
 #include <Games/TES.h>
 #include <Services/CharacterService.h>
 #include <Services/CoordinatedSaveService.h>
@@ -490,30 +492,33 @@ size_t BGSSaveLoadManager::QuarantineCorruptSavesOnce() noexcept
         if (savesDir.empty())
             return 0;
 
-        size_t quarantined = RfabCompat::Detail::QuarantineCorruptEssFilesInDirectory(savesDir);
-        std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(savesDir, ec))
-        {
-            if (ec)
-                break;
+        // Only saves the coop wrote (RFAB_MP_...) are ever moved; the player's own saves are named
+        // in the log and left alone, and a file that is locked right now is not judged (M14, 4.4).
+        RfabCompat::Detail::SaveQuarantineReport report = RfabCompat::Detail::QuarantineDamagedCoopSavesInDirectory(savesDir);
+        Compat::SafeFs::ForEachEntry(savesDir, [&report](const std::filesystem::directory_entry& acEntry) {
+            if (!Compat::SafeFs::IsDirectory(acEntry))
+                return;
 
-            std::error_code subEc;
-            if (!entry.is_directory(subEc) || subEc)
-                continue;
-
-            const auto u8Dir = entry.path().filename().u8string();
-            const std::string dirName = RfabCompat::Detail::ToLowerAscii(
-                std::string_view(reinterpret_cast<const char*>(u8Dir.data()), u8Dir.size()));
+            const std::string dirName = RfabCompat::Detail::ToLowerAscii(Compat::SafeFs::FileNameUtf8Lossy(acEntry.path()));
             if (dirName == "quarantined_corrupt_v100" || dirName == "_rfab_corruptquarantine")
-                continue;
+                return;
 
-            quarantined += RfabCompat::Detail::QuarantineCorruptEssFilesInDirectory(entry.path());
+            report.Add(RfabCompat::Detail::QuarantineDamagedCoopSavesInDirectory(acEntry.path()));
+        });
+
+        if (report.Moved > 0)
+            spdlog::warn("[RFAB SaveLoad] moved {} damaged coop save file(s) into Quarantined_Corrupt_v100", report.Moved);
+        if (report.MoveFailed > 0)
+            spdlog::warn("[RFAB SaveLoad] {} damaged coop save file(s) could not be moved (in use or no access)", report.MoveFailed);
+        if (report.ForeignDamaged > 0)
+        {
+            spdlog::warn("[RFAB SaveLoad] {} save file(s) that are not coop saves look damaged; they were left where they are: {}",
+                         report.ForeignDamaged, report.DescribeForeign());
         }
+        if (report.Unreadable > 0)
+            spdlog::info("[RFAB SaveLoad] {} save file(s) could not be opened right now and were not checked", report.Unreadable);
 
-        if (quarantined > 0)
-            spdlog::warn("[RFAB SaveLoad] Quarantined {} corrupt/truncated .ess save file(s) into _RFAB_CorruptQuarantine", quarantined);
-
-        return quarantined;
+        return report.Moved;
     }
     catch (...)
     {
@@ -573,9 +578,11 @@ bool BGSSaveLoadManager::ExecuteDirectSaveFromProcessEvents(const char* acpFileN
     if (cleanStem.empty())
         return false;
 
-    s_inDirectProcessEventsSave = true;
-    const bool rawOk = TiltedPhoques::ThisCall(RealSaveImpl, this, 2, 0u, cleanStem.c_str());
-    s_inDirectProcessEventsSave = false;
+    bool rawOk = false;
+    {
+        ScopedTlsValue<bool> directSave(s_inDirectProcessEventsSave, true);
+        rawOk = TiltedPhoques::ThisCall(RealSaveImpl, this, 2, 0u, cleanStem.c_str());
+    }
 
     if (!rawOk)
         return false;

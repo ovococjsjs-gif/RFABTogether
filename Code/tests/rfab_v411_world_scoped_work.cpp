@@ -377,17 +377,24 @@ TEST_CASE("v4.1.1 world-scoped work: many game threads post through reloads, not
     // between a completed begin and the start of the end. A hook that reads the same odd value
     // before and after stamping knows its event was produced inside that load.
     std::atomic<uint32_t> loadWindow{0};
-    std::atomic<bool> stop{false};
+    std::atomic<uint32_t> hooksDone{0};
     std::atomic<uint64_t> ran{0};
     std::atomic<uint64_t> ranFromInsideLoad{0};
     std::atomic<uint64_t> postedInsideLoad{0};
     const Lifecycle* pCycle = &cycle;
 
+    // A fixed amount of work, well under the lane's capacity even if the main thread never drained:
+    // the accounting below is then exact on any machine (a full lane drops posts, which is correct
+    // behaviour but would make "posted inside a load" and "dropped as stale" incomparable).
+    constexpr uint32_t kHookThreads = 4;
+    constexpr uint32_t kPostsPerThread = 40000;
+    REQUIRE(static_cast<size_t>(kHookThreads) * kPostsPerThread < queue.GetCapacity(Lane::kSimulation));
+
     std::vector<std::thread> hooks;
-    for (int t = 0; t < 4; ++t)
+    for (uint32_t t = 0; t < kHookThreads; ++t)
     {
         hooks.emplace_back([&]() {
-            while (!stop.load(std::memory_order_acquire))
+            for (uint32_t i = 0; i < kPostsPerThread; ++i)
             {
                 const uint32_t before = loadWindow.load(std::memory_order_seq_cst);
                 const PostStamp stamp = pCycle->GetPostStampAnyThread();
@@ -404,6 +411,7 @@ TEST_CASE("v4.1.1 world-scoped work: many game threads post through reloads, not
                     },
                     Scope::kWorld);
             }
+            hooksDone.fetch_add(1, std::memory_order_release);
         });
     }
 
@@ -413,7 +421,10 @@ TEST_CASE("v4.1.1 world-scoped work: many game threads post through reloads, not
             [&](const PostStamp& acStamp) noexcept { return cycle.IsWorldWorkStillValid(acStamp); });
     };
 
-    for (int i = 0; i < 300; ++i)
+    // Load after load, with frames at every point where the client runs one, for as long as the
+    // hooks are posting (and a few hundred loads at least, however fast they finish).
+    uint32_t loads = 0;
+    while (hooksDone.load(std::memory_order_acquire) < kHookThreads || loads < 300)
     {
         frame();
         cycle.OnWorldLoadBegin(true);
@@ -424,17 +435,20 @@ TEST_CASE("v4.1.1 world-scoped work: many game threads post through reloads, not
         loadWindow.fetch_add(1, std::memory_order_seq_cst);  // even: about to end
         cycle.OnWorldLoadEnd(true);
         frame();
+        ++loads;
     }
-    stop.store(true, std::memory_order_release);
     for (auto& hook : hooks)
         hook.join();
     frame();
 
     const LaneStats stats = queue.GetStats(Lane::kSimulation);
     CHECK(ranFromInsideLoad.load() == 0);
+    CHECK(stats.Posted == static_cast<uint64_t>(kHookThreads) * kPostsPerThread);
+    CHECK(stats.DroppedOverflow == 0);
     CHECK(stats.Executed == ran.load());
-    CHECK(stats.Posted == stats.Executed + stats.DroppedStaleWorld + stats.DroppedOverflow);
+    CHECK(stats.Posted == stats.Executed + stats.DroppedStaleWorld);
     CHECK(stats.DroppedStaleWorld >= postedInsideLoad.load());
     CHECK(stats.DroppedStale == 0);
     CHECK(stats.Failed == 0);
+    CHECK(stats.Pending == 0);
 }

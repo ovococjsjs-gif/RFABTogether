@@ -4,6 +4,7 @@
 #include <common/CoopPacketSafety.h>
 #include <common/CoopWorldView.h>
 #include <common/RfabModpackCompat.h>
+#include <common/Compat/SafeFs.h>
 #include <Components.h>
 #include <Events/PlayerLeaveEvent.h>
 #include <Events/UpdateEvent.h>
@@ -290,7 +291,7 @@ std::string SaveSnapshotService::GetPlayerIdentityKey(const Player* apPlayer)
 
 std::filesystem::path SaveSnapshotService::GetDefaultCheckpointStorePath()
 {
-    return std::filesystem::current_path() / "Data" / "rfab_checkpoints.bin";
+    return Compat::SafeFs::CurrentPathOr(std::filesystem::path(".")) / "Data" / "rfab_checkpoints.bin";
 }
 
 SaveSnapshotService::SaveSnapshotService(World& aWorld, entt::dispatcher& aDispatcher) noexcept

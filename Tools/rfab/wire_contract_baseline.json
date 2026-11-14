@@ -3,12 +3,6 @@
   "known": [
     {
       "rule": "W3",
-      "subject": "RequestCoordinatedSaveLoad::ActionType::LoadPreviousCheckpoint",
-      "detail": "never referenced by the sender (Code/client)",
-      "reason": "SaveSnapshotService implements the rollback to the previous checkpoint, but no client key, menu or command sends it. Decided in WORK_PLAN package 4.4 (saves)."
-    },
-    {
-      "rule": "W3",
       "subject": "ReviveActionRequest::ActionType::CancelChannel",
       "detail": "never referenced by the receiver (Code/server)",
       "reason": "Not a defect: handled by the final else of EncounterService::OnReviveActionRequest, which this rule cannot see."

@@ -17,6 +17,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "Compat/SafeFs.h"
+
 namespace RfabCompat
 {
 inline constexpr std::string_view kRfabOnlineVersion = "4.1.1";
@@ -487,47 +489,38 @@ inline std::filesystem::path ResolveExistingEssSlotPath(
         return std::find(foldedTargets.begin(), foldedTargets.end(), folded) != foldedTargets.end();
     };
 
-    for (const auto& entry : std::filesystem::directory_iterator(acSavesDir, ec))
-    {
-        if (ec)
-            break;
-
-        std::error_code entryEc;
-        if (entry.is_regular_file(entryEc) && !entryEc)
+    // SafeFs::ForEachEntry: the walk cannot throw, whatever the names in the folder are (M14).
+    std::filesystem::path found;
+    ::Compat::SafeFs::ForEachEntry(acSavesDir, [&](const std::filesystem::directory_entry& acEntry) {
+        if (::Compat::SafeFs::IsRegularFile(acEntry))
         {
-            const auto u8Name = entry.path().filename().u8string();
-            const std::string fn(reinterpret_cast<const char*>(u8Name.data()), u8Name.size());
-            if (matchesTarget(fn))
-                return entry.path();
+            if (matchesTarget(::Compat::SafeFs::FileNameUtf8Lossy(acEntry.path())))
+                found = acEntry.path();
         }
-        else if (entry.is_directory(entryEc) && !entryEc)
+        else if (::Compat::SafeFs::IsDirectory(acEntry))
         {
             for (const auto& stemUtf8 : candidateUtf8Stems)
             {
-                const std::filesystem::path subDirect = entry.path() / makeUtf8Path(stemUtf8 + ".ess");
-                if (std::filesystem::exists(subDirect, entryEc) && !entryEc &&
-                    std::filesystem::is_regular_file(subDirect, entryEc) && !entryEc)
+                const std::filesystem::path subDirect = acEntry.path() / makeUtf8Path(stemUtf8 + ".ess");
+                if (::Compat::SafeFs::IsRegularFile(subDirect))
                 {
-                    return subDirect;
+                    found = subDirect;
+                    return false;
                 }
             }
-            std::error_code subIterEc;
-            for (const auto& subEntry : std::filesystem::directory_iterator(entry.path(), subIterEc))
-            {
-                if (subIterEc)
-                    break;
-                std::error_code subFileEc;
-                if (!subEntry.is_regular_file(subFileEc) || subFileEc)
-                    continue;
-                const auto u8Sub = subEntry.path().filename().u8string();
-                const std::string subFn(reinterpret_cast<const char*>(u8Sub.data()), u8Sub.size());
-                if (matchesTarget(subFn))
-                    return subEntry.path();
-            }
+            ::Compat::SafeFs::ForEachEntry(acEntry.path(), [&](const std::filesystem::directory_entry& acSubEntry) {
+                if (!::Compat::SafeFs::IsRegularFile(acSubEntry))
+                    return true;
+                if (!matchesTarget(::Compat::SafeFs::FileNameUtf8Lossy(acSubEntry.path())))
+                    return true;
+                found = acSubEntry.path();
+                return false;
+            });
         }
-    }
+        return found.empty();
+    });
 
-    return {};
+    return found;
 }
 
 // Verifies that an `.ess` file on disk has a genuine Skyrim `TESV_SAVEGAME` header, intact screenshot,
@@ -770,73 +763,182 @@ enum class SavePairValidationResult : uint8_t
     return SavePairValidationResult::kOk;
 }
 
-// Safely moves truncated / headerless / ScrapHeap-aborted `.ess` files into `_RFAB_CorruptQuarantine/`
-// alongside any matching `.skse` or `.ess.tmp` companion files (never deleting user files without backup).
-inline size_t QuarantineCorruptEssFilesInDirectory(const std::filesystem::path& acSavesDir) noexcept
+// True when the file can be opened and its first byte read right now. A save that another program
+// holds open (a cloud sync client, an antivirus scan) fails here; such a file is not judged at all.
+[[nodiscard]] inline bool CanReadFileNow(const std::filesystem::path& acPath) noexcept
 {
-    std::error_code ec;
-    if (acSavesDir.empty() || !std::filesystem::exists(acSavesDir, ec) || !std::filesystem::is_directory(acSavesDir, ec))
-        return 0;
-
-    std::vector<std::filesystem::path> corruptEssFiles;
-    std::vector<std::filesystem::path> corruptSkseFiles;
-    for (const auto& entry : std::filesystem::directory_iterator(acSavesDir, ec))
+    try
     {
-        if (ec || !entry.is_regular_file(ec))
-            continue;
+        std::ifstream ifs(acPath, std::ios::in | std::ios::binary);
+        if (!ifs.is_open())
+            return false;
+        char first = 0;
+        ifs.read(&first, 1);
+        return ifs.gcount() == 1 || ifs.eof();  // an empty file can be read; it is just not a save
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
 
-        const std::string fname = entry.path().filename().string();
-        if (EndsWithIgnoreCase(fname, ".ess") && !IsValidEssFileOnDisk(entry.path()))
+// Every save the coop writes is named RFAB_MP_...: the coordinated saves (Save/Barrier.h) and the
+// pre-join backup (CoopCheckpointStore.h). Nothing else in the saves folder belongs to it.
+inline constexpr std::string_view kCoopSaveSlotPrefix = "RFAB_MP_";
+
+[[nodiscard]] inline bool IsCoopSaveFile(const std::filesystem::path& acPath) noexcept
+{
+    return ::Compat::SafeFs::FileNameStartsWithAsciiNoCase(acPath, kCoopSaveSlotPrefix);
+}
+
+struct SaveQuarantineReport
+{
+    static constexpr size_t kMaxReportedNames = 8;
+
+    size_t Moved{0};           // damaged coop saves and co-saves moved into the quarantine folder
+    size_t MoveFailed{0};      // damaged coop files that could not be moved (in use, no access)
+    size_t ForeignDamaged{0};  // damaged saves the coop did not create: left exactly where they are
+    size_t Unreadable{0};      // could not be opened right now: not judged, left where they are
+    bool WalkFailed{false};    // the folder could not be read to the end
+    std::vector<std::string> ForeignNamesUtf8{};  // the first kMaxReportedNames damaged foreign files
+
+    // Adds the report of another folder (the saves folder has per-profile subfolders).
+    void Add(const SaveQuarantineReport& acOther)
+    {
+        Moved += acOther.Moved;
+        MoveFailed += acOther.MoveFailed;
+        ForeignDamaged += acOther.ForeignDamaged;
+        Unreadable += acOther.Unreadable;
+        WalkFailed = WalkFailed || acOther.WalkFailed;
+        for (const auto& name : acOther.ForeignNamesUtf8)
         {
-            corruptEssFiles.push_back(entry.path());
-        }
-        else if (EndsWithIgnoreCase(fname, ".ess.tmp") && !IsValidEssFileOnDisk(entry.path()))
-        {
-            corruptEssFiles.push_back(entry.path());
-        }
-        else if (EndsWithIgnoreCase(fname, ".skse") && !IsValidSkseCosaveOnDisk(entry.path()))
-        {
-            corruptSkseFiles.push_back(entry.path());
+            if (ForeignNamesUtf8.size() >= kMaxReportedNames)
+                break;
+            ForeignNamesUtf8.push_back(name);
         }
     }
 
-    if (corruptEssFiles.empty() && corruptSkseFiles.empty())
-        return 0;
-
-    const std::filesystem::path quarantineDir = acSavesDir / "Quarantined_Corrupt_v100";
-    std::filesystem::create_directories(quarantineDir, ec);
-    if (ec)
-        return 0;
-
-    size_t movedCount = 0;
-    for (const auto& badPath : corruptEssFiles)
+    // "a.ess, b.ess and 3 more" for the log; empty when there is nothing to name.
+    [[nodiscard]] std::string DescribeForeign() const
     {
-        const auto destPath = quarantineDir / badPath.filename();
-        std::filesystem::rename(badPath, destPath, ec);
-        if (!ec)
+        std::string text;
+        for (const auto& name : ForeignNamesUtf8)
         {
-            ++movedCount;
-            if (EndsWithIgnoreCase(badPath.filename().string(), ".ess"))
+            if (!text.empty())
+                text += ", ";
+            text += name;
+        }
+        if (ForeignDamaged > ForeignNamesUtf8.size())
+        {
+            if (!text.empty())
+                text += " ";
+            text += "and " + std::to_string(ForeignDamaged - ForeignNamesUtf8.size()) + " more";
+        }
+        return text;
+    }
+};
+
+// Looks at every `.ess`, `.ess.tmp` and `.skse` in the folder (not in its subfolders).
+//
+// A damaged file that the COOP wrote (IsCoopSaveFile) is moved into `Quarantined_Corrupt_v100/`
+// next to it, a damaged `.ess` together with its `.skse`: the coordinated reload must never pick a
+// truncated slot. Nothing is deleted.
+//
+// A damaged file that the coop did NOT write is the player's own save. It is counted and named in
+// the report and otherwise left alone: until 4.1.1 it was moved too, so a save that this validator
+// did not understand, or that happened to be locked, vanished from the load menu (defect M14).
+// A file that cannot be opened right now is not called damaged at all.
+//
+// Never throws, whatever the names in the folder are: no path::string(), no throwing iteration.
+[[nodiscard]] inline SaveQuarantineReport QuarantineDamagedCoopSavesInDirectory(const std::filesystem::path& acSavesDir) noexcept
+{
+    SaveQuarantineReport report;
+    try
+    {
+        if (acSavesDir.empty() || !::Compat::SafeFs::IsDirectory(acSavesDir))
+            return report;
+
+        std::vector<std::filesystem::path> damagedEss;
+        std::vector<std::filesystem::path> damagedSkse;
+        const bool walked = ::Compat::SafeFs::ForEachEntry(acSavesDir, [&](const std::filesystem::directory_entry& acEntry) {
+            if (!::Compat::SafeFs::IsRegularFile(acEntry))
+                return;
+
+            const std::filesystem::path& path = acEntry.path();
+            const bool isEss = ::Compat::SafeFs::EndsWithAsciiNoCase(path, ".ess") || ::Compat::SafeFs::EndsWithAsciiNoCase(path, ".ess.tmp");
+            const bool isSkse = !isEss && ::Compat::SafeFs::EndsWithAsciiNoCase(path, ".skse");
+            if (!isEss && !isSkse)
+                return;
+            if (isEss ? IsValidEssFileOnDisk(path) : IsValidSkseCosaveOnDisk(path))
+                return;
+
+            if (!CanReadFileNow(path))
+            {
+                ++report.Unreadable;
+                return;
+            }
+            if (!IsCoopSaveFile(path))
+            {
+                ++report.ForeignDamaged;
+                if (report.ForeignNamesUtf8.size() < SaveQuarantineReport::kMaxReportedNames)
+                    report.ForeignNamesUtf8.push_back(::Compat::SafeFs::FileNameUtf8Lossy(path));
+                return;
+            }
+            (isEss ? damagedEss : damagedSkse).push_back(path);
+        });
+        report.WalkFailed = !walked;
+
+        if (damagedEss.empty() && damagedSkse.empty())
+            return report;
+
+        const std::filesystem::path quarantineDir = acSavesDir / "Quarantined_Corrupt_v100";
+        if (!::Compat::SafeFs::CreateDirectories(quarantineDir))
+        {
+            report.MoveFailed = damagedEss.size() + damagedSkse.size();
+            return report;
+        }
+
+        std::error_code ec;
+        for (const auto& badPath : damagedEss)
+        {
+            std::filesystem::rename(badPath, quarantineDir / badPath.filename(), ec);
+            if (ec)
+            {
+                ++report.MoveFailed;
+                continue;
+            }
+            ++report.Moved;
+            if (::Compat::SafeFs::EndsWithAsciiNoCase(badPath, ".ess"))
             {
                 auto skseCompanion = badPath;
                 skseCompanion.replace_extension(".skse");
-                if (std::filesystem::exists(skseCompanion, ec))
+                if (::Compat::SafeFs::Exists(skseCompanion))
                     std::filesystem::rename(skseCompanion, quarantineDir / skseCompanion.filename(), ec);
             }
         }
-    }
 
-    for (const auto& badSkse : corruptSkseFiles)
+        for (const auto& badSkse : damagedSkse)
+        {
+            if (!::Compat::SafeFs::Exists(badSkse))
+                continue;  // it went along with its .ess above
+            std::filesystem::rename(badSkse, quarantineDir / badSkse.filename(), ec);
+            if (ec)
+                ++report.MoveFailed;
+            else
+                ++report.Moved;
+        }
+    }
+    catch (...)
     {
-        std::error_code existsEc;
-        if (!std::filesystem::exists(badSkse, existsEc) || existsEc)
-            continue;
-        std::filesystem::rename(badSkse, quarantineDir / badSkse.filename(), ec);
-        if (!ec)
-            ++movedCount;
+        // Out of memory while collecting: what was counted so far is reported, nothing else is touched.
     }
+    return report;
+}
 
-    return movedCount;
+// The number of files QuarantineDamagedCoopSavesInDirectory moved.
+inline size_t QuarantineCorruptEssFilesInDirectory(const std::filesystem::path& acSavesDir) noexcept
+{
+    return QuarantineDamagedCoopSavesInDirectory(acSavesDir).Moved;
 }
 
 inline bool ReadTextFile(const std::filesystem::path& acPath, std::string& aOut) noexcept
@@ -3236,10 +3338,11 @@ namespace Detail
     return std::filesystem::path(u8);
 }
 
-[[nodiscard]] inline std::string PathToUtf8Safe(const std::filesystem::path& acPath)
+// Never throws and never fails on the name: path::u8string() throws on a name with an unpaired
+// surrogate, path::string() on any character outside the ANSI code page (M14).
+[[nodiscard]] inline std::string PathToUtf8Safe(const std::filesystem::path& acPath) noexcept
 {
-    const std::u8string u8 = acPath.u8string();
-    return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
+    return ::Compat::SafeFs::ToUtf8Lossy(acPath);
 }
 } // namespace Detail
 
@@ -3473,37 +3576,23 @@ namespace Detail
         return true;
     }
 
-    ec.clear();
-    if (std::filesystem::exists(sksePlugins, ec) && std::filesystem::is_directory(sksePlugins, ec))
-    {
-        for (const auto& entry : std::filesystem::directory_iterator(sksePlugins, ec))
-        {
-            if (ec)
-                break;
-            const std::string lowerName = Detail::ToLowerAscii(Detail::PathToUtf8Safe(entry.path().filename()));
-            if (lowerName.starts_with("customskills") ||
-                lowerName.starts_with("rfab") ||
-                lowerName.starts_with("[rfab]"))
-            {
-                return true;
-            }
-        }
-    }
+    bool found = false;
+    ::Compat::SafeFs::ForEachEntry(sksePlugins, [&found](const std::filesystem::directory_entry& acEntry) {
+        const std::string lowerName = Detail::ToLowerAscii(::Compat::SafeFs::FileNameUtf8Lossy(acEntry.path()));
+        found = lowerName.starts_with("customskills") || lowerName.starts_with("rfab") || lowerName.starts_with("[rfab]");
+        return !found;
+    });
+    if (found)
+        return true;
 
     // 2. CustomSkills v1 (`Data/NetScriptFramework/Plugins/customskill.*.config.txt`)
     const std::filesystem::path nsfPlugins = acDataDir / "NetScriptFramework" / "Plugins";
-    ec.clear();
-    if (std::filesystem::exists(nsfPlugins, ec) && std::filesystem::is_directory(nsfPlugins, ec))
-    {
-        for (const auto& entry : std::filesystem::directory_iterator(nsfPlugins, ec))
-        {
-            if (ec)
-                break;
-            const std::string lowerName = Detail::ToLowerAscii(Detail::PathToUtf8Safe(entry.path().filename()));
-            if (lowerName.starts_with("customskill."))
-                return true;
-        }
-    }
+    ::Compat::SafeFs::ForEachEntry(nsfPlugins, [&found](const std::filesystem::directory_entry& acEntry) {
+        found = Detail::ToLowerAscii(::Compat::SafeFs::FileNameUtf8Lossy(acEntry.path())).starts_with("customskill.");
+        return !found;
+    });
+    if (found)
+        return true;
 
     // 3. Extended UI or RFAB master plugin in Data
     ec.clear();
@@ -4180,22 +4269,16 @@ public:
 
         // 2. Auto-discover any RFAB / Requiem / SkyrimTogether plugins in Data/ regardless of future version renames
         //    (e.g. `RFAB_Core.esp`, `RFAB_Perks.esp`, `RFAB_Bosses.esp`, `Requiem for the Indifferent.esp`, etc.)
-        for (const auto& entry : std::filesystem::directory_iterator(
-                 acDataDir, std::filesystem::directory_options::skip_permission_denied, ec))
-        {
-            if (ec)
-                break;
-            std::error_code fEc;
-            if (!entry.is_regular_file(fEc) || fEc)
-                continue;
+        ::Compat::SafeFs::ForEachEntry(acDataDir, [&](const std::filesystem::directory_entry& acEntry) {
+            if (!::Compat::SafeFs::IsRegularFile(acEntry))
+                return;
 
-            const std::string fname = Detail::PathToUtf8Safe(entry.path().filename());
-            const std::string lower = Detail::ToLowerAscii(fname);
+            const std::string lower = Detail::ToLowerAscii(::Compat::SafeFs::FileNameUtf8Lossy(acEntry.path()));
             if (!Detail::EndsWithIgnoreCase(lower, ".esp") &&
                 !Detail::EndsWithIgnoreCase(lower, ".esm") &&
                 !Detail::EndsWithIgnoreCase(lower, ".esl"))
             {
-                continue;
+                return;
             }
 
             if (lower.find("rfab") != std::string::npos ||
@@ -4203,10 +4286,10 @@ public:
                 lower.find("skyrimtogether") != std::string::npos ||
                 lower.find("fomod") != std::string::npos)
             {
-                if (visitedLower.insert(lower).second && IndexPluginFile(entry.path()))
+                if (visitedLower.insert(lower).second && IndexPluginFile(acEntry.path()))
                     ++indexed;
             }
-        }
+        });
 
         return indexed;
     }

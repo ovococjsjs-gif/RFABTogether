@@ -59,6 +59,7 @@
 #include <Messages/MountRequest.h>
 #include <Messages/NotifyActorValueChanges.h>
 #include <Messages/NotifyDeathStateChange.h>
+#include <Messages/NotifyExecuteLoad.h>
 #include <Messages/NotifyHealthChangeBroadcast.h>
 #include <Messages/NotifyMount.h>
 #include <Messages/NotifyOwnershipTransfer.h>
@@ -68,6 +69,7 @@
 #include <Messages/NotifyRfabProgressionEvent.h>
 #include <Messages/NotifySpawnData.h>
 #include <Messages/RequestActorValueChanges.h>
+#include <Messages/RequestCoordinatedSaveLoad.h>
 #include <Messages/RequestDeathStateChange.h>
 #include <Messages/RequestHealthChangeBroadcast.h>
 #include <Messages/RequestInventoryChanges.h>
@@ -2673,6 +2675,126 @@ int main(int argc, char** argv)
         Check(totals().Reports == reportsBefore, "with Gameplay:bEnableDesyncDetector off reports are ignored");
         bEnableDesyncDetector = true;
         bEnableDesyncAutoRepair = false;
+    }
+
+    // Scene 14: the party leader asks for a rollback (work plan 4.4, defect M15). A client can send
+    // three such requests. The one for the checkpoint BEFORE the newest was implemented on the server
+    // since 4.0 and had no sender until 4.1.1 (Shift+F9, common/Save/LoadRequest.h); this is the first
+    // time that server path runs anywhere. Every request below goes through the wire encoding.
+    {
+        std::printf("[scene 14] rollback requests: newest, previous, by name; only from the leader\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+        auto& saves = world.GetSaveSnapshotService();
+        auto& coordinator = saves.GetCoordinator();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xE001u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xE002u;
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 9.0f;
+        t0.Day = 4;
+        t0.Month = 4;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+
+        const auto ack = [](uint64_t aEpochId, const std::string& acSlot) {
+            CoordinatedSaveAck message{};
+            message.EpochId = aEpochId;
+            message.SlotName = String(acSlot.c_str());
+            message.Success = true;
+            return message;
+        };
+
+        // A committed checkpoint: the server starts the barrier, both clients report their file written.
+        const auto checkpoint = [&]() -> std::string {
+            if (!saves.TriggerCoordinatedSave(false, nullptr))
+                return {};
+            const auto pending = coordinator.GetPendingBarrier();
+            if (!pending.has_value())
+                return {};
+            const std::string slot = pending->SlotName;
+            (void)DeliverWire(world, ack(pending->EpochId, slot), pHost);
+            (void)DeliverWire(world, ack(pending->EpochId, slot), pGuest);
+            return slot;
+        };
+
+        const std::string first = checkpoint();
+        const std::string second = checkpoint();
+        const std::string third = checkpoint();
+        Check(!first.empty() && !second.empty() && !third.empty() && first != second && second != third && first != third,
+              "three checkpoints are committed, each in its own slot");
+        Check(saves.GetSnapshotCount() == 3, "the server keeps all three");
+
+        const auto request = [&](Player* apFrom, RequestCoordinatedSaveLoad::ActionType aAction, const std::string& acSlot = {}) {
+            Harness::ClearOutbox();
+            RequestCoordinatedSaveLoad message{};
+            message.Action = aAction;
+            message.SlotName = String(acSlot.c_str());
+            (void)DeliverWire(world, message, apFrom);
+        };
+        // The slot a player was told to load by the last request ("" when he was told nothing).
+        const auto toldToLoad = [](TiltedPhoques::ConnectionId_t aConn) -> std::string {
+            const auto loads = DecodeOutboxMessagesFor<NotifyExecuteLoad>(aConn);
+            if (loads.empty())
+                return {};
+            if (loads.size() > 1)
+                return "<" + std::to_string(loads.size()) + " load orders>";
+            return std::string(loads[0].SlotName.c_str(), loads[0].SlotName.size());
+        };
+        // Both clients finished loading: the reload barrier of the last rollback is released.
+        const auto everyoneReloaded = [&](const std::string& acSlot) {
+            const auto* pReload = coordinator.GetReloadBarrier();
+            if (!pReload)
+                return;
+            const uint64_t encoded = CoopCheckpoint::EncodeReloadBarrierEpoch(pReload->EpochId);
+            (void)DeliverWire(world, ack(encoded, acSlot), pHost);
+            (void)DeliverWire(world, ack(encoded, acSlot), pGuest);
+        };
+
+        // --- Only the leader rolls the party back.
+        request(pGuest, RequestCoordinatedSaveLoad::ActionType::LoadPreviousCheckpoint);
+        Check(toldToLoad(kHostConn).empty() && toldToLoad(kGuestConn).empty(),
+              "a rollback request from a player who is not the leader loads nothing");
+        Check(saves.GetSnapshotCount() == 3, "and drops no checkpoint");
+
+        // --- The checkpoint before the newest.
+        request(pHost, RequestCoordinatedSaveLoad::ActionType::LoadPreviousCheckpoint);
+        Check(toldToLoad(kHostConn) == second, "the previous-checkpoint request tells the leader to load the checkpoint before the newest");
+        Check(toldToLoad(kGuestConn) == second, "and tells every other player the same slot");
+        Check(saves.GetSnapshotCount() == 2, "the newest checkpoint is dropped: it was the reason to go back");
+        Check(coordinator.GetReloadBarrier() != nullptr, "the party is held together until everyone has loaded");
+        everyoneReloaded(second);
+        Check(coordinator.GetReloadBarrier() == nullptr, "the hold is released when both clients report the load done");
+
+        // --- F9 after that: the newest is now the one just loaded, the dropped one cannot come back.
+        request(pHost, RequestCoordinatedSaveLoad::ActionType::LoadLatestCheckpoint);
+        Check(toldToLoad(kHostConn) == second && toldToLoad(kGuestConn) == second,
+              "a quickload after going back loads the same checkpoint, not the dropped one");
+        Check(saves.GetSnapshotCount() == 2, "and drops nothing");
+        everyoneReloaded(second);
+
+        // --- A slot picked in the load menu.
+        request(pHost, RequestCoordinatedSaveLoad::ActionType::LoadSpecificSlot, first);
+        Check(toldToLoad(kHostConn) == first && toldToLoad(kGuestConn) == first, "a slot picked by name is loaded by everybody");
+        Check(saves.GetSnapshotCount() == 1, "the checkpoints after it are dropped");
+        everyoneReloaded(first);
+
+        // --- Nothing before the only checkpoint: going back means loading it.
+        request(pHost, RequestCoordinatedSaveLoad::ActionType::LoadPreviousCheckpoint);
+        Check(toldToLoad(kHostConn) == first && toldToLoad(kGuestConn) == first,
+              "with one checkpoint left the previous-checkpoint request loads that one");
+        Check(saves.GetSnapshotCount() == 1, "and keeps it");
+        everyoneReloaded(first);
+
+        // --- A slot name the server never committed: the newest checkpoint, never an arbitrary file.
+        request(pHost, RequestCoordinatedSaveLoad::ActionType::LoadSpecificSlot, "Quicksave0_of_somebody");
+        Check(toldToLoad(kHostConn) == first && toldToLoad(kGuestConn) == first,
+              "a slot name that is not a party checkpoint loads the newest checkpoint instead");
     }
 
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures,

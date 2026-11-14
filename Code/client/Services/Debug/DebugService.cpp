@@ -69,7 +69,6 @@
 
 #include <imgui.h>
 #include <inttypes.h>
-extern thread_local bool g_overrideFormId;
 
 constexpr char kBuildTag[] = "Build: " BUILD_COMMIT " " BUILD_BRANCH " EVO\nBuilt: " __TIMESTAMP__;
 static void DrawBuildTag()

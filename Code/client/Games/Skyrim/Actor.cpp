@@ -402,9 +402,8 @@ static thread_local bool s_execInitPackage = false;
 
 void Actor::SetPackage(TESPackage* apPackage) noexcept
 {
-    s_execInitPackage = true;
+    ScopedTlsValue<bool> applyingRemotePackage(s_execInitPackage, true);
     PutCreatedPackage(apPackage);
-    s_execInitPackage = false;
 }
 
 void Actor::SetPlayerRespawnMode(bool aSet) noexcept

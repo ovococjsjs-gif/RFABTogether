@@ -11,6 +11,7 @@
 #include <vector>
 #include <base/threading/ThreadUtils.h>
 #include <common/RfabModpackCompat.h>
+#include <common/Compat/SafeFs.h>
 
 namespace
 {
@@ -21,7 +22,10 @@ DediRunner* s_pRunner{nullptr};
 void EnsureServerLoadOrderReady()
 {
     std::error_code ec;
-    const fs::path dataDir = fs::current_path() / "Data";
+    // SafeFs throughout: this runs before the log exists, and an exception here closes the server
+    // window without a word (M14).
+    const fs::path workDir = Compat::SafeFs::CurrentPathOr(fs::path("."));
+    const fs::path dataDir = workDir / "Data";
     fs::create_directories(dataDir, ec);
     const fs::path targetLoadOrder = dataDir / "loadorder.txt";
 
@@ -36,7 +40,7 @@ void EnsureServerLoadOrderReady()
 
     // Try auto-discovering active loadorder.txt / plugins.txt from nearby MO2 installation or %LOCALAPPDATA%\Skyrim Special Edition
     std::vector<fs::path> candidateDirs;
-    fs::path probe = fs::current_path();
+    fs::path probe = workDir;
     for (int depth = 0; depth < 4 && !probe.empty(); ++depth)
     {
         candidateDirs.push_back(probe / "MO2" / "profiles");
@@ -115,7 +119,8 @@ void EnsureServerLoadOrderReady()
             return false;
         for (const auto& entry : ordered)
             out << entry << "\n";
-        spdlog::info("[RFAB Server] Auto-synced {} active plugins from '{}' -> Data/loadorder.txt", ordered.size(), profDir.string());
+        spdlog::info("[RFAB Server] Auto-synced {} active plugins from '{}' -> Data/loadorder.txt", ordered.size(),
+                     Compat::SafeFs::ToUtf8Lossy(profDir));
         return true;
     };
 
@@ -125,11 +130,13 @@ void EnsureServerLoadOrderReady()
             continue;
         if (writeCleanOrder(base))
             return;
-        for (const auto& sub : fs::directory_iterator(base, ec))
-        {
-            if (sub.is_directory(ec) && writeCleanOrder(sub.path()))
-                return;
-        }
+        bool written = false;
+        Compat::SafeFs::ForEachEntry(base, [&](const fs::directory_entry& acSub) {
+            written = Compat::SafeFs::IsDirectory(acSub) && writeCleanOrder(acSub.path());
+            return !written;
+        });
+        if (written)
+            return;
     }
 }
 } // namespace
@@ -179,7 +186,8 @@ void DediRunner::LoadSettings(int argc, char** argv)
     {
         m_useIni = true;
         std::error_code ec;
-        m_SettingsPath = fs::current_path() / kConfigPathName / kSettingsFileName;
+        const fs::path workDir = Compat::SafeFs::CurrentPathOr(fs::path("."));
+        m_SettingsPath = workDir / kConfigPathName / kSettingsFileName;
         bool needsFreshIni = !exists(m_SettingsPath, ec);
         if (!needsFreshIni)
         {
@@ -191,7 +199,7 @@ void DediRunner::LoadSettings(int argc, char** argv)
         }
         if (needsFreshIni)
         {
-            create_directories(fs::current_path() / kConfigPathName, ec);
+            create_directories(workDir / kConfigPathName, ec);
             SaveSettingsToIni(m_console, m_SettingsPath);
             return;
         }
