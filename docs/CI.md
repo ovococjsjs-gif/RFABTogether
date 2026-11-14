@@ -27,7 +27,7 @@ Workflow-файлы лежат в `.github/workflows-ready/`, а GitHub испо
 
 1. Открыть на сайте GitHub файл `.github/workflows-ready/core-tests-linux.yml` **в ветке разработки**.
 2. Нажать карандаш («Edit this file»).
-3. В поле имени файла поставить курсор в самое начало и нажать Backspace: в поле появится `workflows-ready/`. Исправить на `workflows/`, чтобы путь стал `.github/workflows/core-tests-linux.yml`.
+3. В поле имени файла поставить курсор в самое начало и набрать `../workflows/`. `../` поднимает файл на папку выше, `workflows/` кладёт его в новую папку; путь над редактором должен стать `.github/workflows/core-tests-linux.yml`. Содержимое файла не менять.
 4. Нажать «Commit changes…», оставить «Commit directly to the … branch», подтвердить.
 5. Повторить для `release.yml`.
 
