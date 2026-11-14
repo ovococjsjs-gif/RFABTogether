@@ -547,15 +547,19 @@ void RfabAdapterService::OnNotifyProgressionEvent(const NotifyRfabProgressionEve
 
     case NotifyRfabProgressionEvent::EventKind::DragonSoulSync:
     {
-        if (acMessage.XpDelta <= 0)
+        // XpDelta is the number of souls to ADD. The server sends 1; anything else is not a grant.
+        constexpr int32_t kMaxSoulsPerGrant = 3;
+        if (acMessage.XpDelta <= 0 || acMessage.XpDelta > kMaxSoulsPerGrant)
             break;
         if (PlayerCharacter* pPlayer = PlayerCharacter::Get())
         {
+            // ForceActorValue takes the TARGET value, so the grant is "what I have now, plus the
+            // delta". Passing the delta alone used to set the soul count to 1.
+            const float currentSouls = pPlayer->GetActorPermanentValue(ActorValueInfo::kDragonSouls);
+            const float targetSouls = (currentSouls > 0.0f ? currentSouls : 0.0f) + static_cast<float>(acMessage.XpDelta);
             ScopedActorValueOverride avGuard;
-            pPlayer->ForceActorValue(
-                ActorValueOwner::ForceMode::PERMANENT,
-                ActorValueInfo::kDragonSouls,
-                static_cast<float>(acMessage.XpDelta));
+            pPlayer->ForceActorValue(ActorValueOwner::ForceMode::PERMANENT, ActorValueInfo::kDragonSouls, targetSouls);
+            spdlog::info("[RFAB Progression] Shared dragon soul: {} -> {}", currentSouls, targetSouls);
             Utils::ShowHudMessage(String("RFAB Co-Op: +1 душа дракона (общая награда группы)"));
         }
         break;

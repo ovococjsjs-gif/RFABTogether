@@ -93,7 +93,6 @@ public:
     {
         m_lastBossGhostByServerId.clear();
         m_lockedBossServerIds.clear();
-        m_reportedDragonSoulServerIds.clear();
     }
 
 private:
@@ -102,5 +101,4 @@ private:
     bool m_hasSavedAllyHitSettings{false};
     std::unordered_map<uint32_t, bool> m_lastBossGhostByServerId{};
     std::unordered_set<uint32_t> m_lockedBossServerIds{};
-    std::unordered_set<uint32_t> m_reportedDragonSoulServerIds{};
 };

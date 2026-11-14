@@ -349,6 +349,12 @@ private:
     void OnSyncProgressionEvent(const PacketEvent<SyncRfabProgressionEvent>& acMessage) noexcept;
     void OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept;
     void OnPlayerLeave(const PlayerLeaveEvent& acEvent) noexcept;
+public:
+    // A dragon went from alive to dead on the server (ActorValueService, the one place where that
+    // transition is decided). `apKiller` is the player whose death report was accepted.
+    void OnDragonSlain(entt::entity aDragon, Player* apKiller) noexcept;
+
+private:
     // Records that every connected player now holds `aXpDelta` more shared XP.
     void CreditConnectedPlayers(int32_t aXpDelta, int64_t aTotalAfterGrant) noexcept;
 

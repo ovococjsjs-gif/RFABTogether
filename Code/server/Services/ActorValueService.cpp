@@ -511,6 +511,9 @@ void ActorValueService::OnDeathStateChange(const PacketEvent<RequestDeathStateCh
     if (message.IsDead)
     {
         m_world.GetRfabProgressionService().GetLedger().ClearBossGhostState(message.Id);
+        // This is the only place where a live actor becomes dead, so it runs once per death.
+        if (characterComponent.IsDragon())
+            m_world.GetRfabProgressionService().OnDragonSlain(targetEntity, acMessage.pPlayer);
     }
 
     if (currentHealthRevision != prevHealthRevision)

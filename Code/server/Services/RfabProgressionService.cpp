@@ -26,6 +26,12 @@ Console::Setting bEnableLateJoinCatchUpXp{
     "Pays a (re)joining player the shared RFAB XP the party earned while they were away, up to 25000",
     false};
 
+// Off by default: only the game can show how many souls each player ends up with.
+Console::Setting bEnableSharedDragonSouls{
+    "Gameplay:bEnableSharedDragonSouls",
+    "Gives +1 dragon soul to party members who were out of range when the party killed a dragon",
+    false};
+
 RfabProgressionService::RfabProgressionService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
     : m_world(aWorld)
     , m_progressionConnection(aDispatcher.sink<PacketEvent<SyncRfabProgressionEvent>>().connect<&RfabProgressionService::OnSyncProgressionEvent>(this))
@@ -249,52 +255,10 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
     }
 
     case SyncRfabProgressionEvent::EventKind::DragonSoulSync:
-    {
-        const std::string dragonKey = !sourceKey.empty()
-            ? sourceKey
-            : RfabCoopProgression::DragonSoulLedger::MakeDragonKey(pkt.BookId, static_cast<uint32_t>(pkt.XpDelta));
-        if (dragonKey.empty())
-            break;
-
-        std::vector<uint32_t> eligiblePeers;
-        auto& partyService = m_world.GetPartyService();
-        if (const auto* pParty = partyService.GetPlayerParty(pSender))
-        {
-            for (Player* pMember : pParty->Members)
-            {
-                if (pMember && pMember != pSender)
-                    eligiblePeers.push_back(pMember->GetId());
-            }
-        }
-        else
-        {
-            for (Player* pOther : m_world.GetPlayerManager())
-            {
-                if (pOther && pOther != pSender)
-                    eligiblePeers.push_back(pOther->GetId());
-            }
-        }
-
-        const auto award = m_ledger.GetDragonSoulLedger().RecordDragonKill(
-            dragonKey, pSender->GetId(), eligiblePeers, false);
-        if (award.NewlyAwardedPlayerIds.empty())
-            break;
-
-        NotifyRfabProgressionEvent soulGrant{};
-        soulGrant.Kind = NotifyRfabProgressionEvent::EventKind::DragonSoulSync;
-        soulGrant.EpochId = currentEpoch;
-        soulGrant.SourceKey = String(dragonKey.c_str());
-        soulGrant.BookId = pkt.BookId;
-        soulGrant.XpDelta = 1; // +1 Dragon Soul per unique slain dragon
-        soulGrant.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
-
-        for (uint32_t peerId : award.NewlyAwardedPlayerIds)
-        {
-            if (Player* pPeer = m_world.GetPlayerManager().GetById(peerId))
-                pPeer->Send(soulGrant);
-        }
+        // Not a trigger any more. A 4.1.0 client reports every dead dragon it simulates, including
+        // a corpse it merely walked up to, under a key of its own choosing. The server now sees the
+        // death itself (OnDragonSlain), exactly once per death.
         break;
-    }
 
     case SyncRfabProgressionEvent::EventKind::WordWallSync:
     {
@@ -558,6 +522,64 @@ void RfabProgressionService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexce
 
     // Sync authoritative Host-controlled Co-Op Ally Protection («Единство в битве») state & Host ID.
     SendAllyProtectionStateToPlayer(pNewPlayer, false);
+}
+
+void RfabProgressionService::OnDragonSlain(const entt::entity aDragon, Player* apKiller) noexcept
+{
+    if (!apKiller || !m_world.valid(aDragon))
+        return;
+
+    GameId dragonFormId{};
+    if (const auto* pFormId = m_world.try_get<FormIdComponent>(aDragon))
+        dragonFormId = pFormId->Id;
+    const std::string dragonKey =
+        RfabCoopProgression::DragonSoulLedger::MakeDragonKey(dragonFormId, World::ToInteger(aDragon));
+    if (dragonKey.empty())
+        return;
+
+    // Everyone who has the dragon loaded absorbs its soul the way the game always did: the dragon's
+    // own script waits for that client's player to walk up to the corpse (dragonActorSCRIPT,
+    // state deadAndWaiting). The shared soul is for party members who were somewhere else, and
+    // without the dragon's cell nobody can be told apart.
+    std::vector<Player*> absentMembers;
+    if (const auto* pDragonCell = m_world.try_get<CellIdComponent>(aDragon))
+    {
+        const auto consider = [&](Player* apMember) {
+            if (apMember && apMember != apKiller && !pDragonCell->IsInRange(apMember->GetCellComponent(), true))
+                absentMembers.push_back(apMember);
+        };
+
+        if (const auto* pParty = m_world.GetPartyService().GetPlayerParty(apKiller))
+        {
+            for (Player* pMember : pParty->Members)
+                consider(pMember);
+        }
+        else
+        {
+            for (Player* pOther : m_world.GetPlayerManager())
+                consider(pOther);
+        }
+    }
+
+    // The kill is recorded whether or not souls are shared (it is part of the checkpoint).
+    (void)m_ledger.GetDragonSoulLedger().RecordDragonKill(dragonKey, apKiller->GetId(), {}, false);
+
+    if (!bEnableSharedDragonSouls || absentMembers.empty())
+        return;
+
+    NotifyRfabProgressionEvent soulGrant{};
+    soulGrant.Kind = NotifyRfabProgressionEvent::EventKind::DragonSoulSync;
+    soulGrant.EpochId = m_world.GetSaveSnapshotService().GetCurrentWorldEpoch();
+    soulGrant.SourceKey = String(dragonKey.c_str());
+    soulGrant.BookId = dragonFormId;
+    soulGrant.XpDelta = 1; // souls to add
+    soulGrant.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
+
+    for (Player* pAbsent : absentMembers)
+        pAbsent->Send(soulGrant);
+
+    spdlog::info("[RFAB Progression] Dragon {} slain by player {}: shared soul sent to {} absent party member(s)",
+                 dragonKey, apKiller->GetId(), absentMembers.size());
 }
 
 void RfabProgressionService::CreditConnectedPlayers(int32_t aXpDelta, int64_t aTotalAfterGrant) noexcept

@@ -105,6 +105,7 @@
 extern Console::Setting<bool> bEnableSelfHealingResync;
 extern Console::Setting<bool> bEnableServerOwnedWorldItems;
 extern Console::Setting<bool> bEnableLateJoinCatchUpXp;
+extern Console::Setting<bool> bEnableSharedDragonSouls;
 
 namespace
 {
@@ -1820,27 +1821,9 @@ int main(int argc, char** argv)
             world.destroy(boss);
         }
 
-        // 8.2 Shared Dragon Souls & Word Walls + deduplication
+        // 8.2 Word Walls + deduplication. Shared dragon souls have their own scene (10): the server
+        //     takes a dragon's death from its own death transition, not from a client report.
         {
-            Harness::ClearOutbox();
-            SyncRfabProgressionEvent dragonKill{};
-            dragonKill.Kind = SyncRfabProgressionEvent::EventKind::DragonSoulSync;
-            dragonKill.EpochId = epoch;
-            dragonKill.BookId = GameId{0u, 0x0001CA03u};
-            dragonKill.XpDelta = 777;
-            Check(DeliverWire(world, dragonKill, pHost), "DragonSoulSync packet delivered");
-            const auto guestSouls = DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kGuestConn);
-            Check(guestSouls.size() == 1 && guestSouls[0].Kind == NotifyRfabProgressionEvent::EventKind::DragonSoulSync &&
-                      guestSouls[0].XpDelta == 1,
-                  "peer receives +1 shared Dragon Soul on unique dragon kill");
-
-            // Duplicate dragon kill report must NOT grant a 2nd soul!
-            Harness::ClearOutbox();
-            Check(DeliverWire(world, dragonKill, pGuest), "duplicate DragonSoulSync delivered");
-            Check(DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kHostConn).empty() &&
-                      DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kGuestConn).empty(),
-                  "duplicate DragonSoulSync does not double-grant souls");
-
             // Word Wall sync + dedupe
             Harness::ClearOutbox();
             SyncRfabProgressionEvent wordLearn{};
@@ -2095,6 +2078,139 @@ int main(int argc, char** argv)
 
         bEnableLateJoinCatchUpXp = false;
         std::filesystem::remove(storePath, removeEc);
+    }
+
+    // Scene 10: a dragon's soul is shared with the party members who were not there, once per
+    // death (M2). The trigger is the death the server itself accepts; nothing a client says about
+    // souls is trusted. Amounts are read from the packets sent to each connection.
+    {
+        std::printf("[scene 10] shared dragon soul: absent party members only, once per death\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kKillerConn = 0xA001u;
+        constexpr TiltedPhoques::ConnectionId_t kNearConn = 0xA002u;
+        constexpr TiltedPhoques::ConnectionId_t kFarConn = 0xA003u;
+        const GameId kLairCell{0u, 0x000A1001u};
+        const GameId kTownCell{0u, 0x000A1002u};
+        const GameId kDragonBase{0u, 0x000F811Au};
+
+        Player* pKiller = world.GetPlayerManager().Create(kKillerConn);
+        Player* pNear = world.GetPlayerManager().Create(kNearConn);
+        Player* pFar = world.GetPlayerManager().Create(kFarConn);
+        TimeModel t0{};
+        t0.Time = 9.0f;
+        t0.Day = 2;
+        t0.Month = 2;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pKiller, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pNear, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pFar, {}, {}, DateTime{t0}});
+        Check(world.GetPartyService().IsPlayerInParty(pNear) && world.GetPartyService().IsPlayerInParty(pFar),
+              "the three players are one party");
+
+        pKiller->SetCellComponent(CellIdComponent{kLairCell});
+        pNear->SetCellComponent(CellIdComponent{kLairCell});
+        pFar->SetCellComponent(CellIdComponent{kTownCell});
+
+        uint32_t nextCookie = 500u;
+        const auto spawn = [&](uint32_t aRefId, bool aIsDragon, bool aAlreadyDead) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest assign{};
+            assign.Cookie = nextCookie++;
+            assign.ReferenceId = GameId{0u, aRefId};
+            assign.FormId = kDragonBase;
+            assign.CellId = kLairCell;
+            assign.Position = {10.0f, 20.0f, 30.0f};
+            assign.CurrentActorData.BaseId = kDragonBase;
+            assign.CurrentActorData.InitialActorValues.ActorValuesList[24] = 3000.0f;
+            assign.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 3000.0f;
+            assign.CurrentActorData.IsDead = aAlreadyDead;
+            assign.IsDragon = aIsDragon;
+            (void)DeliverWire(world, assign, pKiller);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(kKillerConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const auto reportDeath = [&](uint32_t aServerId, Player* apBy, bool aIsDead) {
+            Harness::ClearOutbox();
+            RequestDeathStateChange death{};
+            death.Id = aServerId;
+            death.IsDead = aIsDead;
+            return DeliverWire(world, death, apBy);
+        };
+        // Souls the server granted to this connection since the outbox was last cleared.
+        const auto soulsSentTo = [](TiltedPhoques::ConnectionId_t aConn) {
+            int64_t total = 0;
+            for (const auto& message : DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(aConn))
+                if (message.Kind == NotifyRfabProgressionEvent::EventKind::DragonSoulSync)
+                    total += message.XpDelta;
+            return total;
+        };
+        const auto nobodyWasSentASoul = [&] {
+            return soulsSentTo(kKillerConn) == 0 && soulsSentTo(kNearConn) == 0 && soulsSentTo(kFarConn) == 0;
+        };
+
+        const uint32_t firstDragon = spawn(0x000A2001u, true, false);
+        Check(firstDragon != 0xFFFFFFFFu, "the killer's client registers a living dragon");
+        Check(reportDeath(firstDragon, pKiller, true) && nobodyWasSentASoul(),
+              "with Gameplay:bEnableSharedDragonSouls off (the default) a dragon's death sends no souls");
+
+        bEnableSharedDragonSouls = true;
+
+        Check(reportDeath(firstDragon, pNear, true) && nobodyWasSentASoul(),
+              "a second death packet for a dragon that is already dead sends no souls");
+
+        // What a 4.1.0 client sends for every dead dragon it simulates, corpses included.
+        {
+            Harness::ClearOutbox();
+            SyncRfabProgressionEvent clientReport{};
+            clientReport.Kind = SyncRfabProgressionEvent::EventKind::DragonSoulSync;
+            clientReport.EpochId = world.GetSaveSnapshotService().GetCurrentWorldEpoch();
+            clientReport.BookId = GameId{0u, 0x000A2001u};
+            clientReport.XpDelta = static_cast<int32_t>(firstDragon);
+            Check(DeliverWire(world, clientReport, pKiller) && nobodyWasSentASoul(),
+                  "a client's own report about a dead dragon sends no souls");
+            clientReport.SourceKey = "dragon:made-up-key";
+            Check(DeliverWire(world, clientReport, pNear) && nobodyWasSentASoul(),
+                  "a client cannot invent a dragon by sending a key of its own");
+        }
+
+        const uint32_t secondDragon = spawn(0x000A2002u, true, false);
+        Check(reportDeath(secondDragon, pKiller, true), "the second dragon dies");
+        {
+            const auto farGrants = DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kFarConn);
+            int64_t grantCount = 0;
+            for (const auto& message : farGrants)
+                if (message.Kind == NotifyRfabProgressionEvent::EventKind::DragonSoulSync)
+                    ++grantCount;
+            Check(grantCount == 1 && soulsSentTo(kFarConn) == 1, "the party member in another cell is sent exactly one soul, as +1");
+        }
+        Check(soulsSentTo(kKillerConn) == 0 && soulsSentTo(kNearConn) == 0,
+              "the killer and the member standing at the dragon are sent nothing: they absorb the soul the native way");
+
+        const uint32_t corpse = spawn(0x000A2003u, true, true);
+        Check(corpse != 0xFFFFFFFFu && reportDeath(corpse, pKiller, true) && nobodyWasSentASoul(),
+              "a dragon that is registered already dead (a corpse someone walked up to) sends no souls");
+
+        const uint32_t ordinaryEnemy = spawn(0x000A2004u, false, false);
+        Check(ordinaryEnemy != 0xFFFFFFFFu && reportDeath(ordinaryEnemy, pKiller, true) && nobodyWasSentASoul(),
+              "an ordinary enemy's death sends no souls");
+
+        // The owner brings the dragon back (a rollback does this) and it dies again: a new death.
+        Check(reportDeath(secondDragon, pKiller, false) && nobodyWasSentASoul(), "resurrecting a dragon sends no souls");
+        Check(reportDeath(secondDragon, pKiller, true) && soulsSentTo(kFarConn) == 1,
+              "a dragon that came back to life and died again counts as one more death");
+
+        // Everyone at the dragon: nothing to share.
+        pFar->SetCellComponent(CellIdComponent{kLairCell});
+        const uint32_t thirdDragon = spawn(0x000A2005u, true, false);
+        Check(reportDeath(thirdDragon, pKiller, true) && nobodyWasSentASoul(),
+              "when the whole party is at the dragon nobody is sent a soul");
+
+        bEnableSharedDragonSouls = false;
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
     }
 
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures,

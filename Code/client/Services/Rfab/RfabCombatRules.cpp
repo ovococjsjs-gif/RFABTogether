@@ -460,17 +460,8 @@ void RfabCombatRules::PollBossEncounterState(
                 aTransport.Send(unlockEv);
             }
 
-            if (pActor->IsDragon() && m_reportedDragonSoulServerIds.insert(serverId).second)
-            {
-                GameId dragonFormId{};
-                aWorld.GetModSystem().GetServerModId(formIdComp.Id, dragonFormId);
-                SyncRfabProgressionEvent soulEv{};
-                soulEv.Kind = SyncRfabProgressionEvent::EventKind::DragonSoulSync;
-                soulEv.EpochId = aWorldEpoch;
-                soulEv.BookId = dragonFormId;
-                soulEv.XpDelta = static_cast<int32_t>(serverId);
-                aTransport.Send(soulEv);
-            }
+            // A dead dragon is not reported from here: the server sees the death itself
+            // (RfabProgressionService::OnDragonSlain) and decides who is owed a shared soul.
             continue;
         }
 
