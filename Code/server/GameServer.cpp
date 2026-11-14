@@ -62,6 +62,11 @@ Console::Setting bEnableSelfHealingResync{"Gameplay:bEnableSelfHealingResync", "
 Console::Setting bEnableServerOwnedWorldItems{"Gameplay:bEnableServerOwnedWorldItems",
                                               "Dropped items get a server id: every player sees them (also after joining or reloading) and only one player can pick each up",
                                               true};
+// Off by default, which is 4.1.0: every creature that is not on the players' side gets the
+// party health multiplier. Switched on, creatures that never start a fight (permanent Aggression 0,
+// under 800 HP, not a dragon) keep their normal health.
+Console::Setting bEnablePeacefulNpcsUnscaled{"Gameplay:bEnablePeacefulNpcsUnscaled",
+                                             "Enemy health scaling skips peaceful NPCs and animals", false};
 extern Console::Setting<bool> bEnableItemDrops;
 extern Console::Setting<bool> bEnableXpSync;
 extern Console::Setting<bool> bEnableRfabXpSync;
@@ -220,6 +225,7 @@ uint32_t GetDisabledCoopFeatureMask() noexcept
     mask = Session::WithFeature(mask, Feature::kSelfHealingResync, bEnableSelfHealingResync);
     // Without Gameplay:bEnableItemDrops no dropped item is synced at all, server-owned or not.
     mask = Session::WithFeature(mask, Feature::kServerOwnedWorldItems, bEnableServerOwnedWorldItems && bEnableItemDrops);
+    mask = Session::WithFeature(mask, Feature::kPeacefulNpcsUnscaled, bEnablePeacefulNpcsUnscaled);
     return mask;
 }
 

@@ -42,9 +42,10 @@ enum class Feature : uint32_t
     kRfabCombatRules = 1u << 6,    // ally protection, smart standing-target pick, boss/arena sync
     kSelfHealingResync = 1u << 7,  // client gap detection + server resend (architecture step 1)
     kServerOwnedWorldItems = 1u << 8,  // dropped items get a server id, claims are arbitrated (step 4)
+    kPeacefulNpcsUnscaled = 1u << 9,   // enemy health scaling skips creatures that never start a fight
 };
 
-inline constexpr uint32_t kAllKnownFeatureBits = 0x1FFu;
+inline constexpr uint32_t kAllKnownFeatureBits = 0x3FFu;
 
 struct FeatureInfo
 {
@@ -52,7 +53,7 @@ struct FeatureInfo
     std::string_view Name;  // stable, used in logs and in the server console listing
 };
 
-inline constexpr std::array<FeatureInfo, 9> kFeatureTable{{
+inline constexpr std::array<FeatureInfo, 10> kFeatureTable{{
     {Feature::kDownedSystem, "DownedSystem"},
     {Feature::kCoordinatedSaves, "CoordinatedSaves"},
     {Feature::kTacticalHud, "TacticalHud"},
@@ -62,6 +63,7 @@ inline constexpr std::array<FeatureInfo, 9> kFeatureTable{{
     {Feature::kRfabCombatRules, "RfabCombatRules"},
     {Feature::kSelfHealingResync, "SelfHealingResync"},
     {Feature::kServerOwnedWorldItems, "ServerOwnedWorldItems"},
+    {Feature::kPeacefulNpcsUnscaled, "PeacefulNpcsUnscaled"},
 }};
 
 [[nodiscard]] constexpr uint32_t Bit(Feature aFeature) noexcept

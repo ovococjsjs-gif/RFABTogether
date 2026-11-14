@@ -1637,9 +1637,15 @@ namespace
         return false;
 
     const bool isPlayerOrSummon = pExt->IsPlayer() || apActor->IsPlayerSummon() || pExt->IsPlayerSummonFlag();
+    // With the server switch off (the default, 4.1.0 behaviour) every creature that is not on the
+    // players' side is scaled. With it on, creatures that never start a fight are left alone. That
+    // is decided from PERMANENT values: they are the same on every client and do not move with
+    // spells. The current Aggression flipped the answer between hits - Calm switched the scaling
+    // off for its duration, Frenzy switched it on for a townsman.
     const bool isHostileOrBoss =
+        !World::IsFeatureEnabled(Session::Feature::kPeacefulNpcsUnscaled) ||
         apActor->IsDragon() ||
-        apActor->GetActorValue(ActorValueInfo::kAggression) >= 1.0f ||
+        apActor->GetActorPermanentValue(ActorValueInfo::kAggression) >= 1.0f ||
         (!apActor->IsEssential() && apActor->GetActorPermanentValue(ActorValueInfo::kHealth) >= 800.0f);
 
     return Authority::ShouldScaleIncomingEnemyDamage(
