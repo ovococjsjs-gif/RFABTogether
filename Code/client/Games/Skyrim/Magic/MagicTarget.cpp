@@ -240,8 +240,11 @@ bool MagicTarget::AddTargetData::ShouldSync()
     if (!pEffectItem || !pEffectItem->pEffectSetting || !pSpell)
         return false;
 
-    // SlowTime mutates the global engine time scale and must stay strictly local to the caster.
-    if (pEffectItem->IsSlowEffect())
+    // Constant-effect slow time abilities (e.g. Requiem/RFAB Evasion Quick Reflexes) are added and removed locally by
+    // each client's own scripts, so syncing them would leave allies permanently stuck in slow motion.
+    // Every other slow time (the shout, potions, timed perks) is shared, as in 4.1.0: time slows for the
+    // whole party, otherwise the caster would move through a world the others see at full speed.
+    if (pEffectItem->IsSlowEffect() && pSpell->IsConstantEffectSpell())
         return false;
 
     // Never sync player-cast `kScript` ActiveMagicEffects unless they are friendly non-SELF party support spells:

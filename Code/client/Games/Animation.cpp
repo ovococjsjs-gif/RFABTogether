@@ -61,12 +61,15 @@ uint8_t TP_MAKE_THISCALL(HookPerformAction, ActorMediator, TESActionData* apActi
         action.IdleId = apAction->idleForm ? apAction->idleForm->formID : 0;
 
         // Save for later (thread-safe sharded store: HookPerformAction executes on Skyrim AI worker threads!)
-        if (res)
+        if (res && pActor->formID != 0)
         {
-            if (pActor->formID != 0)
-                ActorExtension::SetLatestAnimation(pActor->formID, action);
-            World::Get().GetRunner().Trigger(action);
+            ActorExtension::SetLatestAnimation(pActor->formID, action);
         }
+
+        // Published whatever the engine answered, as in 4.1.0. An action the engine turns down for
+        // the local actor can still be one the other clients have to see (the graph was already in
+        // the state, the idle was queued), and publishing only on success silently dropped those.
+        World::Get().GetRunner().Trigger(action);
 
         return res;
     }
