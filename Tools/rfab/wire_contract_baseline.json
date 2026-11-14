@@ -1,0 +1,77 @@
+{
+  "_comment": "Known wire-contract violations (Tools/rfab/check_wire_contract.py). Every entry needs a reason. The check fails on a violation that is not listed here and on an entry that no longer occurs, so this list can only shrink.",
+  "known": [
+    {
+      "rule": "W3",
+      "subject": "SyncRfabProgressionEvent::EventKind::WordWallSync",
+      "detail": "never referenced by the sender (Code/client)",
+      "reason": "DEFECT_REGISTRY M4: shared Word Walls have a server handler, a checkpoint chunk and a client receiver, but no client code sends the event. Wired or removed in WORK_PLAN package 2.4."
+    },
+    {
+      "rule": "W3",
+      "subject": "NotifyRfabProgressionEvent::EventKind::FullLedgerResync",
+      "detail": "never referenced by the sender (Code/server)",
+      "reason": "Declared for a full ledger resend that was never implemented; the client case is an empty break. Implemented or removed together with M4/M5 (WORK_PLAN package 2.4)."
+    },
+    {
+      "rule": "W3",
+      "subject": "RequestCoordinatedSaveLoad::ActionType::LoadPreviousCheckpoint",
+      "detail": "never referenced by the sender (Code/client)",
+      "reason": "SaveSnapshotService implements the rollback to the previous checkpoint, but no client key, menu or command sends it. Decided in WORK_PLAN package 4.4 (saves)."
+    },
+    {
+      "rule": "W3",
+      "subject": "ReviveActionRequest::ActionType::CancelChannel",
+      "detail": "never referenced by the receiver (Code/server)",
+      "reason": "Not a defect: handled by the final else of EncounterService::OnReviveActionRequest, which this rule cannot see."
+    },
+    {
+      "rule": "W3",
+      "subject": "RequestQuestUpdate::StatusCode::SceneUpdate",
+      "detail": "never referenced by the sender (Code/client)",
+      "reason": "Not a defect: never travels in this message. QuestService uses the value as a dedup-history key for RequestQuestSceneUpdate, which is its own message."
+    },
+    {
+      "rule": "W2",
+      "subject": "CancelAssignmentRequest",
+      "detail": "ClientMessage has no handler under Code/server",
+      "reason": "The client sends it from two places in CharacterService.cpp and the server drops it; the client compensates with m_cancelledCookies when the late AssignCharacterResponse arrives. Whether the server entity created in between can leak is checked in WORK_PLAN package 5.1."
+    },
+    {
+      "rule": "W2",
+      "subject": "NotifySetTimeResult",
+      "detail": "ServerMessage has no handler under Code/client",
+      "reason": "The result of the set-time command is dropped, so a player without permission gets no feedback. Cosmetic; WORK_PLAN stage 7."
+    },
+    {
+      "rule": "W1",
+      "subject": "NotifyPlayerDialogue",
+      "detail": "ServerMessage is never constructed under Code/server",
+      "reason": "Dead type: the server relays dialogue as NotifyChatMessageBroadcast{kPlayerDialogue}, so OverlayService::OnPlayerDialogue on the client never runs. Removed with the other dead protocol surface in WORK_PLAN package 2.4."
+    },
+    {
+      "rule": "W1",
+      "subject": "NotifyObjectInventoryChanges",
+      "detail": "ServerMessage is never constructed under Code/server",
+      "reason": "Dead type inherited from TiltedEvolution: only forward declarations remain on both sides. Removed in WORK_PLAN package 2.4."
+    },
+    {
+      "rule": "W2",
+      "subject": "NotifyObjectInventoryChanges",
+      "detail": "ServerMessage has no handler under Code/client",
+      "reason": "Dead type inherited from TiltedEvolution: only forward declarations remain on both sides. Removed in WORK_PLAN package 2.4."
+    },
+    {
+      "rule": "W1",
+      "subject": "RequestObjectInventoryChanges",
+      "detail": "ClientMessage is never constructed under Code/client",
+      "reason": "Dead type inherited from TiltedEvolution: only forward declarations remain on both sides. Removed in WORK_PLAN package 2.4."
+    },
+    {
+      "rule": "W2",
+      "subject": "RequestObjectInventoryChanges",
+      "detail": "ClientMessage has no handler under Code/server",
+      "reason": "Dead type inherited from TiltedEvolution: only forward declarations remain on both sides. Removed in WORK_PLAN package 2.4."
+    }
+  ]
+}

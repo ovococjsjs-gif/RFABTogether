@@ -43,6 +43,21 @@ if ($env:GITHUB_ACTIONS -eq "true" -and $env:GITHUB_REF) {
         $PublishRelease = $false
     }
 }
+# A repository other than the upstream one builds, tests and packages, but does not publish on
+# its own: the protected tags and the backup manifests below describe the upstream release history,
+# and a fork that reached this point on its main branch would try to mirror releases it never had.
+# A fork opts in by committing an empty file named RELEASE_FROM_THIS_REPOSITORY at its root.
+$script:RfabUpstreamRepository = "Riyozaki/RFAB_Online"
+$script:RfabRepositorySlug = if ($env:GITHUB_REPOSITORY) { $env:GITHUB_REPOSITORY } else { $script:RfabUpstreamRepository }
+if ($env:GITHUB_ACTIONS -eq "true" -and ($script:RfabRepositorySlug -ne $script:RfabUpstreamRepository)) {
+    $forkOptInFile = Join-Path $script:RfabRepoRoot "RELEASE_FROM_THIS_REPOSITORY"
+    if (-not (Test-Path -LiteralPath $forkOptInFile)) {
+        if ($PublishRelease) {
+            Write-Host "[RELEASE] $script:RfabRepositorySlug has not opted in to publishing (no RELEASE_FROM_THIS_REPOSITORY file); building and verifying only." -ForegroundColor Yellow
+        }
+        $PublishRelease = $false
+    }
+}
 $env:RFAB_PUBLISHING_RELEASE = if ($PublishRelease) { "1" } else { "0" }
 
 $ProtectedTags = @("v1.0.0", "v1.1.0", "v1.2.0", "v1.2.0-backup", "v1.2.0-hotfix.1", "v1.2.0-hotfix.2", "v2.0.0-alpha.1", "v2.0.0-alpha.2", "v2.0.0", "v2.0.1", "v2.0.1-backup", "v2.0.2", "v2.0.2-backup", "v2.0.3", "v2.0.3-backup", "v2.1.0", "v2.1.0-backup", "v3.0.0", "v3.0.0-backup", "v3.1.0", "v3.1.0-backup", "v3.1.1", "v3.1.1-backup", "v3.1.2", "v3.1.2-backup", "v3.1.3", "v3.1.3-backup", "v3.1.4", "v3.1.5", "v3.1.6", "v3.1.7-backup", "v3.1.7", "v3.1.8")
@@ -915,6 +930,17 @@ function Invoke-LoggedCmd([string]$StepName, [string]$CmdString) {
         $tailShow = if ($allLines.Length -gt 80) { $allLines[($allLines.Length - 80)..($allLines.Length - 1)] } else { $allLines }
         foreach ($ln in $tailShow) { Write-Host $ln }
         if ($code -ne 0) {
+            # First errors first, repeats dropped, in as many annotations as one step may carry.
+            # The two annotations below keep only the last 3500 characters, which on a cascade of
+            # compiler errors is the end of the cascade and never its cause.
+            try {
+                $diagScript = Join-Path $script:RfabRepoRoot "Tools\rfab\ci_diagnostics.py"
+                if (Test-Path -LiteralPath $diagScript) {
+                    & python $diagScript --log $stepLog --step $StepName --exit-code $code
+                }
+            } catch {
+                Write-Host "[DIAG] ci_diagnostics.py could not run: $($_.Exception.Message)"
+            }
             $errMatches = @($allLines | Where-Object { $_ -match '(?i)(error\s+[A-Z]*\d+|fatal error|unresolved external|error:|Traceback|Assertion|Exception)' } | ForEach-Object { $_ -replace '-external:[^\s]+', '' })
             if ($errMatches.Count -gt 0) {
                 $script:LastDiagMatches = ($errMatches -join "`r`n")
@@ -1042,7 +1068,7 @@ try {
 
         & cmd.exe /d /s /c "gh release delete-asset $VersionTag build_step_log.txt --yes >nul 2>&1"
         & cmd.exe /d /s /c "gh release edit $VersionTag --target $CommitSha --title `"$RelTitle`" --notes-file `"$NotesFile`" $RelFlags"
-        Emit-Annotation "notice" "RELEASE_READY" "Published https://github.com/Riyozaki/RFAB_Online/releases/tag/$VersionTag"
+        Emit-Annotation "notice" "RELEASE_READY" "Published https://github.com/$($script:RfabRepositorySlug)/releases/tag/$VersionTag"
     }
     $global:LASTEXITCODE = 0
     exit 0

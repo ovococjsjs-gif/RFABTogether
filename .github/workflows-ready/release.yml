@@ -11,6 +11,9 @@ permissions:
 jobs:
   release:
     runs-on: windows-2022
+    # A warm build takes 17-19 minutes; the first one in a repository also compiles every xmake
+    # package. The limit only stops a hung test from holding a runner for the default six hours.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,5 +54,6 @@ jobs:
             release_artifacts/SHA256SUMS.txt
             release_artifacts/RELEASE_NOTES.md
           if-no-files-found: warn
-          retention-days: 14
+          # The build of each finished stage stays downloadable for as long as GitHub allows.
+          retention-days: 90
           compression-level: 0
