@@ -1,142 +1,217 @@
-# RFAB Online
-
-> **Это репозиторий RFAB Together** — ветка разработки поверх [`Riyozaki/RFAB_Online`](https://github.com/Riyozaki/RFAB_Online) `v4.1.0`.
-> Версия здесь — **`4.1.1`, в разработке, без плейтеста**. Состояние и план работ: [`docs/WORK_PLAN.md`](docs/WORK_PLAN.md); сборка и CI: [`docs/CI.md`](docs/CI.md).
-> Текст ниже — описание апстрима: ссылки на скачивание в нём ведут на его релизы, а не на сборки этого репозитория.
-
 <div align="center">
 
-### 🎮 Кооперативный мультиплеер для Skyrim SE `1.5.97.0.8` + [Requiem for a Balance (RFAB)](https://github.com/drake1ch/RFAB)
+<img src="docs/assets/banner.jpg" alt="RFAB Together — кооператив для Skyrim SE и сборки Requiem for a Balance" width="100%">
 
-[![Build & Release](https://github.com/Riyozaki/RFAB_Online/actions/workflows/release.yml/badge.svg)](https://github.com/Riyozaki/RFAB_Online/actions/workflows/release.yml)
-[![Latest Release](https://img.shields.io/github/v/release/Riyozaki/RFAB_Online?label=актуальный%20релиз&color=brightgreen)](https://github.com/Riyozaki/RFAB_Online/releases/tag/v3.1.7)
-[![Game Version](https://img.shields.io/badge/Skyrim%20SE-1.5.97.0.8-2a2a3a)](https://github.com/Riyozaki/RFAB_Online/releases/tag/v3.1.7)
-[![SKSE64](https://img.shields.io/badge/SKSE64-2.0.20-blue)](https://github.com/Riyozaki/RFAB_Online/releases/tag/v3.1.7)
+# RFAB Together
 
-*Проходите Requiem for a Balance вдвоём–вчетвером без потери механик RFAB: собственные сложности («Странник», «Довакин», «Легенда», «Проклятый»), режим «Единство в битве» без урона по союзникам, общие квесты и опыт, «Downed-on-Knee» вместо мгновенной смерти и синхронные сохранения всей группы.*
+**Кооператив для Skyrim SE `1.5.97` и сборки [Requiem for a Balance](https://github.com/drake1ch/RFAB)**
 
-[**📥 Скачать v3.1.7**](https://github.com/Riyozaki/RFAB_Online/releases/tag/v3.1.7) · [**⚡ Установка и обновление**](#-быстрый-старт-и-обновление) · [**🎮 Управление (Хост и Гости)**](#-управление-и-права-хоста) · [**📋 Changelog**](./CHANGELOG.md) · [**📚 Документация**](#-документация-и-инженерные-артефакты)
+[![Сборка Windows](https://github.com/ovococjsjs-gif/RFABTogether/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/ovococjsjs-gif/RFABTogether/actions/workflows/release.yml?query=branch%3Amain)
+[![Тесты Linux](https://github.com/ovococjsjs-gif/RFABTogether/actions/workflows/core-tests-linux.yml/badge.svg?branch=main)](https://github.com/ovococjsjs-gif/RFABTogether/actions/workflows/core-tests-linux.yml?query=branch%3Amain)
+![Версия](https://img.shields.io/badge/%D0%B2%D0%B5%D1%80%D1%81%D0%B8%D1%8F-4.1.1-2ea8a0)
+![Skyrim SE](https://img.shields.io/badge/Skyrim%20SE-1.5.97-2a2a3a)
+![SKSE64](https://img.shields.io/badge/SKSE64-2.0.20-3b6ea5)
+![Лицензия](https://img.shields.io/badge/%D0%BB%D0%B8%D1%86%D0%B5%D0%BD%D0%B7%D0%B8%D1%8F-GPL--3.0-8a6d3b)
+
+*Проходите Requiem for a Balance вдвоём–вчетвером: общий мир и задания, личные сложность и прогресс,<br>ранение вместо мгновенной смерти и свой сервер.*
+
+[**Скачать сборку**](#-скачать-и-установить) · [**Что нового**](#-что-нового-в-411) · [**Управление**](#-управление) · [**Плейтест**](docs/PLAYTEST.md) · [**Журнал изменений**](CHANGELOG.md)
 
 </div>
+
+> [!IMPORTANT]
+> **Сборка `4.1.1` собрана для первого плейтеста и в игре ещё не проверена.** Её исправления найдены чтением кода и на серверном стенде. Маршрут проверки на один вечер — [`docs/PLAYTEST.md`](docs/PLAYTEST.md), раздел 0.
 
 ---
 
 ## 🔥 О проекте
 
-**RFAB Online** — готовый к игре кооперативный мультиплеер «из коробки», специально адаптированный под модпак **[Skyrim Requiem for a Balance (RFAB)](https://github.com/drake1ch/RFAB)** (включая **RFAB Respect Edition** и любые обновлённые версии RFAB) и движок **Skyrim Special Edition `1.5.97.0.8`** (`SKSE64 2.0.20`, `version-1-5-97-0.bin`).
+**RFAB Together** — кооперативный мультиплеер для модпака **[Requiem for a Balance (RFAB)](https://github.com/drake1ch/RFAB)** на Skyrim Special Edition `1.5.97`. Проект продолжает [`Riyozaki/RFAB_Online`](https://github.com/Riyozaki/RFAB_Online) `v4.1.0` и построен на платформе Skyrim Together Reborn (Tilted Online).
 
-- **0 перезаписей баланса и контента RFAB:** плагины коопа полностью очищены от ванильных оверрайдов (всего 5 собственных форм в `SkyrimTogether.esp`), сохраняя 100% перков, алтарей, заклинаний, колец, призывов, камер и интерфейса RFAB при любом порядке загрузки (в том числе когда `RFAB.esp` помечен ESM-флагом на слоте `07` в **RFAB Respect Edition**) за счёт встроенного бинарного индексатора `.esm/.esp/.esl` (`EspEdidIndex`).
-- **Установка и обновление в 2 клика:** готовый нативный лаунчер `SkyrimSE.exe`, клиент под **Mod Organizer 2**, русский оверлей и выделенный сервер ставятся автоматически без `git`, консольных команд и ручного копирования файлов.
-- **Чёткая политика версий:** в разделе [Releases](https://github.com/Riyozaki/RFAB_Online/releases) доступен актуальный релиз **[`v3.1.7` (`Latest`)](https://github.com/Riyozaki/RFAB_Online/releases/tag/v3.1.7)** и неприкосновенные архивные бэкапы всех стабильных веток (**[`v2.0.2-backup`](https://github.com/Riyozaki/RFAB_Online/releases/tag/v2.0.2-backup)**, **[`v2.0.2`](https://github.com/Riyozaki/RFAB_Online/releases/tag/v2.0.2)**, **[`v2.0.1-backup`](https://github.com/Riyozaki/RFAB_Online/releases/tag/v2.0.1-backup)**, **[`v2.0.1`](https://github.com/Riyozaki/RFAB_Online/releases/tag/v2.0.1)**, **[`v1.2.0`](https://github.com/Riyozaki/RFAB_Online/releases/tag/v1.2.0)**, **[`v1.1.0`](https://github.com/Riyozaki/RFAB_Online/releases/tag/v1.1.0)**, **[`v1.0.0`](https://github.com/Riyozaki/RFAB_Online/releases/tag/v1.0.0)**).
+- **RFAB остаётся RFAB.** Плагины коопа не перезаписывают баланс и контент сборки: сложности, перки, алтари и скрипты работают у каждого игрока так же, как в одиночной игре.
+- **Настройки других модов не меняются.** Значения, нужные для коопа, лаунчер подставляет только своему процессу; файлы сборки остаются нетронутыми.
+- **Установка одним файлом.** Установщик сам находит Mod Organizer 2, ставит клиент, интерфейс и выделенный сервер.
+- **Каждое исправление можно выключить.** У новых исправлений есть выключатель в `STServer.ini`; выключенное ведёт себя как прежняя версия.
 
 ---
 
-## 📦 Быстрый старт и обновление
+## ✨ Возможности
 
-| Архив в релизе [`v3.1.7` (`Latest`)](https://github.com/Riyozaki/RFAB_Online/releases/tag/v3.1.7) | Назначение |
+| | Возможность | Как это работает в коопе |
+|:-:|---|---|
+| 🛡 | **«Единство в битве»** | Хост включает защиту союзников: игроки группы и их призванные существа не наносят друг другу урона |
+| ⚔️ | **Сложности RFAB** | «Странник», «Довакин», «Легенда» и метка «Проклятый» действуют у каждого игрока отдельно |
+| 🐉 | **Честные бои** | Враги и засады не удваиваются, а их здоровье растёт с числом игроков: по умолчанию ×3 на двоих и ×4 на троих |
+| 📈 | **Общий опыт** | Опыт за врагов, боссов и задания получает вся группа; личный множитель опыта у каждого свой |
+| 🙏 | **Ранение вместо смерти** | При 0 HP персонаж падает на колено, и союзник поднимает его, удерживая `E` |
+| 🧰 | **Добыча без дублей** | Сервер ведёт списки содержимого сундуков и тел, поэтому вещь достаётся одному игроку. Сундуки торговцев и личные хранилища у каждого свои |
+| 🧭 | **Интерфейс отряда** | Список группы, маяки упавших напарников и 3D-метки по прицелу |
+| 💾 | **Общие сохранения** | Сохранение и загрузка проходят синхронно у всей группы |
+
+---
+
+## 🆕 Что нового в 4.1.1
+
+| Область | Что сделано |
 |---|---|
-| **[`RFAB_Online_v3.1.7_Full_Installer.zip`](https://github.com/Riyozaki/RFAB_Online/releases/download/v3.1.7/RFAB_Online_v3.1.7_Full_Installer.zip)** | **Полная установка с нуля или чистое обновление** (`INSTALL_RFAB_ONLINE.bat`): клиент MO2 + UI + выделенный сервер + автонастройка конфигов |
-| **[`RFAB_Online_v3.1.7_Quick_Update.zip`](https://github.com/Riyozaki/RFAB_Online/releases/download/v3.1.7/RFAB_Online_v3.1.7_Quick_Update.zip)** | **Быстрое обновление за 10 секунд** (`UPDATE_RFAB_ONLINE.bat`, ≈15 МБ): обновляет все `.exe`/`.dll`/`.esp`, `UI` и сервер поверх установленного мода |
-| **[`RFAB_Online_v3.1.7_PDB_Symbols.zip`](https://github.com/Riyozaki/RFAB_Online/releases/download/v3.1.7/RFAB_Online_v3.1.7_PDB_Symbols.zip)** | Отладочные символы `.pdb` и [`SHA256SUMS.txt`](https://github.com/Riyozaki/RFAB_Online/releases/download/v3.1.7/SHA256SUMS.txt) |
+| **Диагностика** | Сборщик отчёта одним файлом, расшифровка адресов вылета до имён функций, детектор рассинхрона на сервере |
+| **Вылеты и перезагрузки** | События игры не переживают общую перезагрузку; запуск не падает на именах файлов и папок, которые не помещаются в кодовую страницу Windows; `Shift+F9` возвращает к предыдущей точке; сервер сообщает, почему он закрылся |
+| **Рассинхроны** | Босс не переходит к другому игроку из-за короткой паузы владельца; вскрытый замок не запирается снова; взятый с тела предмет не появляется на нём снова |
+| **Механики RFAB** | Опыт за задание приходит один раз; призванное существо исчезает и у напарника; торговля и хранилища личные; вещь, взятая раньше ответа сервера, не двоится |
+| **Проверки** | На каждый коммит: более 300 тестов ядра на Linux и Windows, серверный стенд под санитайзерами, статические проверки, сборка и проверка установщика |
 
-### 1. Чистая установка (одинаково для Хоста и Друзей)
+Полный список — в [`CHANGELOG.md`](CHANGELOG.md), разбор каждого дефекта — в [`docs/DEFECT_REGISTRY.md`](docs/DEFECT_REGISTRY.md).
 
-1. Скачайте **[`RFAB_Online_v3.1.7_Full_Installer.zip`](https://github.com/Riyozaki/RFAB_Online/releases/tag/v3.1.7)** и распакуйте архив в любую временную папку.
-2. Закройте игру и **Mod Organizer 2**, затем запустите **`INSTALL_RFAB_ONLINE.bat`**:
-   - откроется удобное окно выбора папки сборки RFAB (автоматически находит `ModOrganizer.exe` на дисках и считывает точный путь к `SkyrimSE.exe 1.5.97` из `ModOrganizer.ini`);
-   - установщик автоматически закрывает фоновый сервер, **полностью удаляет любые старые файлы прошлых версий** в `MO2\mods\RFAB_Online` и `RFAB_Online_Server` (сохраняя ваши настройки `STServer.ini`), очищает устаревшие хвосты в `MO2\overwrite` и ставит новую версию начисто;
-   - активирует `+RFAB_Online`, `*SkyrimTogether.esp` и `*SkyrimTogetherQuestPatches.esp` (место в списке плагинов не критично: `RFAB.esp` помечен флагом ESM и всё равно грузится вместе с мастер-файлами, а плагины коопа не перезаписывают записи RFAB) и создаёт профиль запуска **`RFAB Online - Play`** в MO2;
-   - **не изменяет настройки других модов.** Нужные для коопа значения (`EngineFixes` без своего аллокатора памяти, `Skyrim Souls RE` без замедления времени, без автосейвов `[RFAB] Autosave`, выключенный `BetterStealing`) лаунчер RFAB Online подставляет только процессу совместной игры; одиночный RFAB запускается со своими настройками. Правки прежних версий установщика автоматически откатываются (если вы сами меняли файл после установки, он остаётся как есть);
-   - устанавливает выделенный сервер в `<Папка_RFAB>\RFAB_Online_Server` и создаёт ярлык **`START_RFAB_SERVER.bat`**.
+<details>
+<summary><b>Известные ограничения</b></summary>
 
-### 2. Легкое обновление с прошлой версии
+- Перекат напарника, судя по коду, не виден: его фигура смещается без кувырка. На урон и положение это не влияет.
+- Зелья и яды своей варки напарнику не передаются; у того, кто их сварил, они остаются.
+- Запланировано после плейтеста: подключение из главного меню, возвращение в группу после вылета, согласованные сон, ожидание и быстрое путешествие.
 
-Перейти на свежую сборку можно **любым из двух способов** — никакого ручного удаления папок не требуется:
-- **Через `INSTALL_RFAB_ONLINE.bat` (`Full_Installer.zip`):** полностью сносит старую версию клиента и сервера, сохраняет и мигрирует `STServer.ini`, после чего ставит чистую новую сборку.
-- **Через `UPDATE_RFAB_ONLINE.bat` (`Quick_Update.zip`, ≈15 МБ):** мгновенно закрывает старый сервер, удаляет устаревший `UI` и конфликтующие файлы старых сборок и обновляет бинарники клиента (`SkyrimSE.exe`, `EarlyLoad.dll`, `TPProcess.exe`), `.esp`, `UI` и сервер.
-
-### 3. Запуск и подключение
-
-1. **[Только Хост]** Запустите `<Папка_RFAB>\START_RFAB_SERVER.bat` — в окне сразу отобразится IP-адрес для друзей (например, из **Radmin VPN**).
-2. **[Хост и Друзья]** Откройте **Mod Organizer 2** → выберите **`RFAB Online - Play`** → нажмите **«Запустить»**.
-3. Загрузите сохранение в открытом мире → нажмите **`Правый CTRL`** (или **`F2`**) → **«Подключиться» (`Connect`)**:
-   - **Хост вводит:** `127.0.0.1:10578`
-   - **Друзья вводят:** `<IP_хоста>:10578`
-   - все игроки автоматически объединяются в общую кооп-группу!
+</details>
 
 ---
 
-## ✨ Ключевые механики RFAB Online
+## 📦 Скачать и установить
 
-| Механика | Как работает в кооперативе |
+Готовая сборка прикладывается к каждому прогону CI на ветке `main`:
+
+1. Откройте [прогоны «Build & Publish Clean Release» на `main`](https://github.com/ovococjsjs-gif/RFABTogether/actions/workflows/release.yml?query=branch%3Amain+is%3Asuccess) и выберите верхний.
+2. Внизу страницы, в разделе **Artifacts**, скачайте `RFAB_Online-build-<sha>`. Нужен вход в GitHub; архив хранится 90 дней.
+
+| Файл в архиве | Назначение |
 |---|---|
-| 🛡 **«Единство в битве» (строго у Хоста)** | Встроенный в верхнюю панель **Правого CTRL** аналог способности Красноречия RFAB. Когда режим **ВКЛ** (по умолчанию), игроки группы и их саммоны наносят **0 физического урона**, **0 магического урона** и **0 негативных эффектов** (крики, оглушение, яды, плащи, дебаффы) друг другу, но **на 100% лечат и баффают** союзников и их призывы (включая все 18 заклинаний из `RFAB_List_NoAllyDamage_AllowedSpells`). Переключать режим может **только Хост** (для дуэлей и тестов билдов). |
-| ⚔️ **Сложности RFAB и «Проклятый»** | Режимы **«Странник»** (`×2 / ×0.5`), **«Довакин»** (`×1 / ×1`), **«Легенда»** (`×1 / ×2`) и метка **«Проклятый»** (`×0.5` к исходящему урону игрока) работают индивидуально у каждого игрока без перезаписи сервером; урон призывных существ остаётся `1.0x`, как в `DifficultyBalance.dll` / `RFAB.dll`. |
-| 🐉 **Честный спавн и масштаб HP** | Враги и скриптовые засады **не умножаются** (`1×` спавн), а их здоровье масштабируется по числу игроков: `1` игрок = `×1 HP`, `2` игрока = `×3 HP`, `3` игрока = `×4 HP` (настраивается в `STServer.ini`). |
-| 📈 **Общий опыт + личный кошелёк** | Опыт за врагов, боссов, квесты и книги `XPBooksReaded` начисляется всем участникам группы с учётом персонального `RFAB_XP_Multiplier` (кольца, камни), при этом личный кошелёк `RFAB_XP_Amount` защищён от перезаписи чужим `RFAB_Menu`. |
-| 🙏 **Downed-on-Knee вместо смерти** | При падении до `0 HP` точный перехват летального урона (`ScopedLethalPlayerDamageIntercept`) ставит персонажа на колено без вызова одиночного `REQ_DeathHandler` и без искажения `% MaxHP` перков RFAB: союзник может поднять его клавишей **`E`** (~4 с), либо группа побеждает в бою и павшие встают с `30% HP`. Если пала вся группа — сервер синхронно откатывает чекпоинт, снимая враждебные яды/дебаффы и полностью сохраняя еду, эликсиры и благословения RFAB. |
-| 🧰 **Серверный авторитет боя и лута (`v2.0.2`)** | Серверный реестр `CoopLootLedger` защищает сундуки боссов и тела врагов от дюпа при одновременном взятии предметов (сохраняя квестовые ключи/когти для всей группы), окно согласования урона (`650 мс`) не даёт устаревшим пакетам откатывать HP босса назад, а фазы бесплотности боссов RFAB защищены на стороне сервера. |
-| 🧭 **Тактический HUD отряда и 3D-метки** | Лёгкий D3D11/ImGui-интерфейс отряда (`F11` / `/hud`), общая полоса здоровья, фазы и цели агро активного босса RFAB, 3D-маяки раненых напарников и контекстные 3D-метки по прицелу (`F10` / `Alt + СКМ`). |
-| 💾 **Безопасные синхронные сейвы** | Двухфазный барьер `PREPARE → ACK → COMMIT` через нативную очередь `BGSSaveLoadManager`, совместимые настройки `EngineFixes` только для процесса коопа (`MemoryManager = false`, `SaveGameMaxSize = false`, `MaxStdio = 8192`; без них `EngineFixes.dll` в коопе не загружается), полная очистка временных `0xFFxxxxxx`-клонов без порчи статических форм и глубокая бинарная проверка LZ4-структуры `.ess` с авто-карантином повреждённых файлов. |
-| 🚪 **Бесшовные переходы и `O(1)` ядро** | Разделение `ServerWorldModel` / `ClientWorldView`, `O(1)` индексы сетевых сущностей и объектов, гистерезис 3D-моделей при смене экипировки, кросс-ячеечный перенос `0xFF00xxxx`-клонов и спящий режим мировых NPC на сервере гарантируют плавную игру без вылетов при переходах между локациями. |
+| `RFAB_Online_v4.1.1_Full_Installer.zip` | Полная установка или чистое обновление: клиент для MO2, интерфейс, выделенный сервер |
+| `RFAB_Online_v4.1.1_Quick_Update.zip` | Быстрое обновление поверх уже установленной версии |
+| `RFAB_Online_v4.1.1_PDB_Symbols.zip` | Отладочные символы; нужны только для разбора вылета |
+| `SHA256SUMS.txt` | Контрольные суммы архивов |
+
+### 1. Установка (одинаково для хоста и гостей)
+
+1. Распакуйте `RFAB_Online_v4.1.1_Full_Installer.zip` в любую временную папку.
+2. Закройте игру и Mod Organizer 2, запустите **`INSTALL_RFAB_ONLINE.bat`** и укажите папку сборки RFAB.
+3. Установщик удалит файлы прошлых версий, сохранит ваш `STServer.ini`, поставит клиент в MO2 и выделенный сервер в `<Папка_RFAB>\RFAB_Online_Server` с ярлыком **`START_RFAB_SERVER.bat`**.
+
+Обновиться позже можно тем же установщиком или файлом `UPDATE_RFAB_ONLINE.bat` из `Quick_Update.zip`.
+
+### 2. Запуск и подключение
+
+1. **Хост** запускает `<Папка_RFAB>\START_RFAB_SERVER.bat`. В окне сервера виден IP-адрес для друзей (например, из Radmin VPN).
+2. **Все игроки** открывают Mod Organizer 2, выбирают **`RFAB Online - Play`** и нажимают «Запустить».
+3. Загрузите сохранение, нажмите **`Правый Ctrl`** (или **`F2`**) и выберите «Подключиться»:
+   - хост вводит `127.0.0.1:10578`;
+   - друзья вводят `<IP_хоста>:10578`.
+
+Все подключившиеся автоматически объединяются в одну группу.
 
 ---
 
-## 🎮 Управление и права Хоста
+## 🎮 Управление
 
-| Действие / Клавиша | Кто может использовать | Описание |
+| Действие | Кто может | Описание |
 |---|---|---|
-| **`Правый CTRL`** или **`F2`** | **Все игроки** | Открыть оверлей кооператива (подключение, чат, группа, настройки) |
-| **Кнопка «Единство в битве: ВКЛ / ВЫКЛ»** *(или `/allyprotect`)* | **Только Хост** | Включить/выключить защиту союзников от урона и дебаффов для всей группы (у гостей отображается текущий статус Хоста) |
-| **`F5`** *(быстрое сохранение)* | **Любой игрок** | Запустить синхронное сохранение прогресса **для всей группы** |
-| **`F9`** *(быстрая загрузка)* | **Только Хост** | Синхронно загрузить последний групповой чекпоинт у всех игроков (с авто-реконнектом) |
-| **Удерживать `E`** *(у раненого)* | **Все живые союзники** | Поднять упавшего на колено напарника (~4 секунды) |
-| **`F10`** / **`Alt + СКМ`** *(тактический пинг)* | **Все игроки** | Поставить контекстную 3D-метку для группы (`Shift + F10` — опасность, `Ctrl + F10` — очистить) |
-| **`F11`** *(или `/hud`)* | **Все игроки** | Переключить режим тактического HUD отряда (`Полный` → `Компактный` → `Только 3D-метки` → `Скрыт`) |
+| **`Правый Ctrl`** или **`F2`** | Все | Оверлей кооператива: подключение, чат, группа, настройки |
+| **«Единство в битве»** или `/allyprotect` | Только хост | Включить или выключить защиту союзников для всей группы |
+| **`F5`** | Все | Синхронное сохранение для всей группы |
+| **`F9`** | Только хост | Загрузить последнюю общую точку у всех игроков |
+| **Удерживать `E`** у раненого | Все живые союзники | Поднять упавшего на колено напарника |
+| **`F10`** или **`Alt + СКМ`** | Все | Поставить 3D-метку для группы (`Shift + F10` — опасность, `Ctrl + F10` — очистить) |
+| **`F11`** или `/hud` | Все | Переключить вид интерфейса отряда |
 
 ---
 
-## 🖥 Настройка выделенного сервера (`STServer.ini`)
+## 🖥 Сервер
 
-Файл конфигурации расположен в `<Папка_RFAB>\RFAB_Online_Server\config\STServer.ini`:
+Настройки лежат в `<Папка_RFAB>\RFAB_Online_Server\config\STServer.ini`.
 
 | Параметр | По умолчанию | Назначение |
 |---|---|---|
 | `uPort` | `10578` | UDP-порт сервера |
 | `uMaxPlayerCount` | `8` | Максимальное число игроков |
-| `uDifficulty` | `2` | Базовый индекс Adept (`1.0x / 1.0x`), не затирающий личные сложности RFAB |
-| `bAutoPartyJoin` | `true` | Автоматическое объединение всех подключившихся игроков в группу Хоста |
-| `bEnableItemDrops` | `true` | Видимость и синхронизация выброшенных на землю предметов |
-| `bEnablePvp` | `false` | Защита игроков вне группы (внутри группы дружеским огнём управляет Хост кнопкой **«Единство в битве»**) |
-| `bAutoScaleEnemyHealth` | `true` | Автоматическое масштабирование HP врагов (`fHealthMultiplier * (Players + fHealthExtraBase)`) |
-| `bEnableDownedSystem` | `true` | Система ранения `0 HP Downed-on-Knee` и поднятия на `E` |
-| `bEnableCoordinatedSaves` | `true` | Синхронные сохранения группы (`F5` / `F9` / автосейв после боя) |
+| `uDifficulty` | `2` | Базовая сложность сервера; личные сложности RFAB она не затирает |
+| `bAutoPartyJoin` | `true` | Все подключившиеся попадают в группу хоста |
+| `bEnableItemDrops` | `true` | Выброшенные предметы видны всем |
+| `bEnablePvp` | `false` | Урон между игроками вне группы |
+| `bAutoScaleEnemyHealth` | `true` | Здоровье врагов: `fHealthMultiplier × (игроки + fHealthExtraBase)` |
+| `bEnableDownedSystem` | `true` | Ранение на 0 HP и подъём клавишей `E` |
+| `bEnableCoordinatedSaves` | `true` | Общие сохранения группы |
+
+<details>
+<summary><b>Выключатели исправлений 4.1.1</b></summary>
+
+<br>
+
+Включены по умолчанию. Значение `false` возвращает прежнее поведение.
+
+| Параметр | Что делает |
+|---|---|
+| `bEnableBossLeaseRenewal` | Босс остаётся за ведущим его игроком при короткой паузе |
+| `bEnableUnlockMemory` | Сервер помнит вскрытые замки |
+| `bEnableBodyLootAuthority` | Тело сохраняет список вещей при смене ведущего игрока |
+| `bEnableQuestXpSingleAward` | Опыт за задание выплачивается один раз |
+| `bEnableSummonDismissal` | Отпущенное призванное существо исчезает у всех |
+| `bEnablePersonalMerchantStock` | Сундуки торговцев и хранилища личные |
+| `bEnableNeighbourCellContainers` | Сундуки у границ клеток учитываются заранее |
+| `bEnableEarlyTakeReplay` | Вещь, взятая до ответа сервера, не двоится |
+| `bEnableWorldScopedHookEvents` | События, возникшие до общей перезагрузки, отбрасываются |
+| `bEnableDesyncDetector` | Детектор рассинхрона пишет находки в лог сервера |
+
+Выключены по умолчанию, пока не пройдут плейтест.
+
+| Параметр | Что делает |
+|---|---|
+| `bEnableDesyncAutoRepair` | Найденный рассинхрон персонажа исправляется повторной отправкой |
+| `bEnableLateJoinCatchUpXp` | Вернувшийся игрок получает опыт, заработанный группой без него |
+| `bEnableSharedDragonSouls` | Душу дракона получают и те, кого не было рядом |
+| `bEnableMountRideGuard` | На лошадь с всадником не может сесть другой игрок |
+| `bEnablePeacefulNpcsUnscaled` | Мирные существа сохраняют обычное здоровье |
+
+</details>
 
 ---
 
-## 📚 Документация и инженерные артефакты
+## 🧪 Плейтест и отчёты
 
-- **[`CHANGELOG.md`](./CHANGELOG.md)** — подробный журнал изменений по всем релизам (`v3.1.7`, `v2.0.2`, `v2.0.1`, `v1.2.0`, `v1.1.0`, `v1.0.0`).
-- **[`docs/V2.0.2_RELEASE_BACKUP_MANIFEST.json`](./docs/V2.0.2_RELEASE_BACKUP_MANIFEST.json)**, **[`docs/V2.0.1_RELEASE_BACKUP_MANIFEST.json`](./docs/V2.0.1_RELEASE_BACKUP_MANIFEST.json)** и **[`docs/V1.0.0_RELEASE_BACKUP_MANIFEST.json`](./docs/V1.0.0_RELEASE_BACKUP_MANIFEST.json)** — криптографические манифесты (`SHA-256`) неприкосновенных резервных релизов `v2.0.2-backup`, `v2.0.1-backup` и `v1.0.0`.
-- **[`docs/archive/RFAB_ADAPTATION_SPEC.md`](./docs/archive/RFAB_ADAPTATION_SPEC.md)** — спецификация интеграции механик RFAB и кросс-версионной совместимости с будущими обновлениями `drake1ch/RFAB` (`EspEdidIndex`, рекурсивное обнаружение конфигов, плагин-привязанные идентификаторы боссов и квестов).
-- **[`docs/archive/PLAYTEST_SIX_ISSUES_ROOT_CAUSE_AND_FIX_SPEC_2026_10_24.md`](./docs/archive/PLAYTEST_SIX_ISSUES_ROOT_CAUSE_AND_FIX_SPEC_2026_10_24.md)** — полный бинарный разбор и архитектурная спецификация исправлений 6 багов кооп-плейтеста (`+0x6EDFC2` при загрузке сейва, `StatsMenu` / `Tab`, агро на раненого, невидимые бессмертные враги и боевой ИИ / скорость атак NPC).
-- **[`docs/archive/THREAD_SAFETY_AND_REENTRANCY_HARDENING.md`](./docs/archive/THREAD_SAFETY_AND_REENTRANCY_HARDENING.md)** — аудит потокобезопасности, защиты от `Use-After-Free` и реентерабельности всех сервисов клиента.
-- **[`docs/archive/CELL_TRANSITION_CTD_AND_RESPECT_EDITION_AUDIT_2026_10_24.md`](./docs/archive/CELL_TRANSITION_CTD_AND_RESPECT_EDITION_AUDIT_2026_10_24.md)** — корневой разбор и устранение вылетов напарника при смене локации (`DisableImpl` ABI, `FormIdComponent`, `FaceGen`) + аудит совместимости с **RFAB Respect Edition** (`07 RFAB.esp`).
-- **[`docs/archive/CORRUPT_SAVE_ROOT_CAUSE_AUDIT_2026_10_24.md`](./docs/archive/CORRUPT_SAVE_ROOT_CAUSE_AUDIT_2026_10_24.md)** — разбор и устранение всех 4 причин ошибки `sSaveGameCorrupt` (`EngineFixes` `ScrapHeap` `128 МБ / 64 МБ`, бинарная валидация SE v12 `.ess` и перехват `0x0058AE30`).
-- **[`docs/archive/RFAB_COOP_ALLY_PROTECTION_AND_RELEASE_FIX_2026_10_24.md`](./docs/archive/RFAB_COOP_ALLY_PROTECTION_AND_RELEASE_FIX_2026_10_24.md)** — разбор механики *«Единство в битве»* в `RFAB.esp`, серверной авторизации Хоста и кодировки релизов.
-- **[`docs/archive/RFAB_DIFFICULTY_AND_VANILLA_OVERRIDE_AUDIT_2026_10_24.md`](./docs/archive/RFAB_DIFFICULTY_AND_VANILLA_OVERRIDE_AUDIT_2026_10_24.md)** — аудит сложностей RFAB (*Странник / Довакин / Легенда / Проклятый*) и полной зачистки ванильных перезаписей.
-- **[`docs/archive/PLAYTEST_ROOT_CAUSE_AUDIT_2026_10_24.md`](./docs/archive/PLAYTEST_ROOT_CAUSE_AUDIT_2026_10_24.md)** — корневой разбор проблем живого кооп-плейтеста (сейвы, FaceGen, алтари, кольца, саммоны, анимации).
-- **[`docs/archive/RFAB_PORT_NOTES.md`](./docs/archive/RFAB_PORT_NOTES.md)** и **[`docs/archive/SE_1597_PORT_SPEC.md`](./docs/archive/SE_1597_PORT_SPEC.md)** — архитектура сервисов и бинарная спецификация порта под `Skyrim SE 1.5.97.0.8` (`docs/se-1597-id-map.csv`).
-- **[`Data/SKSE/Plugins/RFAB_Online_Bindings.json`](./Data/SKSE/Plugins/RFAB_Online_Bindings.json)** — внешний манифест `EditorID`-привязок для совместимости с обновлениями `drake1ch/RFAB` без перекомпиляции.
-- **[`VERSION`](./VERSION)** — единственный источник номера версии (его читают сборка, установщик, релизный пайплайн и README); поднимается только вместе с новым тегом `vX.Y.Z`.
-- **[`BUILD.md`](./BUILD.md)** — инструкция по самостоятельной сборке клиента, UI и сервера (`xmake` + Visual Studio 2022 + Node.js).
+- **Что проверять.** [`docs/PLAYTEST.md`](docs/PLAYTEST.md): маршрут на один вечер, ожидаемый результат по каждому пункту и способ отката.
+- **Что прислать.** Запустите **`COLLECT_RFAB_REPORT.bat`** в папке RFAB у каждого игрока и на сервере. Он собирает логи, дамп последнего вылета и записи детектора рассинхрона в один архив и никуда его не отправляет.
+- **Куда прислать.** Приложите архивы к [новому обращению](https://github.com/ovococjsjs-gif/RFABTogether/issues/new/choose). В логах есть имя пользователя Windows и адрес сервера: если это важно, посмотрите архив перед отправкой.
+
+---
+
+## 📚 Документация
+
+| Документ | О чём |
+|---|---|
+| [`CHANGELOG.md`](CHANGELOG.md) | Журнал изменений по версиям |
+| [`docs/PLAYTEST.md`](docs/PLAYTEST.md) | Как проверить сборку в игре и что приложить к отчёту |
+| [`docs/DEFECT_REGISTRY.md`](docs/DEFECT_REGISTRY.md) | Реестр дефектов: симптом, причина, место в коде, статус |
+| [`docs/RFAB_MECHANICS_MAP.md`](docs/RFAB_MECHANICS_MAP.md) | Карта механик RFAB: что общее, что личное и как это ведёт себя в коопе |
+| [`docs/WORK_PLAN.md`](docs/WORK_PLAN.md) | План работ и журнал выполненного |
+| [`docs/CI.md`](docs/CI.md) | Что проверяет CI и как читать его результаты |
+| [`docs/STATE_OF_THE_PROJECT.md`](docs/STATE_OF_THE_PROJECT.md) | Состояние проекта |
+| [`BUILD.md`](BUILD.md) | Сборка клиента, интерфейса и сервера из исходников |
+| [`README-ANIMATION-MODS.md`](README-ANIMATION-MODS.md) | Поддержка модов на анимации |
+| [`docs/archive/`](docs/archive) | Аудиты и спецификации прошлых версий |
 
 ---
 
 ## 🙏 Благодарности
 
-- [`drake1ch/RFAB`](https://github.com/drake1ch/RFAB) — авторам модпака **Skyrim Requiem for a Balance**.
-- [`rfortier/TiltedEvolution-rwf`](https://github.com/rfortier/TiltedEvolution-rwf) и команде **Tilted Online** — за базовую платформу Skyrim Together Reborn.
-- Командам **SKSE64** (`ianpatt/skse64`), **CommonLibSSE-NG** и **SSE Engine Fixes** (`aers/EngineFixesSkyrim64`).
+- [`drake1ch/RFAB`](https://github.com/drake1ch/RFAB) — авторам модпака Requiem for a Balance.
+- [`Riyozaki/RFAB_Online`](https://github.com/Riyozaki/RFAB_Online) — за основу, на которой построен этот проект.
+- [`rfortier/TiltedEvolution-rwf`](https://github.com/rfortier/TiltedEvolution-rwf) и команде Tilted Online — за платформу Skyrim Together Reborn.
+- Командам SKSE64 (`ianpatt/skse64`), CommonLibSSE-NG и SSE Engine Fixes (`aers/EngineFixesSkyrim64`).
 
-<sub>Проект является фанатской некоммерческой модификацией и не связан с Bethesda Softworks. Требуется установленный Skyrim SE <code>1.5.97.0.8</code>, Mod Organizer 2 и сборка RFAB.</sub>
+<details>
+<summary><b>English summary</b></summary>
+
+<br>
+
+RFAB Together is a co-op multiplayer mod for Skyrim Special Edition `1.5.97`, tailored to the Requiem for a Balance (RFAB) modpack. It continues `Riyozaki/RFAB_Online` `v4.1.0` and is built on Skyrim Together Reborn (Tilted Online).
+
+Version `4.1.1` is a playtest build: its fixes were found by code reading and on an in-process server test bench, and they have not been verified in the game yet. Builds are attached to CI runs on `main`. The documentation is in Russian.
+
+</details>
+
+<sub>Проект — фанатская некоммерческая модификация, не связанная с Bethesda Softworks. Нужны Skyrim SE <code>1.5.97</code>, Mod Organizer 2 и сборка RFAB. Лицензия — <a href="LICENSE">GPL-3.0</a>.</sub>
