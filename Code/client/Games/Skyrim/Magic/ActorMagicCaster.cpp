@@ -19,7 +19,9 @@ static TInterruptCast* RealInterruptCast = nullptr;
 
 void TP_MAKE_THISCALL(HookSpellCast, ActorMagicCaster, bool abSuccess, int32_t auiTargetCount, MagicItem* apSpell)
 {
-    RFAB_HOOK_CRUMB("HookSpellCast", apSpell ? apSpell->formID : 0);
+    // On a failed cast neither the game nor this hook reads apSpell, so the crumb does not
+    // either: it names the spell only on the path that hands the pointer on to the game.
+    RFAB_HOOK_CRUMB("HookSpellCast", (abSuccess && apSpell) ? apSpell->formID : 0);
     spdlog::debug("HookSpellCast, abSuccess: {}, auiTargetCount: {}, apSpell: {:X}", abSuccess, auiTargetCount, (uint64_t)apSpell);
 
     // Note: these if guards is how the game does it too

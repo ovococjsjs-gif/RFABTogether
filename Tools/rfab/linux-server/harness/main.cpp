@@ -57,6 +57,9 @@
 #include <Messages/ClientMessageFactory.h>
 #include <Messages/ClientReferencesMoveRequest.h>
 #include <Messages/CoordinatedSaveAck.h>
+#include <Messages/NotifyPlayerCellChanged.h>
+#include <Messages/EnterInteriorCellRequest.h>
+#include <Messages/ServerReferencesMoveRequest.h>
 #include <Messages/NotifyActivate.h>
 #include <Messages/LockChangeRequest.h>
 #include <Messages/NotifyLockChange.h>
@@ -114,6 +117,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -3910,6 +3914,290 @@ int main(int argc, char** argv)
         const auto guestWell = registerObjects(pGuest, kGuestConn, {object(kWellDoor, inB, true, 50)});
         Check(guestWell.size() == 1 && guestWell[0].IsSenderFirst && isLocked(kWellDoor) && unlockNoticesFor(kGuestConn, kWellDoor) == 0,
               "an unlock made after the checkpoint is forgotten by the rollback");
+    }
+
+    // =========================================================================
+    // Scene 18: movement, animation events and load doors for two players (work plan 5.5).
+    // =========================================================================
+    //
+    // The harness never looked at what a movement report turns into for the other player, and
+    // never sent the packet a client sends when its player walks through a load door. The scene
+    // pins both: who is sent an NPC's movement and animation events, what a player who arrives
+    // later is told about the NPC, and who simulates it when a player or the NPC changes cell.
+    {
+        std::printf("[scene 18] movement, animation events and load doors for two players\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xF301u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xF302u;
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kHall{0u, 0x000E0001u};
+        const GameId kCellar{0u, 0x000E0002u};
+        const GameId kGuardBase{0u, 0x000E1001u};
+        constexpr uint32_t kHealthIndex = ActorValuesComponent::kHealthActorValueIndex;
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 12.0f;
+        t0.Day = 5;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+
+        // A player walks through a load door: the packet his client sends.
+        const auto walkInto = [&](Player* apPlayer, const GameId& acCell) {
+            Harness::ClearOutbox();
+            EnterInteriorCellRequest request{};
+            request.CellId = acCell;
+            return DeliverWire(world, request, apPlayer);
+        };
+        Check(walkInto(pHost, kHall) && walkInto(pGuest, kHall) && pHost->GetCellComponent().Cell == kHall &&
+                  pGuest->GetCellComponent().Cell == kHall,
+              "both players enter the hall");
+
+        uint32_t nextCookie = 1800u;
+        const auto assign = [&](Player* apOwner, TiltedPhoques::ConnectionId_t aConn, const GameId& acRefId) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            request.ReferenceId = acRefId;
+            if (acRefId != kPlayerRef)
+                request.FormId = kGuardBase;
+            request.CellId = kHall;
+            request.Position = glm::vec3{100.0f, 100.0f, 0.0f};
+            request.CurrentActorData.BaseId = request.FormId;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 100.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 100.0f;
+            (void)DeliverWire(world, request, apOwner);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const uint32_t hostChar = assign(pHost, kHostConn, kPlayerRef);
+        const uint32_t guestChar = assign(pGuest, kGuestConn, kPlayerRef);
+        const uint32_t guard = assign(pHost, kHostConn, GameId{0u, 0x000E2001u});
+        Check(hostChar != 0xFFFFFFFFu && guestChar != 0xFFFFFFFFu && guard != 0xFFFFFFFFu,
+              "two players and a guard simulated by the host are registered");
+
+        const auto entityOf = [](uint32_t aServerId) { return static_cast<entt::entity>(aServerId); };
+        const auto ownerOf = [&](uint32_t aServerId) { return world.get<OwnerComponent>(entityOf(aServerId)).GetOwner(); };
+        const auto positionOf = [&](uint32_t aServerId) { return glm::vec3(world.get<MovementComponent>(entityOf(aServerId)).Position); };
+        const auto cellOf = [&](uint32_t aServerId) { return world.get<CellIdComponent>(entityOf(aServerId)).Cell; };
+        const auto at = [](const glm::vec3& acLhs, const glm::vec3& acRhs) { return glm::distance(acLhs, acRhs) < 1.0f; };
+
+        // One movement report, the way a client builds it for an actor it simulates.
+        const auto movementOf = [&](uint32_t aServerId, const GameId& acCell, const glm::vec3& acPosition,
+                                    std::initializer_list<const char*> aEvents) {
+            ClientReferencesMoveRequest request{};
+            request.Tick = 5000u;
+            ReferenceUpdate update{};
+            update.UpdatedMovement.CellId = acCell;
+            update.UpdatedMovement.Position = acPosition;
+            update.UpdatedMovement.Direction = 0.25f;
+            for (const char* pEvent : aEvents)
+            {
+                ActionEvent action{};
+                action.EventName = TiltedPhoques::String(pEvent);
+                action.TargetEventName = TiltedPhoques::String(pEvent);
+                update.ActionEvents.push_back(action);
+            }
+            request.Updates[aServerId] = update;
+            return request;
+        };
+        // The update for one actor in what a player was sent, if any.
+        const auto relayedTo = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) -> std::optional<ReferenceUpdate> {
+            std::optional<ReferenceUpdate> found;
+            for (const auto& relay : DecodeOutboxMessagesFor<ServerReferencesMoveRequest>(aConn))
+            {
+                const auto it = relay.Updates.find(aServerId);
+                if (it != relay.Updates.end())
+                    found = it->second;
+            }
+            return found;
+        };
+        const auto spawnedFor = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) -> std::optional<CharacterSpawnRequest> {
+            for (const auto& spawn : DecodeOutboxMessagesFor<CharacterSpawnRequest>(aConn))
+            {
+                if (spawn.ServerId == aServerId)
+                    return spawn;
+            }
+            return std::nullopt;
+        };
+        const auto removedFor = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& removal : DecodeOutboxMessagesFor<NotifyRemoveCharacter>(aConn))
+            {
+                if (removal.ServerId == aServerId)
+                    return true;
+            }
+            return false;
+        };
+        const auto grantedTo = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& grant : DecodeOutboxMessagesFor<NotifyOwnershipTransfer>(aConn))
+            {
+                if (grant.ServerId == aServerId)
+                    return true;
+            }
+            return false;
+        };
+        const auto toldToLetGo = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& notice : DecodeOutboxMessagesFor<NotifyRelinquishControl>(aConn))
+            {
+                if (notice.ServerId == aServerId)
+                    return true;
+            }
+            return false;
+        };
+        const auto replays = [](const CharacterSpawnRequest& acSpawn, const char* apEvent) {
+            for (const auto& action : acSpawn.ActionsToReplay.Actions)
+            {
+                if (action.EventName == apEvent)
+                    return true;
+            }
+            return false;
+        };
+
+        // --- 1. Movement and animation events of an NPC ----------------------------------------
+        Harness::ClearOutbox();
+        ClientReferencesMoveRequest guardWalks = movementOf(guard, kHall, glm::vec3{300.0f, 150.0f, 10.0f}, {"moveStart", "JumpUp"});
+        guardWalks.Updates[guard].UpdatedMovement.Variables.Booleans = {true, false, true};
+        guardWalks.Updates[guard].UpdatedMovement.Variables.Integers = {7u};
+        guardWalks.Updates[guard].UpdatedMovement.Variables.Floats = {0.5f, 2.0f};
+        Check(DeliverWire(world, guardWalks, pHost) && at(positionOf(guard), glm::vec3{300.0f, 150.0f, 10.0f}),
+              "the host's game moves the guard: the server holds the new position");
+        const auto guestSeesWalk = relayedTo(kGuestConn, guard);
+        Check(guestSeesWalk.has_value() && at(glm::vec3(guestSeesWalk->UpdatedMovement.Position), glm::vec3{300.0f, 150.0f, 10.0f}) &&
+                  std::fabs(guestSeesWalk->UpdatedMovement.Direction - 0.25f) < 0.01f,
+              "the guest is sent the guard's position and direction at once");
+        Check(guestSeesWalk.has_value() && guestSeesWalk->ActionEvents.size() == 2 && guestSeesWalk->ActionEvents[0].EventName == "moveStart" &&
+                  guestSeesWalk->ActionEvents[1].EventName == "JumpUp",
+              "with both animation events, in the order they happened");
+        Check(guestSeesWalk.has_value() && guestSeesWalk->UpdatedMovement.Variables.Booleans.size() == 3 &&
+                  guestSeesWalk->UpdatedMovement.Variables.Booleans[0] && !guestSeesWalk->UpdatedMovement.Variables.Booleans[1] &&
+                  guestSeesWalk->UpdatedMovement.Variables.Booleans[2] && guestSeesWalk->UpdatedMovement.Variables.Integers.size() == 1 &&
+                  guestSeesWalk->UpdatedMovement.Variables.Integers[0] == 7u && guestSeesWalk->UpdatedMovement.Variables.Floats.size() == 2 &&
+                  std::fabs(guestSeesWalk->UpdatedMovement.Variables.Floats[1] - 2.0f) < 0.01f,
+              "and the animation variables as they were sent: 3 flags, 1 number, 2 fractions");
+        Check(!relayedTo(kHostConn, guard).has_value(), "the host is not sent his own guard's movement back");
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(guard, kHall, glm::vec3{900.0f, 900.0f, 0.0f}, {"attackStart"}), pGuest) &&
+                  at(positionOf(guard), glm::vec3{300.0f, 150.0f, 10.0f}) && !relayedTo(kHostConn, guard).has_value(),
+              "a movement report from the player who does not simulate the guard is ignored");
+
+        Harness::ClearOutbox();
+        ClientReferencesMoveRequest broken = movementOf(guard, kHall, glm::vec3{300.0f, 150.0f, 10.0f}, {});
+        broken.Updates[guard].UpdatedMovement.Position = glm::vec3{std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f};
+        (void)Deliver(world, broken, pHost);
+        ClientReferencesMoveRequest tooFar = movementOf(guard, kHall, glm::vec3{5.0e6f, 0.0f, 0.0f}, {});
+        (void)Deliver(world, tooFar, pHost);
+        Check(at(positionOf(guard), glm::vec3{300.0f, 150.0f, 10.0f}) && !relayedTo(kGuestConn, guard).has_value(),
+              "a position that is not a number, or lies outside any world, is neither stored nor relayed");
+
+        // --- 2. Player avatars ------------------------------------------------------------------
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(hostChar, kHall, glm::vec3{120.0f, 100.0f, 0.0f}, {"SprintStart"}), pHost) &&
+                  relayedTo(kGuestConn, hostChar).has_value() && relayedTo(kGuestConn, hostChar)->ActionEvents.size() == 1,
+              "the host's own movement and sprint reach the guest");
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(hostChar, kHall, glm::vec3{800.0f, 800.0f, 0.0f}, {}), pGuest) &&
+                  at(positionOf(hostChar), glm::vec3{120.0f, 100.0f, 0.0f}) && !relayedTo(kHostConn, hostChar).has_value(),
+              "a player cannot move another player's character");
+
+        // --- 3. The guest walks through a load door and comes back ------------------------------
+        Check(walkInto(pGuest, kCellar) && removedFor(kGuestConn, guard), "the guest leaves for the cellar: his game is told to remove the guard");
+        Check(!removedFor(kHostConn, guestChar) && !DecodeOutboxMessagesFor<NotifyPlayerCellChanged>(kHostConn).empty(),
+              "the host is told that the guest changed cell; a player's character is never taken away from a party member");
+        // While he is away the guard walks to a chair and sits down.
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(guard, kHall, glm::vec3{400.0f, 200.0f, 0.0f}, {"moveStop", "IdleChairFrontEnter"}), pHost) &&
+                  !relayedTo(kGuestConn, guard).has_value() && ownerOf(guard) == pHost,
+              "the guard's movement is no longer sent to him, and the guard stays with the host");
+
+        Check(walkInto(pGuest, kHall), "the guest comes back");
+        const auto guardForGuest = spawnedFor(kGuestConn, guard);
+        Check(guardForGuest.has_value() && at(glm::vec3(guardForGuest->Position), glm::vec3{400.0f, 200.0f, 0.0f}) && guardForGuest->CellId == kHall,
+              "he is sent the guard where it is now, not where he last saw it");
+        Check(guardForGuest.has_value() && replays(*guardForGuest, "IdleChairEnterInstant") && !replays(*guardForGuest, "IdleChairFrontEnter"),
+              "and that it sits: the sit-down is replayed in its instant form, so the guard is not seen sitting down again");
+        Check(ownerOf(guard) == pHost && !grantedTo(kGuestConn, guard), "coming back does not hand the guard to the guest");
+
+        // The guard stands up while the guest is away again.
+        Check(walkInto(pGuest, kCellar), "the guest leaves once more");
+        (void)DeliverWire(world, movementOf(guard, kHall, glm::vec3{400.0f, 200.0f, 0.0f}, {"IdleStop", "moveStart"}), pHost);
+        Check(walkInto(pGuest, kHall), "and comes back after the guard stood up");
+        const auto standingGuard = spawnedFor(kGuestConn, guard);
+        Check(standingGuard.has_value() && standingGuard->ActionsToReplay.ResetAnimationGraph && !replays(*standingGuard, "IdleChairEnterInstant") &&
+                  replays(*standingGuard, "moveStart"),
+              "he is told to reset the guard's animation and is not shown it sitting");
+
+        // --- 4. The simulating player walks through the door ------------------------------------
+        // His client hands over what it leaves behind: a RequestOwnershipTransfer for each actor.
+        // For an actor whose cell is already unloaded the request carries no place.
+        Check(walkInto(pHost, kCellar) && ownerOf(guard) == pHost, "the host leaves for the cellar; the server waits for his client to let the guard go");
+        RequestOwnershipTransfer leaveGuard{};
+        leaveGuard.ServerId = guard;
+        Check(DeliverWire(world, leaveGuard, pHost) && ownerOf(guard) == pGuest && grantedTo(kGuestConn, guard),
+              "the guard he leaves behind goes to the guest, who stays in the hall");
+        Check(at(positionOf(guard), glm::vec3{400.0f, 200.0f, 0.0f}) && cellOf(guard) == kHall,
+              "a handover without a place leaves the guard where the server last held it");
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(guard, kHall, glm::vec3{50.0f, 50.0f, 0.0f}, {}), pHost) &&
+                  at(positionOf(guard), glm::vec3{400.0f, 200.0f, 0.0f}),
+              "a late movement report from the previous simulator does not move the guard");
+        Check(DeliverWire(world, movementOf(guard, kHall, glm::vec3{450.0f, 220.0f, 0.0f}, {"moveStart"}), pGuest) &&
+                  at(positionOf(guard), glm::vec3{450.0f, 220.0f, 0.0f}) && !relayedTo(kHostConn, guard).has_value(),
+              "the guest's game moves it now; the host, in another cell, is not sent that");
+
+        // The host comes back. A calm NPC placed in the world returns to the party leader's game.
+        Check(walkInto(pHost, kHall), "the host comes back to the hall");
+        const auto guardForHost = spawnedFor(kHostConn, guard);
+        Check(guardForHost.has_value() && at(glm::vec3(guardForHost->Position), glm::vec3{450.0f, 220.0f, 0.0f}),
+              "he is sent the guard where the guest's game left it");
+        Check(ownerOf(guard) == pHost && grantedTo(kHostConn, guard) && toldToLetGo(kGuestConn, guard),
+              "the calm guard returns to the party leader's game, and the guest's game is told to let it go");
+
+        // In a fight the guard stays with whoever simulates it.
+        Check(walkInto(pHost, kCellar), "the host leaves again");
+        Check(DeliverWire(world, leaveGuard, pHost) && ownerOf(guard) == pGuest, "the guard goes to the guest again");
+        DrawWeaponRequest guardDraws{};
+        guardDraws.Id = guard;
+        guardDraws.IsWeaponDrawn = true;
+        Check(DeliverWire(world, guardDraws, pGuest) && world.get<CharacterComponent>(entityOf(guard)).IsWeaponDrawn(),
+              "the guard draws its weapon in the guest's game");
+        Check(walkInto(pHost, kHall) && ownerOf(guard) == pGuest && !grantedTo(kHostConn, guard) && !toldToLetGo(kGuestConn, guard) &&
+                  spawnedFor(kHostConn, guard).has_value(),
+              "the returning leader is shown the guard, but a guard with a drawn weapon stays with the guest");
+
+        // --- 5. The NPC itself goes through the door -------------------------------------------
+        // The guest's game reports the guard in the cellar, then lets it go there (the actor left
+        // the loaded cell): this handover carries the place.
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(guard, kCellar, glm::vec3{10.0f, 20.0f, 0.0f}, {}), pGuest) && cellOf(guard) == kCellar &&
+                  at(positionOf(guard), glm::vec3{10.0f, 20.0f, 0.0f}),
+              "the guard runs through the door: the server holds it in the cellar");
+        Check(removedFor(kHostConn, guard), "the host, who stays in the hall, is told to remove it");
+        RequestOwnershipTransfer guardGone{};
+        guardGone.ServerId = guard;
+        guardGone.CellId = kCellar;
+        guardGone.Position = glm::vec3{12.0f, 24.0f, 0.0f};
+        Check(DeliverWire(world, guardGone, pGuest) && ownerOf(guard) == nullptr && cellOf(guard) == kCellar &&
+                  at(positionOf(guard), glm::vec3{12.0f, 24.0f, 0.0f}),
+              "the guest's game lets it go: nobody is in the cellar, so nobody simulates it, and the server keeps its place");
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(guard, kCellar, glm::vec3{99.0f, 99.0f, 0.0f}, {}), pGuest) &&
+                  at(positionOf(guard), glm::vec3{12.0f, 24.0f, 0.0f}),
+              "after that its former simulator cannot move it");
+        // The host follows it.
+        Check(walkInto(pHost, kCellar), "the host follows the guard into the cellar");
+        const auto guardInCellar = spawnedFor(kHostConn, guard);
+        Check(guardInCellar.has_value() && guardInCellar->CellId == kCellar && at(glm::vec3(guardInCellar->Position), glm::vec3{12.0f, 24.0f, 0.0f}),
+              "and is sent the guard in the cellar, at the place its last simulator reported");
+        Check(ownerOf(guard) == pHost && grantedTo(kHostConn, guard), "the guard nobody simulated is given to him");
+        Check(world.get<CharacterComponent>(entityOf(guard)).IsWeaponDrawn(), "still with its weapon drawn");
     }
 
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures,
