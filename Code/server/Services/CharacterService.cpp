@@ -1095,7 +1095,9 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
                     acMessage.pPlayer->Send(response);
                     m_world.GetSaveSnapshotService().GetCoordinator().RecordFlightEvent(
                         nowMs, CoopFlight::FlightEventKind::kAmbushDeduplicated, existingServerId, acMessage.pPlayer->GetId());
-                    spdlog::debug(
+                    // info, not debug: it is rare (the non-leader's client deletes its own copy
+                    // before it gets here), and a playtest report has to show that it happened.
+                    spdlog::info(
                         "[RFAB AmbushDedup] Bound peer {} dynamic ambush NPC {:X}:{:X} to existing ServerId {:X}",
                         acMessage.pPlayer->GetId(),
                         message.FormId.ModId,

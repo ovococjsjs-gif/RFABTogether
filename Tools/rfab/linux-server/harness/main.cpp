@@ -4587,6 +4587,178 @@ int main(int argc, char** argv)
         std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
     }
 
+    // =========================================================================
+    // Scene 21: an encounter both games spawn is one group of enemies (work plan 6.3).
+    // =========================================================================
+    //
+    // RFAB's encounter scripts run in every player's game and place their own creatures: the gates
+    // of the Deadlands tower call PlaceActorAtMe on a timer (RFAB_OblTowerGateSummonScript), the
+    // Dwarven centurion calls it for its spiders (DwarvenCenturionSupportsSummon). Such a creature
+    // has no form id the two games share, so two games would make two of it.
+    //
+    // Two layers prevent that. The client of a player who does not lead the party deletes its own
+    // copy when a party member is within 100 m (DespawnSuppressedNonLeaderWildTempSpawn), so only
+    // the leader's game places the creature. What still reaches the server is merged here: a
+    // creature another player registered in the last 12 s within 20 m is given to the second game
+    // as the same creature. The scene pins this second layer; the first runs only in the game.
+    {
+        std::printf("[scene 21] an encounter both games spawn is one group of enemies\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xF601u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xF602u;
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kArena{0u, 0x00110001u};
+        const GameId kSpider{0u, 0x00111001u};
+        const GameId kWolf{0u, 0x00111002u};
+        const GameId kDremora{0u, 0x00111003u};
+        const GameId kScamp{0u, 0x00111004u};
+        const GameId kHorse{0u, 0x00111005u};
+        constexpr uint32_t kTemporary = std::numeric_limits<uint32_t>::max();
+        constexpr uint32_t kHealthIndex = ActorValuesComponent::kHealthActorValueIndex;
+        // The merge radius is 20 m, about 1400 game units. Each step uses a spot of its own, far
+        // from the others, because the records of the earlier steps are still fresh.
+        constexpr float kStep = 100.0f;      // 1.4 m
+        constexpr float kFar = 4000.0f;      // 57 m
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 12.0f;
+        t0.Day = 8;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+
+        const auto walkInto = [&](Player* apPlayer, const GameId& acCell) {
+            Harness::ClearOutbox();
+            EnterInteriorCellRequest request{};
+            request.CellId = acCell;
+            return DeliverWire(world, request, apPlayer);
+        };
+        Check(walkInto(pHost, kArena) && walkInto(pGuest, kArena), "both players enter the arena");
+
+        struct Placed
+        {
+            uint32_t ServerId{0xFFFFFFFFu};
+            bool Owner{false};
+            bool Answered{false};
+        };
+        uint32_t nextCookie = 2100u;
+        uint32_t nextTemporaryRef = 0xFF000C00u;
+        // What a game does when a script places a creature (or, with kPlayerRef, when the player's
+        // own character registers): one AssignCharacterRequest, one answer.
+        const auto place = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, const GameId& acBase, float aX, float aY,
+                               bool aMount = false) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            if (acBase == kPlayerRef)
+            {
+                request.ReferenceId = kPlayerRef;
+            }
+            else
+            {
+                request.ReferenceId = GameId{kTemporary, nextTemporaryRef++};
+                request.FormId = acBase;
+                request.IsMount = aMount;
+            }
+            request.CellId = kArena;
+            request.Position = glm::vec3{aX, aY, 0.0f};
+            request.CurrentActorData.BaseId = request.FormId;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 100.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 100.0f;
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? Placed{responses[0].ServerId, responses[0].Owner, true} : Placed{};
+        };
+        Check(place(pHost, kHostConn, kPlayerRef, 0.0f, 0.0f).Answered && place(pGuest, kGuestConn, kPlayerRef, 0.0f, 0.0f).Answered,
+              "both players' characters are registered");
+
+        const auto entityOf = [](uint32_t aServerId) { return static_cast<entt::entity>(aServerId); };
+        const auto ownerOf = [&](uint32_t aServerId) { return world.get<OwnerComponent>(entityOf(aServerId)).GetOwner(); };
+        const auto characters = [&]() { return world.view<CharacterComponent>().size(); };
+        const auto spawnedFor = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) -> std::optional<CharacterSpawnRequest> {
+            for (const auto& spawn : DecodeOutboxMessagesFor<CharacterSpawnRequest>(aConn))
+            {
+                if (spawn.ServerId == aServerId)
+                    return spawn;
+            }
+            return std::nullopt;
+        };
+        const auto nothingSpawnedFor = [&](TiltedPhoques::ConnectionId_t aConn) {
+            return DecodeOutboxMessagesFor<CharacterSpawnRequest>(aConn).empty();
+        };
+
+        // --- 1. One creature placed by both games ----------------------------------------------
+        const float spot1 = 10000.0f;
+        const Placed hostSpider = place(pHost, kHostConn, kSpider, spot1, 0.0f);
+        const auto spiderForGuest = spawnedFor(kGuestConn, hostSpider.ServerId);
+        Check(hostSpider.Answered && hostSpider.Owner && ownerOf(hostSpider.ServerId) == pHost && spiderForGuest.has_value() &&
+                  spiderForGuest->BaseId == kSpider && spiderForGuest->FormId == GameId{},
+              "the host's game places a spider: it is the host's, and the guest is sent it as a new creature of that kind");
+
+        const size_t beforeGuestSpider = characters();
+        const Placed guestSpider = place(pGuest, kGuestConn, kSpider, spot1 + kStep, 0.0f);
+        Check(guestSpider.Answered && !guestSpider.Owner && guestSpider.ServerId == hostSpider.ServerId && characters() == beforeGuestSpider,
+              "the guest's game places the same spider 1.4 m away: it is given the host's spider, and the server keeps one");
+        Check(spawnedFor(kGuestConn, hostSpider.ServerId).has_value() && nothingSpawnedFor(kHostConn),
+              "the guest is sent the host's spider once more with that answer; the host is told nothing");
+
+        const Placed guestSecondSpider = place(pGuest, kGuestConn, kSpider, spot1 + kStep, 0.0f);
+        Check(guestSecondSpider.Answered && guestSecondSpider.Owner && guestSecondSpider.ServerId != hostSpider.ServerId &&
+                  spawnedFor(kHostConn, guestSecondSpider.ServerId).has_value(),
+              "a second spider of the guest at that spot is his own: the host placed only one, and the host is sent it");
+
+        // --- 2. A pack: several creatures of one kind at one spot -------------------------------
+        const float spot2 = 20000.0f;
+        const Placed hostWolf1 = place(pHost, kHostConn, kWolf, spot2, 0.0f);
+        const Placed hostWolf2 = place(pHost, kHostConn, kWolf, spot2, 0.0f);
+        Check(hostWolf1.Owner && hostWolf2.Owner && hostWolf1.ServerId != hostWolf2.ServerId,
+              "the host's game places two wolves at one spot: they stay two, a player's own creatures are never merged");
+        const Placed guestWolf1 = place(pGuest, kGuestConn, kWolf, spot2, 0.0f);
+        const Placed guestWolf2 = place(pGuest, kGuestConn, kWolf, spot2, 0.0f);
+        const bool oneEach = (guestWolf1.ServerId == hostWolf1.ServerId && guestWolf2.ServerId == hostWolf2.ServerId) ||
+                             (guestWolf1.ServerId == hostWolf2.ServerId && guestWolf2.ServerId == hostWolf1.ServerId);
+        Check(!guestWolf1.Owner && !guestWolf2.Owner && oneEach,
+              "the guest's two wolves are given the host's two, one each");
+
+        // --- 3. The two games rolled different kinds --------------------------------------------
+        const float spot3 = 30000.0f;
+        const Placed hostDremora = place(pHost, kHostConn, kDremora, spot3, 0.0f);
+        const Placed guestScamp = place(pGuest, kGuestConn, kScamp, spot3, 0.0f);
+        const auto dremoraForGuest = spawnedFor(kGuestConn, hostDremora.ServerId);
+        Check(hostDremora.Owner && !guestScamp.Owner && guestScamp.ServerId == hostDremora.ServerId && dremoraForGuest.has_value() &&
+                  dremoraForGuest->BaseId == kDremora,
+              "the host's gate rolled a dremora, the guest's a scamp: the scamp is given the dremora, and the guest is told its kind");
+
+        const float spot4 = 40000.0f;
+        const Placed nearDremora = place(pHost, kHostConn, kDremora, spot4, 0.0f);
+        const Placed awayScamp = place(pHost, kHostConn, kScamp, spot4 + 5.0f * kStep, 0.0f);
+        const Placed guestScamp2 = place(pGuest, kGuestConn, kScamp, spot4, 0.0f);
+        Check(nearDremora.Owner && awayScamp.Owner && !guestScamp2.Owner && guestScamp2.ServerId == awayScamp.ServerId,
+              "with a dremora at the spot and a scamp 7 m away, the guest's scamp is given the scamp: the same kind comes first");
+
+        // --- 4. What is not merged --------------------------------------------------------------
+        const float spot5 = 50000.0f;
+        const Placed hostFarSpider = place(pHost, kHostConn, kSpider, spot5, 0.0f);
+        const Placed guestFarSpider = place(pGuest, kGuestConn, kSpider, spot5 + kFar, 0.0f);
+        Check(hostFarSpider.Owner && guestFarSpider.Owner && guestFarSpider.ServerId != hostFarSpider.ServerId,
+              "a spider the guest's game places 57 m from the host's is another spider");
+
+        const float spot6 = 60000.0f;
+        const Placed hostHorse = place(pHost, kHostConn, kHorse, spot6, 0.0f);
+        const Placed guestHorse = place(pGuest, kGuestConn, kHorse, spot6, 0.0f, true);
+        Check(hostHorse.Owner && guestHorse.Owner && guestHorse.ServerId != hostHorse.ServerId,
+              "a mount is never merged: the guest's horse next to a creature of the same kind stays his horse");
+
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+    }
+
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures,
                 g_failures == 1 ? "" : "s");
     return g_failures == 0 ? 0 : 1;
