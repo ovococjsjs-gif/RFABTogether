@@ -4,6 +4,7 @@
 #include <AI/AIProcess.h>
 #include <Misc/MiddleProcess.h>
 #include <Havok/bhkCharacterController.h>
+#include <common/CoopInventoryDiff.h>
 #include <CoopOwnership.h>
 #include <Authority/ActorValues.h>
 #include <Authority/Health.h>
@@ -1058,6 +1059,14 @@ int32_t Actor::GetGoldAmount() const noexcept
 
 void Actor::SetActorInventory(const Inventory& acInventory) noexcept
 {
+    const auto* pSelfExt = this->GetExtension();
+    const bool isPlayerActor = (formID == 0x14) || (pSelfExt && pSelfExt->IsPlayer());
+    if (!CoopInventoryDiff::ShouldApplyWholesaleActorInventory(acInventory, isPlayerActor, IsDead()))
+    {
+        spdlog::debug("Skipping unseeded empty SetActorInventory for living NPC {:X}", formID);
+        return;
+    }
+
     Inventory currentInventory = GetActorInventory();
     if (currentInventory == acInventory)
     {
@@ -1077,8 +1086,7 @@ void Actor::SetActorInventory(const Inventory& acInventory) noexcept
         ? std::clamp(preHealth / preMaxHealth, 0.05f, 1.0f)
         : 1.0f;
 
-    const auto* pSelfExt = this->GetExtension();
-    if ((!pSelfExt || !pSelfExt->IsPlayer()) && currentInventory.ContainsQuestItems())
+    if (!isPlayerActor && currentInventory.ContainsQuestItems())
         SetInventoryRetainingQuestItems(currentInventory, acInventory);
     else
         SetInventory(acInventory);

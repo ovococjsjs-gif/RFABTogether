@@ -23,6 +23,7 @@
 
 #include <BranchInfo.h>
 #include <Components.h>
+#include <common/CoopInventoryDiff.h>
 
 #include <Systems/InterpolationSystem.h>
 #include <Systems/AnimationSystem.h>
@@ -665,6 +666,7 @@ bool CharacterService::TakeOwnership(const uint32_t acFormId, const uint32_t acS
         pActor->EvaluatePackage();
 
     const uint64_t effectiveEpoch = aOwnershipEpoch != 0 ? aOwnershipEpoch : m_ownershipLeases.EpochOf(acServerId);
+    m_weaponDrawUpdates.erase(acFormId);
     m_lastVoluntaryClaimMs.erase(acServerId);
     m_cachedRemoteSpawns.erase(acServerId);
     m_remoteModels.erase(acServerId);
@@ -1399,24 +1401,6 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
         // heal or resurrect wounded/dead enemies!
         if (serverProvidedExistingState)
         {
-            // Equip inventory only once 3D is ready; if 3D is still streaming, stage WaitingFor3D so
-            // EquipManager::EquipItem never runs on a half-constructed actor (SkyrimSE.exe+0x1133D8 / 0x65D2CB).
-            if (pActor->GetNiNode() && !pActor->IsStillLoading())
-            {
-                pActor->SetActorInventory(acMessage.CurrentInventory);
-            }
-            else
-            {
-                CharacterSpawnRequest pending3D{};
-                pending3D.ServerId = acMessage.ServerId;
-                pending3D.InventoryContent = acMessage.CurrentInventory;
-                pending3D.InitialActorValues = acMessage.AllActorValues;
-                pending3D.IsDead = acMessage.IsDead;
-                pending3D.IsWeaponDrawn = acMessage.IsWeaponDrawn;
-                m_world.emplace_or_replace<WaitingFor3D>(cEntity, pending3D);
-            }
-            pActor->SetActorValues(acMessage.AllActorValues);
-
             if (pActor->IsDead() != acMessage.IsDead)
             {
                 if (acMessage.IsDead)
@@ -1432,7 +1416,36 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
                 }
             }
 
-            m_weaponDrawUpdates[pActor->formID] = {acMessage.IsWeaponDrawn};
+            const bool isPlayerActor = (pActor->formID == 0x14) || (acMessage.PlayerId != 0);
+            const bool shouldApplyInventory = CoopInventoryDiff::ShouldApplyWholesaleActorInventory(
+                acMessage.CurrentInventory,
+                isPlayerActor,
+                acMessage.IsDead || pActor->IsDead());
+
+            // Equip inventory only once 3D is ready; if 3D is still streaming, stage WaitingFor3D so
+            // EquipManager::EquipItem never runs on a half-constructed actor (SkyrimSE.exe+0x1133D8 / 0x65D2CB).
+            if (shouldApplyInventory)
+            {
+                if (pActor->GetNiNode() && !pActor->IsStillLoading())
+                {
+                    pActor->SetActorInventory(acMessage.CurrentInventory);
+                }
+                else
+                {
+                    CharacterSpawnRequest pending3D{};
+                    pending3D.ServerId = acMessage.ServerId;
+                    pending3D.InventoryContent = acMessage.CurrentInventory;
+                    pending3D.InitialActorValues = acMessage.AllActorValues;
+                    pending3D.IsDead = acMessage.IsDead;
+                    pending3D.IsWeaponDrawn = acMessage.IsWeaponDrawn;
+                    m_world.emplace_or_replace<WaitingFor3D>(cEntity, pending3D);
+                }
+            }
+            pActor->SetActorValues(acMessage.AllActorValues);
+
+            m_weaponDrawUpdates.erase(pActor->formID);
+            if (acMessage.IsWeaponDrawn && !pActor->IsDead())
+                pActor->SetWeaponDrawnEx(true);
             MoveActor(pActor, acMessage.WorldSpaceId, acMessage.CellId, acMessage.Position);
         }
         else
@@ -2684,7 +2697,13 @@ Actor* CharacterService::MaterializeRemoteView(
         aModel.PendingOwnershipEpoch = 0;
         aModel.PendingHealthRevision = 0;
         m_world.GetActorValueService().NoteAuthoritativeHealthRevision(spawnedServerId, deferredRev);
-        pActor->SetActorInventory(viewSpawnCopy.InventoryContent);
+        if (CoopInventoryDiff::ShouldApplyWholesaleActorInventory(
+                viewSpawnCopy.InventoryContent,
+                viewSpawnCopy.IsPlayer,
+                viewSpawnCopy.IsDead || pActor->IsDead()))
+        {
+            pActor->SetActorInventory(viewSpawnCopy.InventoryContent);
+        }
         (void)TakeOwnership(pActor->formID, spawnedServerId, aEntity, deferredGrantEpoch);
     }
 
@@ -2926,7 +2945,16 @@ void CharacterService::RunRemoteUpdates() noexcept
         // inventory/equipment/AV/health/death/weapon-draw delta received while 3D was streaming is preserved!
         const CharacterSpawnRequest& activeSpawn = ResolveAuthoritativeSpawnState(entity, waitingFor3D.SpawnRequest);
 
-        pActor->SetActorInventory(activeSpawn.InventoryContent);
+        if (pActor->IsDead() != activeSpawn.IsDead)
+            activeSpawn.IsDead ? KillActorSuppressingDuplicateXp(pActor) : pActor->ResurrectInPlace();
+
+        if (CoopInventoryDiff::ShouldApplyWholesaleActorInventory(
+                activeSpawn.InventoryContent,
+                activeSpawn.IsPlayer,
+                activeSpawn.IsDead || pActor->IsDead()))
+        {
+            pActor->SetActorInventory(activeSpawn.InventoryContent);
+        }
         pActor->SetActorValues(activeSpawn.InitialActorValues);
         pActor->SetFactions(activeSpawn.FactionsContent);
 
@@ -2935,10 +2963,10 @@ void CharacterService::RunRemoteUpdates() noexcept
             pActor->LoadAnimationVariables(activeSpawn.ActionsToReplay.Actions[0].Variables);
         }
 
-        m_weaponDrawUpdates[pActor->formID] = {activeSpawn.IsWeaponDrawn};
-
-        if (pActor->IsDead() != activeSpawn.IsDead)
-            activeSpawn.IsDead ? KillActorSuppressingDuplicateXp(pActor) : pActor->ResurrectInPlace();
+        if (!m_world.all_of<LocalComponent>(entity))
+            m_weaponDrawUpdates[pActor->formID] = {activeSpawn.IsWeaponDrawn};
+        else
+            m_weaponDrawUpdates.erase(pActor->formID);
 
         if (pActor->IsVampireLord())
             pActor->FixVampireLordModel();

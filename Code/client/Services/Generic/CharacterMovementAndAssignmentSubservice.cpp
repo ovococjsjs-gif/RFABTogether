@@ -4,6 +4,7 @@
 
 #include <Actor.h>
 #include <Components.h>
+#include <common/CoopInventoryDiff.h>
 #include <Forms/BGSColorForm.h>
 #include <Forms/BGSHeadPart.h>
 #include <Forms/BGSTextureSet.h>
@@ -147,42 +148,6 @@ void CharacterService::OnRemoteSpawnDataReceived(const NotifySpawnData& acMessag
             (void)ReconcileLoadedRemoteSpeciesMismatch(pActor, acMessage.NewActorData.BaseId);
     }
 
-    // Never run SetActorInventory while 3D is still streaming (GetNiNode() == nullptr): stage into WaitingFor3D instead.
-    if (pActor->GetNiNode() && !pActor->IsStillLoading())
-    {
-        pActor->SetActorInventory(acMessage.NewActorData.InitialInventory);
-    }
-    else if (!m_world.all_of<WaitingFor3D>(entity))
-    {
-        CharacterSpawnRequest pending3D{};
-        pending3D.ServerId = acMessage.Id;
-        pending3D.InitialActorValues = acMessage.NewActorData.InitialActorValues;
-        pending3D.InventoryContent = acMessage.NewActorData.InitialInventory;
-        pending3D.BaseId = hasStaticBaseId ? acMessage.NewActorData.BaseId : GameId{};
-        pending3D.IsDead = acMessage.NewActorData.IsDead;
-        pending3D.IsWeaponDrawn = acMessage.NewActorData.IsWeaponDrawn;
-        pending3D.HealthRevision = acMessage.HealthRevision;
-        m_world.emplace_or_replace<WaitingFor3D>(entity, pending3D);
-    }
-
-    pActor->SetActorValues(acMessage.NewActorData.InitialActorValues);
-    if (isLocalOwner)
-    {
-        if (auto* pAvComp = m_world.try_get<ActorValuesComponent>(entity))
-            pAvComp->CurrentActorValues = acMessage.NewActorData.InitialActorValues;
-    }
-    m_weaponDrawUpdates[pActor->formID] = {acMessage.NewActorData.IsWeaponDrawn};
-
-    if (!isLocalOwner)
-    {
-        if (auto* pInterp = m_world.try_get<InterpolationComponent>(entity))
-        {
-            pInterp->TimePoints.clear();
-            pInterp->Position = pActor->position;
-            pInterp->Clock.Reset();
-        }
-    }
-
     if (pActor->IsDead() != acMessage.NewActorData.IsDead)
     {
         if (acMessage.NewActorData.IsDead)
@@ -191,6 +156,52 @@ void CharacterService::OnRemoteSpawnDataReceived(const NotifySpawnData& acMessag
             spdlog::warn("Keeping local actor {:X} dead although server spawn data has it alive (#906)", pActor->formID);
         else
             pActor->ResurrectInPlace();
+    }
+
+    const auto* pActorExt = pActor->GetExtension();
+    const bool isPlayerActor = (pActor->formID == 0x14) || (pActorExt && pActorExt->IsPlayer());
+    const bool shouldApplyInventory = CoopInventoryDiff::ShouldApplyWholesaleActorInventory(
+        acMessage.NewActorData.InitialInventory,
+        isPlayerActor,
+        acMessage.NewActorData.IsDead || pActor->IsDead());
+
+    // Never run SetActorInventory while 3D is still streaming (GetNiNode() == nullptr): stage into WaitingFor3D instead.
+    if (shouldApplyInventory)
+    {
+        if (pActor->GetNiNode() && !pActor->IsStillLoading())
+        {
+            pActor->SetActorInventory(acMessage.NewActorData.InitialInventory);
+        }
+        else if (!m_world.all_of<WaitingFor3D>(entity))
+        {
+            CharacterSpawnRequest pending3D{};
+            pending3D.ServerId = acMessage.Id;
+            pending3D.InitialActorValues = acMessage.NewActorData.InitialActorValues;
+            pending3D.InventoryContent = acMessage.NewActorData.InitialInventory;
+            pending3D.BaseId = hasStaticBaseId ? acMessage.NewActorData.BaseId : GameId{};
+            pending3D.IsDead = acMessage.NewActorData.IsDead;
+            pending3D.IsWeaponDrawn = acMessage.NewActorData.IsWeaponDrawn;
+            pending3D.HealthRevision = acMessage.HealthRevision;
+            m_world.emplace_or_replace<WaitingFor3D>(entity, pending3D);
+        }
+    }
+
+    pActor->SetActorValues(acMessage.NewActorData.InitialActorValues);
+    if (isLocalOwner)
+    {
+        if (auto* pAvComp = m_world.try_get<ActorValuesComponent>(entity))
+            pAvComp->CurrentActorValues = acMessage.NewActorData.InitialActorValues;
+        m_weaponDrawUpdates.erase(pActor->formID);
+    }
+    else
+    {
+        m_weaponDrawUpdates[pActor->formID] = {acMessage.NewActorData.IsWeaponDrawn};
+        if (auto* pInterp = m_world.try_get<InterpolationComponent>(entity))
+        {
+            pInterp->TimePoints.clear();
+            pInterp->Position = pActor->position;
+            pInterp->Clock.Reset();
+        }
     }
 
     spdlog::info("Applied remote spawn data, actor form id: {:X}", pActor->formID);

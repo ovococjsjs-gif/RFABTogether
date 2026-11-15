@@ -72,6 +72,7 @@ struct LogInstance
         globalOut->set_pattern("%^[%Y-%m-%d %H:%M:%S.%e] [%l] [tid %t] %$ %v");
 
         globalOut->set_level(level::from_str(sLogLevel.value()));
+        globalOut->flush_on(level::info);
         spdlog::flush_every(std::chrono::seconds(2));
 
         // as the library is compiled into the client + server we have to do this twice

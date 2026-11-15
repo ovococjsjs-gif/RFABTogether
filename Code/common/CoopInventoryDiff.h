@@ -227,4 +227,51 @@ namespace CoopInventoryDiff
 
         return plan;
     }
+
+    template <class TInventory>
+    [[nodiscard]] inline bool IsActorInventoryEmpty(const TInventory& acInventory) noexcept
+    {
+        for (const auto& entry : acInventory.Entries)
+        {
+            if (entry.Count > 0 && static_cast<bool>(entry.BaseId))
+                return false;
+        }
+        return !static_cast<bool>(acInventory.CurrentMagicEquipment.LeftHandSpell) &&
+               !static_cast<bool>(acInventory.CurrentMagicEquipment.RightHandSpell) &&
+               !static_cast<bool>(acInventory.CurrentMagicEquipment.Shout);
+    }
+
+    /**
+     * Wholesale actor inventory replacement (`SetActorInventory`) may legitimately clear an actor
+     * to zero items/spells ONLY when the actor is dead (a fully looted corpse) or a player clone.
+     * For a living non-player NPC, an all-empty `Inventory` comes from an unseeded dormant record
+     * (`EnsureDormantPersistentCharacter` from `rfab_checkpoints.bin`, which persists position and
+     * health only) or an uninitialized snapshot, and applying it strips the NPC of all weapons,
+     * arrows, shields, staves, spells, and shouts so it walks around disarmed and unable to fight.
+     */
+    template <class TInventory>
+    [[nodiscard]] inline bool ShouldApplyWholesaleActorInventory(
+        const TInventory& acIncoming,
+        bool aIsPlayer,
+        bool aIsDead) noexcept
+    {
+        if (aIsPlayer || aIsDead)
+            return true;
+        return !IsActorInventoryEmpty(acIncoming);
+    }
+
+    /**
+     * Delayed `m_weaponDrawUpdates` retries exist solely to replay remote weapon-draw poses once a
+     * non-owned remote actor's animation graph finishes initializing (`HookActorProcess` suppresses
+     * native AI on `IsRemote()` actors). Locally simulated actors (`!aIsRemote || aIsLocalPlayer`) are
+     * driven every frame by Skyrim's own combat AI / player input and must never have cached remote
+     * `SetWeaponDrawnEx(false)` forced onto them at t+0.5s / t+2.0s.
+     */
+    [[nodiscard]] constexpr bool ShouldApplyCachedRemoteWeaponDraw(
+        bool aIsLocalPlayer,
+        bool aIsRemote,
+        bool aIsDead) noexcept
+    {
+        return !aIsLocalPlayer && aIsRemote && !aIsDead;
+    }
 } // namespace CoopInventoryDiff

@@ -4,6 +4,7 @@
 
 #include <Actor.h>
 #include <Components.h>
+#include <common/CoopInventoryDiff.h>
 #include <Events/BeastFormChangeEvent.h>
 #include <Events/InitPackageEvent.h>
 #include <Events/MountEvent.h>
@@ -430,6 +431,15 @@ void CharacterService::ApplyCachedWeaponDraws(const UpdateEvent& acUpdateEvent) 
 
         Actor* pActor = Cast<Actor>(TESForm::GetById(cId));
         if (!pActor || pActor->IsDeleted())
+        {
+            toRemove.push_back(cId);
+            continue;
+        }
+
+        const auto* pExt = pActor->GetExtension();
+        const bool isLocalPlayer = (cId == 0x14) || (pExt && pExt->IsLocalPlayer());
+        const bool isRemote = pExt && pExt->IsRemote();
+        if (!CoopInventoryDiff::ShouldApplyCachedRemoteWeaponDraw(isLocalPlayer, isRemote, pActor->IsDead()))
         {
             toRemove.push_back(cId);
             continue;

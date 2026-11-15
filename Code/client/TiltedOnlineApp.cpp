@@ -69,7 +69,7 @@ TiltedOnlineApp::TiltedOnlineApp()
     auto console = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
     auto logger = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{console, rotatingLogger});
     logger->set_pattern("%^[%Y-%m-%d %H:%M:%S.%e] [%l] [tid %t] %$ %v");
-    logger->flush_on(spdlog::level::err);
+    logger->flush_on(spdlog::level::info);
     spdlog::flush_every(std::chrono::seconds(1));
     set_default_logger(logger);
 }
