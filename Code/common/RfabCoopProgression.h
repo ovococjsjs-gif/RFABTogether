@@ -158,7 +158,7 @@ enum class DifficultyParityOutcome : uint8_t
 
 // Infers RFAB StartMenu tier & Cursed flag directly from live GMST multipliers:
 //   fDiffMultHPByPCVH (outgoing) and fDiffMultHPToPCVH (incoming).
-// Matches docs/RFAB_DIFFICULTY_AND_VANILLA_OVERRIDE_AUDIT_2026_10_24.md verbatim:
+// Matches docs/archive/RFAB_DIFFICULTY_AND_VANILLA_OVERRIDE_AUDIT_2026_10_24.md verbatim:
 //   - Wanderer: outgoing 2.0 (cursed 0.5), incoming 0.5
 //   - Dovahkiin: outgoing 1.0 (cursed 0.5), incoming 1.0
 //   - Legend:    outgoing 1.0 (cursed 0.5), incoming 2.0

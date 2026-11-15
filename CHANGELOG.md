@@ -27,7 +27,7 @@
 
 ---
 
-## [v4.1.1] — в разработке *(RFAB Together: фундамент сборки и проверки поверх `v4.1.0`)*
+## [v4.1.1] — 2026-11-15 *(RFAB Together: вылеты, рассинхроны и адаптация под RFAB поверх `v4.1.0`; сборка для первого плейтеста, в игре не проверена)*
 
 > **Статус:** версия не выпущена и не проходила плейтест. Это ветка разработки репозитория [`ovococjsjs-gif/RFABTogether`](https://github.com/ovococjsjs-gif/RFABTogether) поверх `Riyozaki/RFAB_Online` `v4.1.0`. План работ — [`docs/WORK_PLAN.md`](docs/WORK_PLAN.md), открытые дефекты — [`docs/DEFECT_REGISTRY.md`](docs/DEFECT_REGISTRY.md), раздел 9b.
 >
@@ -294,7 +294,7 @@
 - **Фаза 2 (Нативный `Bleedout / Revive`, спелл-ревайв и `Sticky Host Cell Authority`):** убран пол `1.0f HP` — колено и подъём работают через родной `Essential + NoBleedoutRecovery` при `0.0 HP`, добавлено серверное мгновенное оживление союзника заклинаниями Восстановления (`ReviveActionRequest::HealingSpellRevive`), авто-группа при входе и приоритет Хоста на спокойных мировых NPC (`Sticky Host Cell Authority`).
 - **Фаза 3 (`WorldReloadBarrier`):** синхронная перезагрузка парных `.ess`-чекпоинтов при вайпе группы и `F9` с сохранением открытого сокета `GameNetworkingSockets`, `PlayerId` и `Party` (без `m_transport.Close()` и без `SetActorInventory`), барьер ожидания готовности Хоста и очистка пост-чекпоинтных сущностей на сервере.
 - **Фаза 4 (Чистый пайплайн урона `1 / M`, движения и анимаций):** сохранён 100% нативный `MaxHP` из `RFAB.esp` (входящий урон делится на `M` в `HookRestoreActorValue` после расчётов брони/резистов `RFAB.dll`), экстерьерные границы `4096` проходятся бесшовно через `ForcePosition` / `MoveToCellSeamless` с гистерезисом `128` юнитов, а `BehaviorVar` и `InterpolationSystem` разделяют линейные переменные, круговой `Direction` (`0..360°`) и дискретные переменные `MCO / SCAR / TUDM`.
-- **Фаза 5 (Модульная декомпозиция и `CoopExperienceLedger`):** выделены `Code/common/CoopExperienceLedger.h`, 4 модуля `Code/client/Services/Rfab/*`, 4 клиентских сабсервиса `Character*Subservice.cpp` и серверный `CharacterSocialAndMountSubservice.cpp`, а `RetryPendingMounts` переведён на `O(1)` поиск `FindEntityByServerId`. Полная документация: `docs/FULL_PROJECT_AUDIT_AND_UNIFIED_ARCHITECTURE.md`.
+- **Фаза 5 (Модульная декомпозиция и `CoopExperienceLedger`):** выделены `Code/common/CoopExperienceLedger.h`, 4 модуля `Code/client/Services/Rfab/*`, 4 клиентских сабсервиса `Character*Subservice.cpp` и серверный `CharacterSocialAndMountSubservice.cpp`, а `RetryPendingMounts` переведён на `O(1)` поиск `FindEntityByServerId`. Полная документация: `docs/archive/FULL_PROJECT_AUDIT_AND_UNIFIED_ARCHITECTURE.md`.
 
 ---
 
