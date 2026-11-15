@@ -51,6 +51,37 @@
 #include <CoopOwnership.h>
 #include <chrono>
 
+// Work plan 5.1 / defect M22. A boss fight locked to its simulating player is granted the boss
+// lease (15 s). On: every renewal of that lease keeps the boss window too, so the boss stays
+// with its owner for the 15 s the claim promised. Off: what every build since the boss window
+// was introduced has done - renewals use the ordinary 8 s window, so the boss window lasts only
+// until the owner's next packet. (v4.1.0 had no boss window: 8 s for every NPC.)
+Console::Setting bEnableBossLeaseRenewal{
+    "Gameplay:bEnableBossLeaseRenewal",
+    "(RFAB) A boss fight locked to its simulating player keeps the 15 s boss lease on every renewal (off: renewals shorten it to the ordinary 8 s)",
+    true};
+
+// Work plan 5.3 / defect M24. A player who takes over the simulation of an NPC sends the NPC as
+// his game shows it, items included, and the server replaced its own list with that one. On: for
+// an NPC the server already holds as dead its own list stands, and only items it never listed
+// and nobody took are added (CoopLootLedger::ShouldAcceptClaimedBodyItem). Off = 4.1.0: the new
+// simulator's list replaces the server's, so an item taken a moment earlier can be listed again.
+Console::Setting bEnableBodyLootAuthority{
+    "Gameplay:bEnableBodyLootAuthority",
+    "(RFAB) The server's list of what a dead NPC holds is not replaced by the list of the player who takes the body over (off = 4.1.0: it is, and a taken item can reappear)",
+    true};
+
+// Work plan 6.2 / defect M26. A summon cannot be handed over, and the lease model refuses the
+// request a client sends when it unloads an actor. For a summon that request is the only way the
+// server learns that it is gone, and the branch that removed it stood behind the refusal. On: the
+// summoner's request removes his summon for everybody. Off = 4.1.0: the request is refused and
+// the summon stays on the server, shown to the other players where it last stood, until its
+// summoner disconnects.
+Console::Setting bEnableSummonDismissal{
+    "Gameplay:bEnableSummonDismissal",
+    "(RFAB) A summon its summoner's game has let go is removed for the other players (off = 4.1.0: it stays where it last stood until the summoner disconnects)",
+    true};
+
 namespace
 {
 constexpr uint32_t kHealthActorValueIndex = 24;
@@ -63,13 +94,32 @@ uint64_t SteadyClockMs() noexcept
             .count());
 }
 
-Authority::Policy SelectEntityLeasePolicy(const CharacterComponent& acChar, bool aIsBossLocked = false) noexcept
+Authority::EntityTraits LeaseTraitsOf(const CharacterComponent& acChar, bool aIsBossLocked) noexcept
 {
-    if (acChar.IsPlayer() || acChar.IsPlayerSummon() || acChar.IsMount())
-        return Authority::Policy{};
-    if (aIsBossLocked || (acChar.IsDragon() && acChar.IsWeaponDrawn()))
-        return Authority::BossEncounterLeasePolicy();
-    return Authority::WorldNpcLeasePolicy();
+    Authority::EntityTraits traits{};
+    traits.IsPlayerAvatar = acChar.IsPlayer();
+    traits.IsPlayerSummon = acChar.IsPlayerSummon();
+    traits.IsMount = acChar.IsMount();
+    traits.IsDragonInCombat = acChar.IsDragon() && acChar.IsWeaponDrawn();
+    traits.IsBossEncounterLocked = aIsBossLocked;
+    return traits;
+}
+
+// The policy at a claim: the caller has already looked the lock up for the Subject it builds.
+Authority::Policy SelectEntityLeasePolicy(const CharacterComponent& acChar, bool aIsBossLocked) noexcept
+{
+    return Authority::SelectLeasePolicy(LeaseTraitsOf(acChar, aIsBossLocked));
+}
+
+// The policy everywhere else - renewals, sweeps, server-side grants - for the lease as held by
+// `aOwnerPlayerId`. One function, so a renewal can no longer forget the lock the claim honoured.
+Authority::Policy LeasePolicyFor(World& aWorld, entt::entity aEntity, const CharacterComponent& acChar,
+                                 uint32_t aOwnerPlayerId) noexcept
+{
+    const bool bossLocked =
+        bEnableBossLeaseRenewal &&
+        aWorld.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(World::ToInteger(aEntity), aOwnerPlayerId);
+    return Authority::SelectLeasePolicy(LeaseTraitsOf(acChar, bossLocked));
 }
 }
 
@@ -108,6 +158,10 @@ void CharacterService::OnCharacterIndexConstructed(entt::registry& aRegistry, en
 
 void CharacterService::OnCharacterIndexDestroyed(entt::registry& aRegistry, entt::entity aEntity) noexcept
 {
+    // Ghost phases and encounter locks are keyed by the server id of this entity.
+    if (auto* pProgression = m_world.ctx().find<RfabProgressionService>())
+        pProgression->GetLedger().ClearBossGhostState(World::ToInteger(aEntity));
+
     if (const auto* pForm = aRegistry.try_get<FormIdComponent>(aEntity); pForm && pForm->Id != GameId{})
     {
         const uint64_t key = CoopWorldView::PackGameIdKey(pForm->Id.ModId, pForm->Id.BaseId);
@@ -466,7 +520,7 @@ void CharacterService::ReconcileAllEntitiesForObserver(Player* apObserver) const
 
                     const auto adoption = Authority::Claim(mutableOwner.GetLease(), Authority::Subject{},
                                                            Authority::OwnerState{false, false}, observer, nowMs,
-                                                           SelectEntityLeasePolicy(charComp));
+                                                           LeasePolicyFor(m_world, entity, charComp, apObserver->GetId()));
                     const uint64_t newEpoch = mutableOwner.Apply(adoption, apObserver);
                     mutableOwner.InvalidOwners.Clear();
                     m_interestRegistry.UnmarkInRange(apObserver->GetId(), serverId);
@@ -864,7 +918,9 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
                 // WakeDormantCharactersInActiveRanges or ReconcileAllEntitiesForObserver pre-assigned this player
                 // as owner before their AssignCharacterRequest arrived: confirm ownership instead of replying Owner=false!
                 existingOwnerComp.InvalidOwners.Clear();
-                existingOwnerComp.RefreshLease(SteadyClockMs(), SelectEntityLeasePolicy(characterComponent));
+                existingOwnerComp.RefreshLease(
+                    SteadyClockMs(),
+                    LeasePolicyFor(m_world, existingEntity, characterComponent, acMessage.pPlayer->GetId()));
                 m_interestRegistry.UnmarkInRange(acMessage.pPlayer->GetId(), World::ToInteger(existingEntity));
                 isOwner = true;
             }
@@ -887,7 +943,8 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
                 {
                     const uint32_t existingServerId = World::ToInteger(existingEntity);
                     const bool isBossLocked =
-                        m_world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(existingServerId) ||
+                        m_world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(
+                            existingServerId, GetOwnerPlayerId(existingOwnerComp.GetOwner())) ||
                         (characterComponent.IsDragon() && characterComponent.IsWeaponDrawn());
 
                     Authority::Subject subject{};
@@ -1038,7 +1095,9 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
                     acMessage.pPlayer->Send(response);
                     m_world.GetSaveSnapshotService().GetCoordinator().RecordFlightEvent(
                         nowMs, CoopFlight::FlightEventKind::kAmbushDeduplicated, existingServerId, acMessage.pPlayer->GetId());
-                    spdlog::debug(
+                    // info, not debug: it is rare (the non-leader's client deletes its own copy
+                    // before it gets here), and a playtest report has to show that it happened.
+                    spdlog::info(
                         "[RFAB AmbushDedup] Bound peer {} dynamic ambush NPC {:X}:{:X} to existing ServerId {:X}",
                         acMessage.pPlayer->GetId(),
                         message.FormId.ModId,
@@ -1086,6 +1145,16 @@ void CharacterService::OnOwnershipTransferRequest(const PacketEvent<RequestOwner
         handoffSubject.IsSummonPinnedToOwner = pCharacterComponent->IsPlayerSummon();
     }
 
+    if (bEnableSummonDismissal && handoffSubject.IsSummonPinnedToOwner &&
+        Authority::MaySummonerDismiss(pCharacterOwnerComponent->GetLease(), senderId, message.OwnershipEpoch))
+    {
+        // The summoner's game let the summon go: it is gone from the only game that can run it.
+        // Anybody else asking, or a stale epoch, falls through to the refusal below.
+        spdlog::debug("[Ownership] Summon {:X} let go by its summoner (player {}): removed", message.ServerId, senderId);
+        m_world.GetDispatcher().trigger(CharacterRemoveEvent(message.ServerId));
+        return;
+    }
+
     const auto handoffDecision = Authority::Release(pCharacterOwnerComponent->GetLease(), handoffSubject, senderId,
                                                     message.OwnershipEpoch, SteadyClockMs());
 
@@ -1112,6 +1181,9 @@ void CharacterService::OnOwnershipTransferRequest(const PacketEvent<RequestOwner
         return;
     }
 
+    // Not reached for a summon since the lease model was put in front of it: Authority::Release
+    // refuses a pinned entity above. The summoner's own request is handled before the refusal
+    // (bEnableSummonDismissal, defect M26).
     if (auto* pCharacterComponent = m_world.try_get<CharacterComponent>(cEntity))
     {
         if (pCharacterComponent->IsPlayerSummon())
@@ -1237,7 +1309,7 @@ void CharacterService::OnOwnershipTransferEvent(const OwnershipTransferEvent& ac
         candidates,
         declined,
         reassignNowMs,
-        SelectEntityLeasePolicy(characterComponent));
+        LeasePolicyFor(m_world, acEvent.Entity, characterComponent, Authority::kNoOwner));
 
     Player* pSelectedOwner = nullptr;
     if (reassignment.Result == Authority::Outcome::kGranted)
@@ -1345,7 +1417,8 @@ void CharacterService::OnOwnershipClaimRequest(const PacketEvent<RequestOwnershi
     const uint64_t nowMs = SteadyClockMs();
 
     const bool isBossLocked =
-        m_world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(acMessage.Packet.ServerId) ||
+        m_world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(
+            acMessage.Packet.ServerId, GetOwnerPlayerId(pOwnerComp->GetOwner())) ||
         (pCharComp->IsDragon() && pCharComp->IsWeaponDrawn());
 
     Authority::Subject subject{};
@@ -1373,10 +1446,9 @@ void CharacterService::OnOwnershipClaimRequest(const PacketEvent<RequestOwnershi
         !pOwnerComp->GetLease().IsExpired(nowMs))
     {
         // Simulation Authority != Combat Target: while the current owner is connected, in range, and its lease is live,
-        // only allow mounting an un-ridden horse (`IsMount()` && `CanTransferMountOwnership`) or calm non-combat takeover by the party leader.
+        // only allow taking a horse that nobody else is riding (`IsMount()`) or calm non-combat takeover by the party leader.
         const bool canTakeMount =
-            pCharComp->IsMount() &&
-            m_mountGuard.CanTransferMountOwnership(acMessage.Packet.ServerId, acMessage.pPlayer->GetId());
+            pCharComp->IsMount() && !IsMountHeldByOtherRider(acMessage.Packet.ServerId, acMessage.pPlayer);
         const bool allowedVoluntaryTakeover =
             canTakeMount ||
             (m_world.GetPartyService().IsPlayerLeader(acMessage.pPlayer) && !pCharComp->IsWeaponDrawn());
@@ -1443,6 +1515,18 @@ void CharacterService::OnOwnershipClaimRequest(const PacketEvent<RequestOwnershi
         sanitizedData.InitialActorValues.ActorValuesList[kHealthActorValueIndex] = claimedHealth;
     if (claimedMaxHealth > 0.0f && (claimedMaxHpIt != sanitizedData.InitialActorValues.ActorMaxValuesList.end() || serverMaxHealth > 0.0f))
         sanitizedData.InitialActorValues.ActorMaxValuesList[kHealthActorValueIndex] = claimedMaxHealth;
+
+    // One writer for what a body holds (M24): the loot ledger, not the list of whoever simulates
+    // the body next. `pCharComp->IsDead()` is the server's state before this claim is applied, so
+    // an NPC the claim itself reports dead for the first time still brings its own list.
+    if (bEnableBodyLootAuthority && pCharComp->IsDead())
+    {
+        if (const auto* pHeldInventory = m_world.try_get<InventoryComponent>(cEntity))
+        {
+            sanitizedData.InitialInventory = m_world.GetInventoryService().MergeClaimedBodyInventory(
+                cEntity, acMessage.Packet.ServerId, pHeldInventory->Content, sanitizedData.InitialInventory);
+        }
+    }
 
     uint32_t prevHealthRev = 0;
     if (const auto* pAvBefore = m_world.try_get<ActorValuesComponent>(cEntity))
@@ -1597,6 +1681,20 @@ void CharacterService::OnReferencesMoveRequest(const PacketEvent<ClientReference
 
             animationComponent.CurrentAction = action;
             acceptedActions.push_back(animationComponent.CurrentAction);
+        }
+
+        // A player getting off a mount: the only report of a dismount there is.
+        if (characterComponent.IsPlayer())
+        {
+            for (const auto& action : acceptedActions)
+            {
+                if (RfabWorldImmersion::MountOwnershipGuard::IsMountExitAnimationEvent(
+                        std::string_view(action.EventName.c_str(), action.EventName.size())))
+                {
+                    m_mountGuard.ReleaseAllForPlayer(acMessage.pPlayer->GetId());
+                    break;
+                }
+            }
         }
 
         animationComponent.ActionsReplayCache.AppendAll(acceptedActions);
@@ -1808,7 +1906,8 @@ void CharacterService::TransferOwnership(Player* apPlayer, const uint32_t acServ
     Player* pPreviousOwner = characterOwnerComponent.GetOwner();
     const uint64_t nowMs = SteadyClockMs();
     const auto* pTargetChar = m_world.try_get<CharacterComponent>(*it);
-    const Authority::Policy transferPolicy = pTargetChar ? SelectEntityLeasePolicy(*pTargetChar) : Authority::Policy{};
+    const Authority::Policy transferPolicy =
+        pTargetChar ? LeasePolicyFor(m_world, *it, *pTargetChar, GetOwnerPlayerId(apPlayer)) : Authority::Policy{};
     const uint64_t newEpoch = characterOwnerComponent.SetOwner(apPlayer, nowMs, transferPolicy);
     characterOwnerComponent.InvalidOwners.Clear();
 
@@ -2016,18 +2115,26 @@ void CharacterService::NotePlayerSimulationActivity(Player* apPlayer, uint64_t a
 
         const auto& charComp = view.get<CharacterComponent>(entity);
         ownerComp.InvalidOwners.ForgetPlayer(playerId);
-        ownerComp.RefreshLease(aNowMs, SelectEntityLeasePolicy(charComp));
+        ownerComp.RefreshLease(aNowMs, LeasePolicyFor(m_world, entity, charComp, playerId));
     }
 }
 
 void CharacterService::SweepExpiredWorldNpcLeases(uint64_t aNowMs) const noexcept
 {
-    if (m_lastExpiredLeaseSweepMs != 0 && aNowMs > m_lastExpiredLeaseSweepMs &&
-        (aNowMs - m_lastExpiredLeaseSweepMs) < 500ull)
-    {
+    const Authority::SweepPolicy sweepPolicy{};
+    if (!Authority::IsSweepDue(m_lastExpiredLeaseSweepMs, aNowMs, sweepPolicy.ExpiredLeaseSweepIntervalMs))
         return;
-    }
     m_lastExpiredLeaseSweepMs = aNowMs;
+
+    const auto activityOf = [this](uint32_t aPlayerId) noexcept {
+        Authority::PeerActivity activity{};
+        if (const auto it = m_lastPlayerSimulationActivityMs.find(aPlayerId); it != m_lastPlayerSimulationActivityMs.end())
+        {
+            activity.Known = true;
+            activity.LastAtMs = it->second;
+        }
+        return activity;
+    };
 
     auto view = m_world.view<OwnerComponent, CharacterComponent, CellIdComponent>();
     for (auto entity : view)
@@ -2041,16 +2148,15 @@ void CharacterService::SweepExpiredWorldNpcLeases(uint64_t aNowMs) const noexcep
         if (charComp.IsPlayer() || charComp.IsPlayerSummon() || charComp.IsMount())
             continue;
 
-        if (!ownerComp.GetLease().IsExpired(aNowMs))
-            continue;
-
         const uint32_t currentOwnerId = pCurrentOwner->GetId();
-        if (const auto actIt = m_lastPlayerSimulationActivityMs.find(currentOwnerId);
-            actIt != m_lastPlayerSimulationActivityMs.end() &&
-            aNowMs >= actIt->second &&
-            (aNowMs - actIt->second) < Authority::kWorldNpcLeaseDurationMs)
+        const Authority::Policy ownerPolicy = LeasePolicyFor(m_world, entity, charComp, currentOwnerId);
+        const auto lapsed =
+            Authority::EvaluateLapsedLease(ownerComp.GetLease(), activityOf(currentOwnerId), aNowMs, ownerPolicy);
+        if (lapsed == Authority::LapsedLeaseAction::kNothing)
+            continue;
+        if (lapsed == Authority::LapsedLeaseAction::kRefreshForActiveOwner)
         {
-            ownerComp.RefreshLease(aNowMs, SelectEntityLeasePolicy(charComp));
+            ownerComp.RefreshLease(aNowMs, ownerPolicy);
             continue;
         }
 
@@ -2068,13 +2174,8 @@ void CharacterService::SweepExpiredWorldNpcLeases(uint64_t aNowMs) const noexcep
             if (!pCandidate->GetCellComponent().IsInRange(cellComp, charComp.IsDragon()))
                 continue;
 
-            const auto peerActIt = m_lastPlayerSimulationActivityMs.find(pCandidate->GetId());
-            if (peerActIt == m_lastPlayerSimulationActivityMs.end() ||
-                aNowMs < peerActIt->second ||
-                (aNowMs - peerActIt->second) > Authority::kActivePeerSimulationWindowMs)
-            {
+            if (!Authority::IsPeerActivelySimulating(activityOf(pCandidate->GetId()), aNowMs, sweepPolicy))
                 continue;
-            }
 
             Authority::Candidate candidate{};
             candidate.PlayerId = pCandidate->GetId();
@@ -2102,7 +2203,7 @@ void CharacterService::SweepExpiredWorldNpcLeases(uint64_t aNowMs) const noexcep
             candidates,
             declined,
             aNowMs,
-            SelectEntityLeasePolicy(charComp));
+            LeasePolicyFor(m_world, entity, charComp, Authority::kNoOwner));
         if (reassignment.Result != Authority::Outcome::kGranted)
             continue;
 
@@ -2147,7 +2248,7 @@ void CharacterService::SweepExpiredWorldNpcLeases(uint64_t aNowMs) const noexcep
 void CharacterService::WakeDormantCharactersInActiveRanges() const noexcept
 {
     const uint64_t nowMs = SteadyClockMs();
-    if (m_lastWakeSweepMs != 0 && nowMs > m_lastWakeSweepMs && (nowMs - m_lastWakeSweepMs) < 1000ull)
+    if (!Authority::IsSweepDue(m_lastWakeSweepMs, nowMs, Authority::SweepPolicy{}.DormantWakeSweepIntervalMs))
         return;
     m_lastWakeSweepMs = nowMs;
 
@@ -2193,7 +2294,8 @@ void CharacterService::WakeDormantCharactersInActiveRanges() const noexcept
             pBestObserver->Send(spawnMsg);
         }
 
-        const uint64_t newEpoch = ownerComp.SetOwner(pBestObserver, nowMs, SelectEntityLeasePolicy(charComp));
+        const uint64_t newEpoch =
+            ownerComp.SetOwner(pBestObserver, nowMs, LeasePolicyFor(m_world, entity, charComp, pBestObserver->GetId()));
         ownerComp.InvalidOwners.Clear();
         m_interestRegistry.UnmarkInRange(pBestObserver->GetId(), serverId);
 

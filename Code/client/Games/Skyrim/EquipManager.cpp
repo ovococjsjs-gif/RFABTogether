@@ -1,4 +1,5 @@
 #include <TiltedOnlinePCH.h>
+#include <CrashBreadcrumbs.h>
 
 #include <EquipManager.h>
 #include <Games/References.h>
@@ -166,6 +167,7 @@ void EquipManager::UnequipAll(Actor* apActor)
 
 void* TP_MAKE_THISCALL(EquipHook, EquipManager, Actor* apActor, TESForm* apItem, EquipData* apData)
 {
+    RFAB_HOOK_CRUMB("EquipHook", apActor ? apActor->formID : 0, apItem ? apItem->formID : 0);
     if (!apActor || !apItem)
         return nullptr;
 
@@ -201,6 +203,7 @@ void* TP_MAKE_THISCALL(EquipHook, EquipManager, Actor* apActor, TESForm* apItem,
 
 void* TP_MAKE_THISCALL(UnEquipHook, EquipManager, Actor* apActor, TESForm* apItem, EquipData* apData)
 {
+    RFAB_HOOK_CRUMB("UnEquipHook", apActor ? apActor->formID : 0, apItem ? apItem->formID : 0);
     if (!apActor || !apItem)
         return nullptr;
 
@@ -236,6 +239,7 @@ void* TP_MAKE_THISCALL(UnEquipHook, EquipManager, Actor* apActor, TESForm* apIte
 
 void* TP_MAKE_THISCALL(EquipSpellHook, EquipManager, Actor* apActor, TESForm* apSpell, MagicEquipData* apData)
 {
+    RFAB_HOOK_CRUMB("EquipSpellHook", apActor ? apActor->formID : 0, apSpell ? apSpell->formID : 0);
     if (!apActor || !apSpell)
         return nullptr;
 
@@ -263,6 +267,7 @@ void* TP_MAKE_THISCALL(EquipSpellHook, EquipManager, Actor* apActor, TESForm* ap
 
 void* TP_MAKE_THISCALL(UnEquipSpellHook, EquipManager, Actor* apActor, TESForm* apSpell, MagicEquipData* apData)
 {
+    RFAB_HOOK_CRUMB("UnEquipSpellHook", apActor ? apActor->formID : 0, apSpell ? apSpell->formID : 0);
     if (!apActor || !apSpell)
         return nullptr;
 
@@ -289,6 +294,7 @@ void* TP_MAKE_THISCALL(UnEquipSpellHook, EquipManager, Actor* apActor, TESForm* 
 
 void* TP_MAKE_THISCALL(EquipShoutHook, EquipManager, Actor* apActor, TESForm* apShout, ShoutEquipData* apData)
 {
+    RFAB_HOOK_CRUMB("EquipShoutHook", apActor ? apActor->formID : 0, apShout ? apShout->formID : 0);
     if (!apActor || !apShout)
         return nullptr;
 
@@ -316,6 +322,7 @@ void* TP_MAKE_THISCALL(EquipShoutHook, EquipManager, Actor* apActor, TESForm* ap
 
 void* TP_MAKE_THISCALL(UnEquipShoutHook, EquipManager, Actor* apActor, TESForm* apShout, ShoutEquipData* apData)
 {
+    RFAB_HOOK_CRUMB("UnEquipShoutHook", apActor ? apActor->formID : 0, apShout ? apShout->formID : 0);
     if (!apActor || !apShout)
         return nullptr;
 

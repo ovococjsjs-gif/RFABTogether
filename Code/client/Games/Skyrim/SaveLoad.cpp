@@ -1,10 +1,13 @@
 #include <TiltedOnlinePCH.h>
+#include <CrashBreadcrumbs.h>
 
 #include <SaveLoad.h>
 #include <common/CoopWorldStabilizer.h>
 #include <common/RfabModpackCompat.h>
+#include <common/Compat/SafeFs.h>
 #include <Games/IFormFactory.h>
 #include <Games/Memory.h>
+#include <Games/Overrides.h>
 #include <Games/TES.h>
 #include <Services/CharacterService.h>
 #include <Services/CoordinatedSaveService.h>
@@ -164,6 +167,7 @@ bool PatchRelativeCallSite(uintptr_t aCallSiteAddr, void* apDetourFn, TFn** appO
 
 bool TP_MAKE_THISCALL(HookLoadEntry, BGSSaveLoadManager, void* apFileEntry, uint64_t aArg2, uint64_t aArg3, uint64_t aArg4, uint64_t aArg5)
 {
+    RFAB_HOOK_CRUMB("HookLoadEntry");
     RFAB_EXPECT_MAIN_THREAD("HookLoadEntry");
     if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealLoadEntry, apThis, apFileEntry, aArg2, aArg3, aArg4, aArg5);
@@ -196,6 +200,7 @@ bool TP_MAKE_THISCALL(HookLoadCallSite, BGSSaveLoadManager, uint64_t* apUnk0, ui
 
 bool TP_MAKE_THISCALL(HookSaveImpl, BGSSaveLoadManager, int32_t aDeviceId, uint32_t aOutputStats, const char* acpFileName)
 {
+    RFAB_HOOK_CRUMB("HookSaveImpl");
     RFAB_EXPECT_MAIN_THREAD("HookSaveImpl");
     if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealSaveImpl, apThis, aDeviceId, aOutputStats, acpFileName);
@@ -218,6 +223,7 @@ bool TP_MAKE_THISCALL(HookSaveImpl, BGSSaveLoadManager, int32_t aDeviceId, uint3
 
 bool TP_MAKE_THISCALL(HookSaveGame2, BGSSaveLoadManager, uint64_t aArg1, uint64_t aArg2, uint64_t aArg3)
 {
+    RFAB_HOOK_CRUMB("HookSaveGame2");
     RFAB_EXPECT_MAIN_THREAD("HookSaveGame2");
     if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealSaveGame2, apThis, aArg1, aArg2, aArg3);
@@ -235,6 +241,7 @@ bool TP_MAKE_THISCALL(HookSaveGame2, BGSSaveLoadManager, uint64_t aArg1, uint64_
 
 bool TP_MAKE_THISCALL(HookLoadImpl, BGSSaveLoadManager, const char* acpFileName, int32_t aDeviceId, uint32_t aOutputStats, bool aCheckForMods)
 {
+    RFAB_HOOK_CRUMB("HookLoadImpl");
     RFAB_EXPECT_MAIN_THREAD("HookLoadImpl");
     if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealLoadImpl, apThis, acpFileName, aDeviceId, aOutputStats, aCheckForMods);
@@ -247,6 +254,7 @@ bool TP_MAKE_THISCALL(HookLoadImpl, BGSSaveLoadManager, const char* acpFileName,
 
 bool TP_MAKE_THISCALL(HookLoadMostRecent, BGSSaveLoadManager)
 {
+    RFAB_HOOK_CRUMB("HookLoadMostRecent");
     RFAB_EXPECT_MAIN_THREAD("HookLoadMostRecent");
     if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
         return TiltedPhoques::ThisCall(RealLoadMostRecent, apThis);
@@ -259,6 +267,7 @@ bool TP_MAKE_THISCALL(HookLoadMostRecent, BGSSaveLoadManager)
 
 void TP_MAKE_THISCALL(HookQueueSaveLoadTask, BGSSaveLoadManager, uint32_t aTaskMask)
 {
+    RFAB_HOOK_CRUMB("HookQueueSaveLoadTask", aTaskMask);
     RFAB_EXPECT_MAIN_THREAD("HookQueueSaveLoadTask");
     if (!s_universalHooksInstalled.load(std::memory_order_acquire) || !World::IsCreated())
     {
@@ -483,30 +492,33 @@ size_t BGSSaveLoadManager::QuarantineCorruptSavesOnce() noexcept
         if (savesDir.empty())
             return 0;
 
-        size_t quarantined = RfabCompat::Detail::QuarantineCorruptEssFilesInDirectory(savesDir);
-        std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(savesDir, ec))
-        {
-            if (ec)
-                break;
+        // Only saves the coop wrote (RFAB_MP_...) are ever moved; the player's own saves are named
+        // in the log and left alone, and a file that is locked right now is not judged (M14, 4.4).
+        RfabCompat::Detail::SaveQuarantineReport report = RfabCompat::Detail::QuarantineDamagedCoopSavesInDirectory(savesDir);
+        Compat::SafeFs::ForEachEntry(savesDir, [&report](const std::filesystem::directory_entry& acEntry) {
+            if (!Compat::SafeFs::IsDirectory(acEntry))
+                return;
 
-            std::error_code subEc;
-            if (!entry.is_directory(subEc) || subEc)
-                continue;
-
-            const auto u8Dir = entry.path().filename().u8string();
-            const std::string dirName = RfabCompat::Detail::ToLowerAscii(
-                std::string_view(reinterpret_cast<const char*>(u8Dir.data()), u8Dir.size()));
+            const std::string dirName = RfabCompat::Detail::ToLowerAscii(Compat::SafeFs::FileNameUtf8Lossy(acEntry.path()));
             if (dirName == "quarantined_corrupt_v100" || dirName == "_rfab_corruptquarantine")
-                continue;
+                return;
 
-            quarantined += RfabCompat::Detail::QuarantineCorruptEssFilesInDirectory(entry.path());
+            report.Add(RfabCompat::Detail::QuarantineDamagedCoopSavesInDirectory(acEntry.path()));
+        });
+
+        if (report.Moved > 0)
+            spdlog::warn("[RFAB SaveLoad] moved {} damaged coop save file(s) into Quarantined_Corrupt_v100", report.Moved);
+        if (report.MoveFailed > 0)
+            spdlog::warn("[RFAB SaveLoad] {} damaged coop save file(s) could not be moved (in use or no access)", report.MoveFailed);
+        if (report.ForeignDamaged > 0)
+        {
+            spdlog::warn("[RFAB SaveLoad] {} save file(s) that are not coop saves look damaged; they were left where they are: {}",
+                         report.ForeignDamaged, report.DescribeForeign());
         }
+        if (report.Unreadable > 0)
+            spdlog::info("[RFAB SaveLoad] {} save file(s) could not be opened right now and were not checked", report.Unreadable);
 
-        if (quarantined > 0)
-            spdlog::warn("[RFAB SaveLoad] Quarantined {} corrupt/truncated .ess save file(s) into _RFAB_CorruptQuarantine", quarantined);
-
-        return quarantined;
+        return report.Moved;
     }
     catch (...)
     {
@@ -566,9 +578,11 @@ bool BGSSaveLoadManager::ExecuteDirectSaveFromProcessEvents(const char* acpFileN
     if (cleanStem.empty())
         return false;
 
-    s_inDirectProcessEventsSave = true;
-    const bool rawOk = TiltedPhoques::ThisCall(RealSaveImpl, this, 2, 0u, cleanStem.c_str());
-    s_inDirectProcessEventsSave = false;
+    bool rawOk = false;
+    {
+        ScopedTlsValue<bool> directSave(s_inDirectProcessEventsSave, true);
+        rawOk = TiltedPhoques::ThisCall(RealSaveImpl, this, 2, 0u, cleanStem.c_str());
+    }
 
     if (!rawOk)
         return false;

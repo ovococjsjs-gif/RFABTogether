@@ -2,14 +2,13 @@
 
 /**
  * Pure, deterministic RFAB co-op progression & session-parity helpers (zero Skyrim engine deps):
- *  1. DragonSoulLedger: shares slain dragon souls 1-for-1 across all party members without double-grants.
- *  2. WordWallLedger: shares learned Words of Power (TESWordOfPower GameId) across party & late joiners.
- *  3. DifficultyHandshake: validates RFAB_StartMenu Difficulty (Странник / Довакин / Легенда) &
+ *  1. DragonSoulLedger: the dragons the party has slain (the server decides who is sent a soul).
+ *  2. DifficultyHandshake: validates RFAB_StartMenu Difficulty (Странник / Довакин / Легенда) &
  *     Cursed (Проклятый) parity between Host and Guest with localized mismatch warnings.
- *  4. QuestsIniDedupe: canonical UTF-8 / Cyrillic-safe keys for RFAB Quests.ini XP deduplication.
- *  5. LateJoinerCatchUp: bounded, idempotent catch-up XP calculation for friends joining mid-session.
+ *  3. SharedXpCreditLedger: who already holds how much of the party's shared XP (late-join catch-up).
  */
 
+#include <TiltedCore/Buffer.hpp>
 #include <Structs/GameId.h>
 
 #include <algorithm>
@@ -127,42 +126,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// 2. Shared Word Walls Ledger (TESWordOfPower GameId)
-// ---------------------------------------------------------------------------
-
-class WordWallLedger
-{
-public:
-    void Clear() noexcept { m_learnedWords.clear(); }
-    [[nodiscard]] size_t Size() const noexcept { return m_learnedWords.size(); }
-    [[nodiscard]] const std::vector<GameId>& GetLearnedWords() const noexcept { return m_learnedWords; }
-
-    bool RecordWordLearned(const GameId& acWordId)
-    {
-        if (!acWordId || acWordId.ModId == 0xFFFFFFFFu)
-            return false;
-        for (const auto& existing : m_learnedWords)
-        {
-            if (existing == acWordId)
-                return false;
-        }
-        m_learnedWords.push_back(acWordId);
-        return true;
-    }
-
-    void RestoreWords(const std::vector<GameId>& acWords)
-    {
-        Clear();
-        for (const auto& w : acWords)
-            (void)RecordWordLearned(w);
-    }
-
-private:
-    std::vector<GameId> m_learnedWords{};
-};
-
-// ---------------------------------------------------------------------------
-// 3. RFAB_StartMenu Difficulty & Cursed Handshake
+// 2. RFAB_StartMenu Difficulty & Cursed Handshake
 // ---------------------------------------------------------------------------
 
 enum class RfabDifficultyTier : uint8_t
@@ -194,7 +158,7 @@ enum class DifficultyParityOutcome : uint8_t
 
 // Infers RFAB StartMenu tier & Cursed flag directly from live GMST multipliers:
 //   fDiffMultHPByPCVH (outgoing) and fDiffMultHPToPCVH (incoming).
-// Matches docs/RFAB_DIFFICULTY_AND_VANILLA_OVERRIDE_AUDIT_2026_10_24.md verbatim:
+// Matches docs/archive/RFAB_DIFFICULTY_AND_VANILLA_OVERRIDE_AUDIT_2026_10_24.md verbatim:
 //   - Wanderer: outgoing 2.0 (cursed 0.5), incoming 0.5
 //   - Dovahkiin: outgoing 1.0 (cursed 0.5), incoming 1.0
 //   - Legend:    outgoing 1.0 (cursed 0.5), incoming 2.0
@@ -291,67 +255,18 @@ enum class DifficultyParityOutcome : uint8_t
 }
 
 // ---------------------------------------------------------------------------
-// 4. Quests.ini Canonical Deduplication Key
+// 3. Late-joiner catch-up XP: who already holds how much of the party's shared XP
 // ---------------------------------------------------------------------------
-
-// Normalizes quest names (including UTF-8 Cyrillic titles from RFAB `Quests.ini`) into a
-// whitespace-collapsed, ASCII-lowercased canonical source key (`quest_ini:<hash64>`), so
-// two players completing the same RFAB quest >4s apart still hit the exact same server XP key!
-[[nodiscard]] inline std::string MakeCanonicalQuestsIniSourceKey(
-    const GameId& acQuestId,
-    uint16_t aStage,
-    std::string_view aQuestEditorOrTitle = {})
-{
-    if (acQuestId && acQuestId.ModId != 0xFFFFFFFFu)
-    {
-        char buf[64]{};
-        std::snprintf(buf, sizeof(buf), "quest:%08X:%08X:%u", acQuestId.ModId, acQuestId.BaseId, static_cast<unsigned>(aStage));
-        return std::string(buf);
-    }
-
-    // Fallback: canonical FNV-1a 64-bit hash of trimmed, whitespace-collapsed title/editorId.
-    std::string canonical;
-    canonical.reserve(aQuestEditorOrTitle.size());
-    bool prevSpace = true;
-    for (unsigned char ch : aQuestEditorOrTitle)
-    {
-        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n')
-        {
-            if (!prevSpace)
-            {
-                canonical.push_back(' ');
-                prevSpace = true;
-            }
-        }
-        else
-        {
-            if (ch >= 'A' && ch <= 'Z')
-                ch = static_cast<unsigned char>(ch - 'A' + 'a');
-            canonical.push_back(static_cast<char>(ch));
-            prevSpace = false;
-        }
-    }
-    while (!canonical.empty() && canonical.back() == ' ')
-        canonical.pop_back();
-
-    if (canonical.empty())
-        return {};
-
-    uint64_t h = 14695981039346656037ULL;
-    for (unsigned char c : canonical)
-    {
-        h ^= static_cast<uint64_t>(c);
-        h *= 1099511628211ULL;
-    }
-
-    char buf[64]{};
-    std::snprintf(buf, sizeof(buf), "quest_ini:%016llX:%u", static_cast<unsigned long long>(h), static_cast<unsigned>(aStage));
-    return std::string(buf);
-}
-
-// ---------------------------------------------------------------------------
-// 5. Late-Joiner Catch-Up XP Policy
-// ---------------------------------------------------------------------------
+//
+// Shared XP reaches a player while they are connected: they earn it, or they receive the
+// broadcast. A player who was away is owed what the party earned in the meantime, and nothing
+// else. The ledger counts XP per persistent player identity
+// (CoopWorldView::BuildPlayerIdentityKey), travels inside the progression snapshot and therefore
+// survives reconnects, server restarts and world rollbacks.
+//
+// It replaces a tracker that remembered connection ids. A connection id is new on every
+// reconnect, so every reconnect - and every join after a server restart - paid out up to the cap
+// again, to players who had been there all along (DEFECT_REGISTRY M1).
 
 inline constexpr int32_t kDefaultMaxLateJoinCatchUpXp = 25000;
 
@@ -359,48 +274,108 @@ struct LateJoinCatchUpDecision
 {
     bool ShouldGrant{false};
     int32_t GrantXpDelta{0};
+    // Owed but not paid: beyond the cap, or owed while the feature is switched off.
+    int64_t ForfeitedXp{0};
 };
 
-class LateJoinCatchUpTracker
+class SharedXpCreditLedger
 {
 public:
-    void Clear() noexcept { m_grantedPlayers.clear(); }
+    using CreditMap = std::unordered_map<std::string, int64_t>;
 
-    // Evaluates bounded, one-time-per-session catch-up XP for a player joining an ongoing session
-    // that already accumulated `aAuthoritativeSessionXp`. Players who were already credited (or
-    // who joined at session start with 0 accumulated XP) never receive duplicate grants.
-    LateJoinCatchUpDecision EvaluateAndMark(
-        uint32_t aPlayerId,
-        int64_t aAuthoritativeSessionXp,
+    // A connection without a Discord id and without a name only has a per-connection key
+    // ("pid:<n>"). It cannot be recognised next time, so it is never owed anything.
+    [[nodiscard]] static bool IsPersistentIdentity(std::string_view aIdentityKey) noexcept
+    {
+        return !aIdentityKey.empty() && aIdentityKey.rfind("pid:", 0) != 0;
+    }
+
+    void Clear() noexcept
+    {
+        m_credited.clear();
+        m_baselineXp = 0;
+    }
+
+    // XP that was earned while this identity was connected. `aTotalAfterGrant` is the party total
+    // including the delta: an identity that is connected but was never seen joining is level with
+    // the party by definition.
+    void CreditConnected(const std::string& acIdentityKey, int64_t aXpDelta, int64_t aTotalAfterGrant)
+    {
+        if (!IsPersistentIdentity(acIdentityKey) || aXpDelta <= 0)
+            return;
+
+        const auto it = m_credited.find(acIdentityKey);
+        if (it == m_credited.end())
+            m_credited.emplace(acIdentityKey, std::max<int64_t>(aTotalAfterGrant, 0));
+        else
+            it->second += aXpDelta;
+    }
+
+    // The identity is connected while the party total is `aTotalSharedXp` and nothing is owed to
+    // it for the past - used after a rollback, where a connected player may be missing from the
+    // restored credits. Never lowers a credit.
+    void LevelWithParty(const std::string& acIdentityKey, int64_t aTotalSharedXp)
+    {
+        if (!IsPersistentIdentity(acIdentityKey))
+            return;
+
+        const int64_t total = std::max<int64_t>(aTotalSharedXp, 0);
+        const auto [it, isNew] = m_credited.try_emplace(acIdentityKey, total);
+        if (!isNew && it->second < total)
+            it->second = total;
+    }
+
+    // The identity (re)joined while the party total is `aTotalSharedXp`. Whatever is decided, the
+    // identity is level with the party afterwards: what is not paid out is forfeited, so joining
+    // again cannot pay a second time.
+    LateJoinCatchUpDecision EvaluateJoin(
+        const std::string& acIdentityKey,
+        int64_t aTotalSharedXp,
         bool aEnabled,
         int32_t aMaxGrantXp = kDefaultMaxLateJoinCatchUpXp)
     {
         LateJoinCatchUpDecision out{};
-        if (!aEnabled || aPlayerId == 0 || aAuthoritativeSessionXp <= 0 || aMaxGrantXp <= 0)
+        if (!IsPersistentIdentity(acIdentityKey))
             return out;
 
-        if (!m_grantedPlayers.insert(aPlayerId).second)
-            return out;
+        const int64_t total = std::max<int64_t>(aTotalSharedXp, 0);
+        const auto [it, isNew] = m_credited.try_emplace(acIdentityKey, m_baselineXp);
+        const int64_t owed = total - it->second;
+        if (owed <= 0)
+            return out; // level with the party, or ahead of a total that was rolled back
 
-        const int64_t bounded = std::min<int64_t>(aAuthoritativeSessionXp, static_cast<int64_t>(aMaxGrantXp));
-        out.ShouldGrant = bounded > 0;
-        out.GrantXpDelta = static_cast<int32_t>(bounded);
+        it->second = total;
+
+        const int64_t cap = aEnabled ? std::max<int64_t>(aMaxGrantXp, 0) : 0;
+        const int64_t grant = std::min(owed, cap);
+        out.ShouldGrant = grant > 0;
+        out.GrantXpDelta = static_cast<int32_t>(grant);
+        out.ForfeitedXp = owed - grant;
         return out;
     }
 
-    void MarkAlreadySyncedAtSessionStart(uint32_t aPlayerId)
+    // Identities never seen before are assumed to hold this much already. Zero in a new world.
+    // A checkpoint written before credits were tracked is loaded with the baseline set to its
+    // total: nobody is owed XP from a time nothing was recorded about.
+    void SetBaselineXp(int64_t aBaselineXp) noexcept { m_baselineXp = std::max<int64_t>(aBaselineXp, 0); }
+    [[nodiscard]] int64_t GetBaselineXp() const noexcept { return m_baselineXp; }
+
+    [[nodiscard]] const CreditMap& GetCredits() const noexcept { return m_credited; }
+    [[nodiscard]] int64_t GetCreditedXp(const std::string& acIdentityKey) const noexcept
     {
-        if (aPlayerId != 0)
-            m_grantedPlayers.insert(aPlayerId);
+        const auto it = m_credited.find(acIdentityKey);
+        return it != m_credited.end() ? it->second : m_baselineXp;
     }
 
-    [[nodiscard]] bool HasBeenEvaluated(uint32_t aPlayerId) const noexcept
+    void Restore(CreditMap aCredits, int64_t aBaselineXp)
     {
-        return m_grantedPlayers.contains(aPlayerId);
+        m_credited = std::move(aCredits);
+        SetBaselineXp(aBaselineXp);
     }
 
 private:
-    std::unordered_set<uint32_t> m_grantedPlayers{};
+    CreditMap m_credited{};
+    int64_t m_baselineXp{0};
 };
 
 } // namespace RfabCoopProgression

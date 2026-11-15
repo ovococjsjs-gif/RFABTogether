@@ -17,12 +17,20 @@ namespace
 constexpr int32_t kMaxSingleXpGrant = 1'000'000;
 constexpr uint64_t kTacticalPingRateWindowMs = 2500;
 constexpr uint32_t kMaxTacticalPingsPerWindow = 6;
+}
 
+// Off by default: the feature hands out XP, and it has not been through a playtest. The accounting
+// below runs either way, so switching it on later never pays for the time it was off.
 Console::Setting bEnableLateJoinCatchUpXp{
     "Gameplay:bEnableLateJoinCatchUpXp",
-    "Grants bounded catch-up XP to players joining an ongoing RFAB co-op session",
-    true};
-}
+    "Pays a (re)joining player the shared RFAB XP the party earned while they were away, up to 25000",
+    false};
+
+// Off by default: only the game can show how many souls each player ends up with.
+Console::Setting bEnableSharedDragonSouls{
+    "Gameplay:bEnableSharedDragonSouls",
+    "Gives +1 dragon soul to party members who were out of range when the party killed a dragon",
+    false};
 
 RfabProgressionService::RfabProgressionService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
     : m_world(aWorld)
@@ -87,6 +95,8 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
             broadcast.XpDelta = outcome.AppliedDelta;
             broadcast.AuthoritativeTotalXp = outcome.AuthoritativeTotalXp;
             GameServer::Get()->SendToPlayers(broadcast, pSender);
+            // A book is read once per world: a late joiner gets it marked as read without its XP.
+            CreditConnectedPlayers(outcome.AppliedDelta, outcome.AuthoritativeTotalXp);
         }
         else if (outcome.DuplicateRebateDelta < 0)
         {
@@ -95,36 +105,6 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
             rebate.EpochId = currentEpoch;
             rebate.SourceKey = pkt.SourceKey;
             rebate.BookId = pkt.BookId;
-            rebate.XpDelta = outcome.DuplicateRebateDelta;
-            rebate.AuthoritativeTotalXp = outcome.AuthoritativeTotalXp;
-            pSender->Send(rebate);
-        }
-        break;
-    }
-
-    case SyncRfabProgressionEvent::EventKind::LedgerXpGrant:
-    {
-        const int32_t clampedXp = std::clamp(pkt.XpDelta, 0, kMaxSingleXpGrant);
-        if (clampedXp <= 0)
-            return;
-
-        const auto outcome = m_ledger.TryGrantXp(sourceKey, clampedXp);
-        if (outcome.Accepted)
-        {
-            NotifyRfabProgressionEvent broadcast{};
-            broadcast.Kind = NotifyRfabProgressionEvent::EventKind::LedgerXpGrant;
-            broadcast.EpochId = currentEpoch;
-            broadcast.SourceKey = pkt.SourceKey;
-            broadcast.XpDelta = outcome.AppliedDelta;
-            broadcast.AuthoritativeTotalXp = outcome.AuthoritativeTotalXp;
-            GameServer::Get()->SendToPlayers(broadcast, pSender);
-        }
-        else if (outcome.DuplicateRebateDelta < 0)
-        {
-            NotifyRfabProgressionEvent rebate{};
-            rebate.Kind = NotifyRfabProgressionEvent::EventKind::LedgerXpRebate;
-            rebate.EpochId = currentEpoch;
-            rebate.SourceKey = pkt.SourceKey;
             rebate.XpDelta = outcome.DuplicateRebateDelta;
             rebate.AuthoritativeTotalXp = outcome.AuthoritativeTotalXp;
             pSender->Send(rebate);
@@ -220,7 +200,7 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
                 break;
 
             const bool locked = (pkt.GlobalValue >= 0.5f);
-            m_ledger.SetBossEncounterLocked(bossServerId, locked);
+            m_ledger.SetBossEncounterLocked(bossServerId, locked, pSender->GetId());
         }
         else if (sourceKey == "arena_unlock" && pkt.BookId)
         {
@@ -240,71 +220,6 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
                     pOther->Send(broadcast);
             }
         }
-        break;
-    }
-
-    case SyncRfabProgressionEvent::EventKind::DragonSoulSync:
-    {
-        const std::string dragonKey = !sourceKey.empty()
-            ? sourceKey
-            : RfabCoopProgression::DragonSoulLedger::MakeDragonKey(pkt.BookId, static_cast<uint32_t>(pkt.XpDelta));
-        if (dragonKey.empty())
-            break;
-
-        std::vector<uint32_t> eligiblePeers;
-        auto& partyService = m_world.GetPartyService();
-        if (const auto* pParty = partyService.GetPlayerParty(pSender))
-        {
-            for (Player* pMember : pParty->Members)
-            {
-                if (pMember && pMember != pSender)
-                    eligiblePeers.push_back(pMember->GetId());
-            }
-        }
-        else
-        {
-            for (Player* pOther : m_world.GetPlayerManager())
-            {
-                if (pOther && pOther != pSender)
-                    eligiblePeers.push_back(pOther->GetId());
-            }
-        }
-
-        const auto award = m_ledger.GetDragonSoulLedger().RecordDragonKill(
-            dragonKey, pSender->GetId(), eligiblePeers, false);
-        if (award.NewlyAwardedPlayerIds.empty())
-            break;
-
-        NotifyRfabProgressionEvent soulGrant{};
-        soulGrant.Kind = NotifyRfabProgressionEvent::EventKind::DragonSoulSync;
-        soulGrant.EpochId = currentEpoch;
-        soulGrant.SourceKey = String(dragonKey.c_str());
-        soulGrant.BookId = pkt.BookId;
-        soulGrant.XpDelta = 1; // +1 Dragon Soul per unique slain dragon
-        soulGrant.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
-
-        for (uint32_t peerId : award.NewlyAwardedPlayerIds)
-        {
-            if (Player* pPeer = m_world.GetPlayerManager().GetById(peerId))
-                pPeer->Send(soulGrant);
-        }
-        break;
-    }
-
-    case SyncRfabProgressionEvent::EventKind::WordWallSync:
-    {
-        if (!m_ledger.GetWordWallLedger().RecordWordLearned(pkt.BookId))
-            break;
-
-        NotifyRfabProgressionEvent wordBroadcast{};
-        wordBroadcast.Kind = NotifyRfabProgressionEvent::EventKind::WordWallSync;
-        wordBroadcast.EpochId = currentEpoch;
-        wordBroadcast.SourceKey = pkt.SourceKey;
-        wordBroadcast.EditorId = pkt.EditorId;
-        wordBroadcast.BookId = pkt.BookId;
-        wordBroadcast.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
-        if (GameServer::Get())
-            GameServer::Get()->SendToPlayers(wordBroadcast, pSender);
         break;
     }
 
@@ -397,6 +312,15 @@ void RfabProgressionService::OnSyncProgressionEvent(const PacketEvent<SyncRfabPr
         }
         break;
     }
+
+    default:
+        // Reserved kinds and anything a newer client may send. Nothing here is acted on:
+        //  - LedgerXpGrant (the zero default of the message): no client has ever sent a keyed XP
+        //    grant; RFAB XP is shared by SyncRfabExperienceRequest (OnSharedRfabXpRelayed).
+        //  - DragonSoulSync: a 4.1.0 client reports every dead dragon it simulates, a corpse it
+        //    walked up to included; the server sees the death itself (OnDragonSlain).
+        //  - WordWallSync: sharing Words of Power was never wired to a client (M4).
+        break;
     }
 }
 
@@ -505,17 +429,6 @@ void RfabProgressionService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexce
         pNewPlayer->Send(bossSync);
     }
 
-    // Sync already-discovered Words of Power so late joiners stay synchronized on shouts.
-    for (const auto& wordId : m_ledger.GetWordWallLedger().GetLearnedWords())
-    {
-        NotifyRfabProgressionEvent wordSync{};
-        wordSync.Kind = NotifyRfabProgressionEvent::EventKind::WordWallSync;
-        wordSync.EpochId = currentEpoch;
-        wordSync.BookId = wordId;
-        wordSync.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
-        pNewPlayer->Send(wordSync);
-    }
-
     // Send Host's RFAB_StartMenu Difficulty & Cursed state for handshake validation.
     if (m_hostDifficultyState.IsValid())
     {
@@ -529,15 +442,13 @@ void RfabProgressionService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexce
         pNewPlayer->Send(diffSync);
     }
 
-    // Bounded one-time catch-up XP for friends joining an ongoing session that already earned shared XP.
-    if (m_ledger.GetTotalSharedXp() == 0)
+    // Catch-up XP: what the party earned while this player was away, counted per persistent
+    // identity. A reconnect, a second join event or a server restart finds the identity level with
+    // the party and pays nothing (the tracker this replaces was keyed by the connection id).
     {
-        m_lateJoinCatchUp.MarkAlreadySyncedAtSessionStart(pNewPlayer->GetId());
-    }
-    else
-    {
-        const auto catchUp = m_lateJoinCatchUp.EvaluateAndMark(
-            pNewPlayer->GetId(), m_ledger.GetTotalSharedXp(), bEnableLateJoinCatchUpXp);
+        const std::string identityKey = SaveSnapshotService::GetPlayerIdentityKey(pNewPlayer);
+        const auto catchUp = m_ledger.GetXpCredits().EvaluateJoin(
+            identityKey, m_ledger.GetTotalSharedXp(), bEnableLateJoinCatchUpXp);
         if (catchUp.ShouldGrant)
         {
             NotifyRfabProgressionEvent catchUpPkt{};
@@ -547,11 +458,96 @@ void RfabProgressionService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexce
             catchUpPkt.XpDelta = catchUp.GrantXpDelta;
             catchUpPkt.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
             pNewPlayer->Send(catchUpPkt);
+            spdlog::info(
+                "[RFAB Progression] Catch-up XP +{} for '{}' ({} forfeited above the cap)",
+                catchUp.GrantXpDelta, identityKey, catchUp.ForfeitedXp);
         }
     }
 
     // Sync authoritative Host-controlled Co-Op Ally Protection («Единство в битве») state & Host ID.
     SendAllyProtectionStateToPlayer(pNewPlayer, false);
+}
+
+void RfabProgressionService::OnSharedRfabXpRelayed(const uint32_t aBaseXp) noexcept
+{
+    // The relay carries an amount and no source, so nothing can be deduplicated here: the party
+    // total grows by what was relayed, and everyone connected holds it (the sender earned it, the
+    // others were sent it). Only a player who is away misses it.
+    const auto clampedXp = static_cast<int32_t>(std::min<uint32_t>(aBaseXp, static_cast<uint32_t>(kMaxSingleXpGrant)));
+    const auto outcome = m_ledger.TryGrantXp({}, clampedXp);
+    if (outcome.Accepted)
+        CreditConnectedPlayers(outcome.AppliedDelta, outcome.AuthoritativeTotalXp);
+}
+
+void RfabProgressionService::OnDragonSlain(const entt::entity aDragon, Player* apKiller) noexcept
+{
+    if (!apKiller || !m_world.valid(aDragon))
+        return;
+
+    GameId dragonFormId{};
+    if (const auto* pFormId = m_world.try_get<FormIdComponent>(aDragon))
+        dragonFormId = pFormId->Id;
+    const std::string dragonKey =
+        RfabCoopProgression::DragonSoulLedger::MakeDragonKey(dragonFormId, World::ToInteger(aDragon));
+    if (dragonKey.empty())
+        return;
+
+    // Everyone who has the dragon loaded absorbs its soul the way the game always did: the dragon's
+    // own script waits for that client's player to walk up to the corpse (dragonActorSCRIPT,
+    // state deadAndWaiting). The shared soul is for party members who were somewhere else, and
+    // without the dragon's cell nobody can be told apart.
+    std::vector<Player*> absentMembers;
+    if (const auto* pDragonCell = m_world.try_get<CellIdComponent>(aDragon))
+    {
+        const auto consider = [&](Player* apMember) {
+            if (apMember && apMember != apKiller && !pDragonCell->IsInRange(apMember->GetCellComponent(), true))
+                absentMembers.push_back(apMember);
+        };
+
+        if (const auto* pParty = m_world.GetPartyService().GetPlayerParty(apKiller))
+        {
+            for (Player* pMember : pParty->Members)
+                consider(pMember);
+        }
+        else
+        {
+            for (Player* pOther : m_world.GetPlayerManager())
+                consider(pOther);
+        }
+    }
+
+    // The kill is recorded whether or not souls are shared (it is part of the checkpoint).
+    (void)m_ledger.GetDragonSoulLedger().RecordDragonKill(dragonKey, apKiller->GetId(), {}, false);
+
+    if (!bEnableSharedDragonSouls || absentMembers.empty())
+        return;
+
+    NotifyRfabProgressionEvent soulGrant{};
+    soulGrant.Kind = NotifyRfabProgressionEvent::EventKind::DragonSoulSync;
+    soulGrant.EpochId = m_world.GetSaveSnapshotService().GetCurrentWorldEpoch();
+    soulGrant.SourceKey = String(dragonKey.c_str());
+    soulGrant.BookId = dragonFormId;
+    soulGrant.XpDelta = 1; // souls to add
+    soulGrant.AuthoritativeTotalXp = m_ledger.GetTotalSharedXp();
+
+    for (Player* pAbsent : absentMembers)
+        pAbsent->Send(soulGrant);
+
+    spdlog::info("[RFAB Progression] Dragon {} slain by player {}: shared soul sent to {} absent party member(s)",
+                 dragonKey, apKiller->GetId(), absentMembers.size());
+}
+
+void RfabProgressionService::CreditConnectedPlayers(int32_t aXpDelta, int64_t aTotalAfterGrant) noexcept
+{
+    if (aXpDelta <= 0)
+        return;
+
+    // The sender granted the XP locally and everyone else receives the broadcast, so every
+    // connected player holds it now. Only players who are away are owed it later.
+    m_world.GetPlayerManager().ForEach([&](const Player* apConnected) {
+        m_ledger.GetXpCredits().CreditConnected(
+            SaveSnapshotService::GetPlayerIdentityKey(apConnected), aXpDelta, aTotalAfterGrant);
+    });
 }
 
 void RfabProgressionService::OnPlayerLeave(const PlayerLeaveEvent& acEvent) noexcept

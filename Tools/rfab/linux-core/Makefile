@@ -24,6 +24,10 @@ ifeq ($(SANITIZE),1)
   # (Code/core/src/Serialization.cpp:34). That is an upstream bug we cannot fix from
   # here and it would fail every sanitized run; our own code stays fully checked.
   VENDOR_SAN := -fno-sanitize=undefined
+  # TiltedCore's allocators (every TiltedPhoques::Vector, Map, String, Buffer) take their memory
+  # from mimalloc, whose blocks AddressSanitizer does not see on its own. MI_TRACK_ASAN makes
+  # mimalloc poison what it frees, so a use after free of such a container is reported.
+  MIMALLOC_SAN := -fsanitize=address -fno-omit-frame-pointer -DMI_TRACK_ASAN=1
 endif
 
 BUILD_DIR ?= $(REPO_ROOT)/build/linux-core$(BUILD_SUFFIX)
@@ -100,7 +104,19 @@ PORTABLE_TESTS := \
   $(REPO_ROOT)/Code/tests/rfab_v410_world_items.cpp \
   $(REPO_ROOT)/Code/tests/rfab_v410_compat_overlay.cpp \
   $(REPO_ROOT)/Code/tests/rfab_v411_stabilization_tests.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_phase3_adaptation_tests.cpp
+  $(REPO_ROOT)/Code/tests/rfab_v411_phase3_adaptation_tests.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_desync_detector.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_breadcrumbs.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_world_scoped_work.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_safe_fs.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_load_request.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_remote_view_decisions.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_lease_timing.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_unlock_memory.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_body_loot.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_quest_xp_order.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_personal_containers.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_early_take_replay.cpp
 
 CORE_SRCS     := $(filter-out %MimallocAllocator.cpp,$(wildcard $(TILTEDCORE)/Code/core/src/*.cpp)) \
                  $(TILTEDCORE)/Code/core/src/MimallocAllocator.cpp
@@ -141,7 +157,7 @@ $(MIMALLOC_OBJ): $(MIMALLOC)/src/static.c $(MAKEFILE_LIST)
 	@echo "  CC    mimalloc"
 	@# -U, not -D...=0: mimalloc guards the malloc interposer with #if defined(), so
 	@# defining it to zero switched the override ON and broke AddressSanitizer.
-	@$(CC) $(CFLAGS) -w -UMI_MALLOC_OVERRIDE -I$(MIMALLOC)/include -c $< -o $@
+	@$(CC) $(CFLAGS) $(MIMALLOC_SAN) -w -UMI_MALLOC_OVERRIDE -I$(MIMALLOC)/include -c $< -o $@
 
 define compile_rule
 $(call obj_of,$(1),$(2)): $(2) $(MAKEFILE_LIST)
@@ -153,7 +169,10 @@ endef
 $(foreach s,$(CORE_SRCS),$(eval $(call compile_rule,core,$(s),$(VENDOR_SAN))))
 $(foreach s,$(ENCODING_SRCS),$(eval $(call compile_rule,encoding,$(s),$(PCH))))
 $(foreach s,$(COMMON_SRCS),$(eval $(call compile_rule,common,$(s),$(PCH))))
-$(foreach s,$(PORTABLE_TESTS),$(eval $(call compile_rule,tests,$(s),$(PCH))))
+# The suites are compiled WITHOUT the encoding prefix header, exactly like the xmake TPTests
+# target: a suite that only compiles because EncodingPch.h was force-included builds here and
+# fails under MSVC (first Windows CI run: rfab_v411_phase3_adaptation_tests.cpp, 38 errors).
+$(foreach s,$(PORTABLE_TESTS),$(eval $(call compile_rule,tests,$(s),)))
 
 -include $(ALL_DEPS)
 

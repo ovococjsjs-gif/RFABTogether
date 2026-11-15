@@ -205,6 +205,29 @@ struct Token
     }
 };
 
+// What a poster records about the moment it posted world-scoped work (see GetPostStampAnyThread).
+struct PostStamp
+{
+    Token PostedIn{};
+    bool DuringWorldLoad{false};
+};
+
+// World-scoped work describes a change in the world the poster was living in: a hit, an item that
+// moved, a quest stage, always by form id. It means something only against the world both sides
+// last agreed on, and that agreement is replaced whenever a save is loaded. So such work is valid
+// only when it was posted after the last world load finished, in the session that is still alive:
+//   * posted before a load was committed   - the form ids belong to the world that was torn down
+//                                            (temporary ids are handed out again after a load);
+//   * posted while a load was in progress  - the engine restoring a save looks like gameplay to a
+//                                            hook (items added, effects applied, values set), but
+//                                            it is the new baseline, not a change to it.
+// Work posted while no session existed is not judged here (nothing to be stale against).
+[[nodiscard]] constexpr bool IsWorldWorkStillValid(const PostStamp& acStamp, bool aSessionStillCurrent,
+                                                   uint32_t aWorldGenerationNow) noexcept
+{
+    return aSessionStillCurrent && !acStamp.DuringWorldLoad && acStamp.PostedIn.World == aWorldGenerationNow;
+}
+
 struct Counters
 {
     uint32_t AuthenticatedWithoutTransport{0};
@@ -518,6 +541,18 @@ public:
     {
         return Token::Unpack(m_publishedToken.load(std::memory_order_acquire));
     }
+    // The token and the loading flag for world-scoped work, read so that a post racing with a world
+    // load begin can never look like work of the new world: the token is read FIRST and the flag
+    // second, while PublishToken() raises the flag BEFORE it stores the new token. A poster that
+    // already sees the new world generation therefore also sees "loading"; one that sees the old
+    // generation is stale whatever the flag says.
+    [[nodiscard]] PostStamp GetPostStampAnyThread() const noexcept
+    {
+        PostStamp stamp;
+        stamp.PostedIn = Token::Unpack(m_publishedToken.load(std::memory_order_seq_cst));
+        stamp.DuringWorldLoad = m_publishedWorldLoading.load(std::memory_order_seq_cst);
+        return stamp;
+    }
     // True from the first world load begin until its end/cancel, already while the teardown is being
     // delivered (the machine changes state before dispatch), so every gate closes before any teardown.
     [[nodiscard]] bool IsWorldLoadingAnyThread() const noexcept
@@ -528,6 +563,11 @@ public:
     // ---- staleness checks (lifecycle thread) ----
     [[nodiscard]] bool IsStillCurrentSession(Token aToken) const noexcept { return m_machine.IsCurrentSession(aToken); }
     [[nodiscard]] bool IsStillCurrentWorld(Token aToken) const noexcept { return m_machine.IsCurrentWorld(aToken); }
+    // See IsWorldWorkStillValid above. Asked when the work is about to run.
+    [[nodiscard]] bool IsWorldWorkStillValid(const PostStamp& acStamp) const noexcept
+    {
+        return Session::IsWorldWorkStillValid(acStamp, m_machine.IsCurrentSession(acStamp.PostedIn), m_machine.GetWorldGeneration());
+    }
 
 private:
     template <class TInput> void Feed(TInput&& aInput) noexcept
@@ -582,8 +622,15 @@ private:
 
     void PublishToken() noexcept
     {
-        m_publishedToken.store(m_machine.GetToken().Pack(), std::memory_order_release);
-        m_publishedWorldLoading.store(m_machine.IsWorldLoading(), std::memory_order_release);
+        // Order matters to GetPostStampAnyThread(): when a load begins, "loading" becomes visible
+        // before the new world generation does. When a load ends the generation does not change,
+        // so the order is irrelevant there.
+        const bool loading = m_machine.IsWorldLoading();
+        if (loading)
+            m_publishedWorldLoading.store(true, std::memory_order_seq_cst);
+        m_publishedToken.store(m_machine.GetToken().Pack(), std::memory_order_seq_cst);
+        if (!loading)
+            m_publishedWorldLoading.store(false, std::memory_order_seq_cst);
     }
 
     Machine m_machine{};

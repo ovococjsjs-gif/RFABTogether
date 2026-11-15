@@ -10,26 +10,36 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Every job runs its command through Tools/rfab/ci_run.sh, which turns a failure into
+# annotations (first compiler errors, failed assertions with their expansion) and a success
+# into one notice with the result line. The commands, and the list of static checks, live in
+# scripts on purpose: the GitHub App used for development cannot change this file.
+
 jobs:
+  static-checks:
+    # Everything that reads the sources instead of running them: hook discipline (engine
+    # threads only read snapshots and post), the wire contract (every message and event kind
+    # has a sender and a receiver), release invariants (version, submodule pins) and the
+    # SE 1.5.97 port audit. Each tool first proves its rules still catch their mistakes.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Static checks
+        run: ./Tools/rfab/ci_run.sh "static checks" ./Tools/rfab/run-static-checks.sh
+
   core-tests:
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Hook discipline (engine threads only read snapshots and post)
-        # Source rules for every engine hook, script-event sink and CEF handler: no registry,
-        # dispatcher, transport or non-RFAB_ANY_THREAD service call outside posted work. The
-        # self-test proves each rule still catches the mistake it exists for.
-        run: |
-          python3 Tools/rfab/check_hook_discipline.py --self-test
-          python3 Tools/rfab/check_hook_discipline.py --verbose
       - name: Cache third-party sources
         uses: actions/cache@v4
         with:
           path: build/deps
           key: core-deps-${{ hashFiles('Tools/rfab/run-core-tests.sh') }}
       - name: Build & run core tests
-        run: ./Tools/rfab/run-core-tests.sh
+        run: ./Tools/rfab/ci_run.sh "core tests" ./Tools/rfab/run-core-tests.sh
 
   core-tests-sanitized:
     # The same suites under AddressSanitizer + UndefinedBehaviorSanitizer. This is how
@@ -54,7 +64,7 @@ jobs:
           # few hundred sessions is exactly the one that reaches a player as "it
           # desynced and I could not reproduce it".
           RFAB_SOAK_SEEDS: '512'
-        run: ./Tools/rfab/run-core-tests.sh --asan
+        run: ./Tools/rfab/ci_run.sh "core tests (ASan + UBSan)" ./Tools/rfab/run-core-tests.sh --asan
 
   ui-build:
     # Proves the shipped CEF UI can be rebuilt from Code/skyrim_ui. The release
@@ -104,4 +114,4 @@ jobs:
           path: build/deps
           key: server-deps-${{ hashFiles('Tools/rfab/linux-server/run-server-tests.sh') }}
       - name: Build & run the in-process server
-        run: ./Tools/rfab/linux-server/run-server-tests.sh
+        run: ./Tools/rfab/ci_run.sh "server harness" ./Tools/rfab/linux-server/run-server-tests.sh

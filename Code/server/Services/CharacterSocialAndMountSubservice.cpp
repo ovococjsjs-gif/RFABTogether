@@ -22,6 +22,7 @@
 #include <Messages/SyncExperienceRequest.h>
 #include <Messages/SyncRfabExperienceRequest.h>
 #include <Services/InventoryService.h>
+#include <Services/RfabProgressionService.h>
 #include <Setting.h>
 #include <World.h>
 #include <common/CoopExperienceLedger.h>
@@ -34,6 +35,14 @@
 // kSharedRfabXp) so clients stop polling and broadcasting when the relay is switched off.
 Console::Setting bEnableXpSync{"Gameplay:bEnableXpSync", "Syncs combat XP within the party", true};
 Console::Setting bEnableRfabXpSync{"Gameplay:bEnableRfabXpSync", "Syncs RFAB XP gains within the party", true};
+
+// Off by default, which is the behaviour of 4.1.0: whoever mounts a horse takes over its
+// simulation. Switched on, a mount that a player is riding cannot be mounted, taken over or have
+// its saddlebag changed by another player until the ride ends.
+Console::Setting bEnableMountRideGuard{
+    "Gameplay:bEnableMountRideGuard",
+    "While a player rides a mount, other players cannot mount it, take over its simulation or change its saddlebag",
+    false};
 
 void CharacterService::OnFactionsChanges(const PacketEvent<RequestFactionsChanges>& acMessage) const noexcept
 {
@@ -68,15 +77,11 @@ void CharacterService::OnMountRequest(const PacketEvent<MountRequest>& acMessage
     if (pRiderOwner && pRiderOwner->GetOwner() != acMessage.pPlayer)
         return;
 
-    // Dismount (MountId == 0): release the rider's active mount lock immediately.
+    // No client sends a dismount (the end of a ride is read from the rider's animation stream and
+    // from the distance between rider and mount), but zero can only mean "not on a mount".
     if (message.MountId == 0)
     {
         m_mountGuard.ReleaseAllForPlayer(senderPlayerId);
-        NotifyMount notify;
-        notify.RiderId = message.RiderId;
-        notify.MountId = 0;
-        if (!GameServer::Get()->SendToPlayersInRange(notify, riderEntity, acMessage.GetSender()))
-            spdlog::error("{}: SendToPlayersInRange failed on dismount", __FUNCTION__);
         return;
     }
 
@@ -84,15 +89,23 @@ void CharacterService::OnMountRequest(const PacketEvent<MountRequest>& acMessage
     if (!m_world.valid(mountEntity))
         return;
 
-    // Reject hijacking a mount that another player is actively riding.
-    if (!m_mountGuard.TryAcquireRide(message.MountId, senderPlayerId, message.RiderId))
+    // The ride guard concerns players only. An NPC that the sender simulates mounts its horse the
+    // way it always did: recording it under the simulating player's id would overwrite that
+    // player's own ride and tie the horse to whoever happens to simulate the NPC.
+    const auto* pRiderChar = m_world.try_get<CharacterComponent>(riderEntity);
+    const bool riderIsPlayerCharacter = pRiderChar && pRiderChar->IsPlayer();
+    if (bEnableMountRideGuard && riderIsPlayerCharacter)
     {
-        spdlog::warn(
-            "[RFAB Mounts] Rejected mount hijack on {:X} by player {} (currently ridden by player {})",
-            message.MountId,
-            senderPlayerId,
-            m_mountGuard.GetActiveRiderPlayerId(message.MountId));
-        return;
+        if (IsMountHeldByOtherRider(message.MountId, acMessage.pPlayer))
+        {
+            spdlog::warn(
+                "[RFAB Mounts] Rejected mount request on {:X} by player {}: player {} is riding it",
+                message.MountId,
+                senderPlayerId,
+                m_mountGuard.GetActiveRiderPlayerId(message.MountId));
+            return;
+        }
+        (void)m_mountGuard.TryAcquireRide(message.MountId, senderPlayerId, message.RiderId);
     }
 
     if (auto* pMountOwner = m_world.try_get<OwnerComponent>(mountEntity))
@@ -118,6 +131,53 @@ void CharacterService::OnMountRequest(const PacketEvent<MountRequest>& acMessage
 
     if (!GameServer::Get()->SendToPlayersInRange(notify, mountEntity, acMessage.GetSender()))
         spdlog::error("{}: SendToPlayersInRange failed", __FUNCTION__);
+}
+
+void CharacterService::ReleaseMountRideIfOver(const uint32_t aMountServerId) const noexcept
+{
+    const auto ride = m_mountGuard.GetActiveRide(aMountServerId);
+    if (!ride)
+        return;
+
+    const auto mountEntity = static_cast<entt::entity>(aMountServerId);
+    const auto riderEntity = static_cast<entt::entity>(ride->RiderServerEntityId);
+
+    bool stillRiding = false;
+    if (m_world.valid(mountEntity) && m_world.valid(riderEntity))
+    {
+        const auto* pMountChar = m_world.try_get<CharacterComponent>(mountEntity);
+        const auto* pMountMove = m_world.try_get<MovementComponent>(mountEntity);
+        const auto* pMountCell = m_world.try_get<CellIdComponent>(mountEntity);
+        const auto* pRiderMove = m_world.try_get<MovementComponent>(riderEntity);
+        const auto* pRiderCell = m_world.try_get<CellIdComponent>(riderEntity);
+        const auto* pRiderOwner = m_world.try_get<OwnerComponent>(riderEntity);
+        const Player* pRiderPlayer = pRiderOwner ? pRiderOwner->GetOwner() : nullptr;
+
+        if (pMountChar && !pMountChar->IsDead() && pMountMove && pRiderMove && pMountCell && pRiderCell && pRiderPlayer &&
+            pRiderPlayer->GetId() == ride->RiderPlayerId)
+        {
+            const bool sameSpace = pMountCell->WorldSpaceId == pRiderCell->WorldSpaceId &&
+                                   (pMountCell->WorldSpaceId || pMountCell->Cell == pRiderCell->Cell);
+            const glm::vec3 apart = pMountMove->Position - pRiderMove->Position;
+            stillRiding = sameSpace && RfabWorldImmersion::MountOwnershipGuard::IsRiderStillAtMount(glm::dot(apart, apart));
+        }
+    }
+
+    if (!stillRiding)
+    {
+        spdlog::debug("[RFAB Mounts] Ride on {:X} by player {} is over; lock released", aMountServerId, ride->RiderPlayerId);
+        m_mountGuard.ReleaseMountEntity(aMountServerId);
+    }
+}
+
+bool CharacterService::IsMountHeldByOtherRider(const uint32_t aMountServerId, const Player* apChallenger) const noexcept
+{
+    if (!bEnableMountRideGuard)
+        return false;
+
+    ReleaseMountRideIfOver(aMountServerId);
+    const uint32_t riderPlayerId = m_mountGuard.GetActiveRiderPlayerId(aMountServerId);
+    return riderPlayerId != 0 && (!apChallenger || riderPlayerId != apChallenger->GetId());
 }
 
 void CharacterService::OnNewPackageRequest(const PacketEvent<NewPackageRequest>& acMessage) const noexcept
@@ -207,6 +267,9 @@ void CharacterService::OnSyncRfabExperienceRequest(const PacketEvent<SyncRfabExp
     const uint32_t experience = std::min(acMessage.Packet.Experience, CoopExperienceLedger::kMaxRfabXpDelta);
     if (experience == 0)
         return;
+
+    // The party total and who already holds it (late-join catch-up).
+    m_world.GetRfabProgressionService().OnSharedRfabXpRelayed(experience);
 
     NotifySyncRfabExperience notify;
     notify.Experience = experience;

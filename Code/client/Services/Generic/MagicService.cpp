@@ -581,10 +581,14 @@ void MagicService::OnNotifyAddTarget(const NotifyAddTarget& acMessage) noexcept
         }
     }
 
-    // Never redirect remote SlowTime effects onto the local PlayerCharacter: SlowTime mutates the
-    // global engine time scale and would freeze unrelated party peers in slow motion.
+    // This hack is here because slow time seems to be twice as slow when cast by an npc
     if (pEffect->IsSlowEffect())
-        return;
+    {
+        acMessage.CasterId && (pCaster = PlayerCharacter::Get());
+        spdlog::debug(
+            __FUNCTION__ ": hacking IsSlowEffect() targetId {:X}, casterId {:X}, magnitude {}, IsDualCasting {}", acMessage.TargetId, acMessage.CasterId, acMessage.Magnitude,
+            acMessage.IsDualCasting);
+    }
 
     MagicTarget::AddTargetData data{};
     data.pCaster = pCaster;
@@ -600,6 +604,10 @@ void MagicService::OnNotifyAddTarget(const NotifyAddTarget& acMessage) noexcept
 
     if (pEffect->IsVampireLordEffect())
         pActor->GetExtension()->GraphDescriptorHash = AnimationGraphDescriptor_VampireLordBehavior::m_key;
+
+    // This hack is here because slow time seems to be twice as slow when cast by an npc
+    if (pEffect->IsSlowEffect())
+        pActor = PlayerCharacter::Get();
 
     if (!pActor)
         return;

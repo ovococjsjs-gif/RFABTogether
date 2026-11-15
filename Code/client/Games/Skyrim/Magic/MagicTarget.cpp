@@ -1,4 +1,5 @@
 #include "MagicTarget.h"
+#include <CrashBreadcrumbs.h>
 
 #include <algorithm>
 #include <chrono>
@@ -240,8 +241,11 @@ bool MagicTarget::AddTargetData::ShouldSync()
     if (!pEffectItem || !pEffectItem->pEffectSetting || !pSpell)
         return false;
 
-    // SlowTime mutates the global engine time scale and must stay strictly local to the caster.
-    if (pEffectItem->IsSlowEffect())
+    // Constant-effect slow time abilities (e.g. Requiem/RFAB Evasion Quick Reflexes) are added and removed locally by
+    // each client's own scripts, so syncing them would leave allies permanently stuck in slow motion.
+    // Every other slow time (the shout, potions, timed perks) is shared, as in 4.1.0: time slows for the
+    // whole party, otherwise the caster would move through a world the others see at full speed.
+    if (pEffectItem->IsSlowEffect() && pSpell->IsConstantEffectSpell())
         return false;
 
     // Never sync player-cast `kScript` ActiveMagicEffects unless they are friendly non-SELF party support spells:
@@ -293,6 +297,7 @@ Sync::ConcentrationLimiter<64> s_concentrationSyncLimiter{};
 
 bool TP_MAKE_THISCALL(HookAddTarget, MagicTarget, MagicTarget::AddTargetData& arData)
 {
+    RFAB_HOOK_CRUMB("HookAddTarget");
     if (!World::IsCreated() || !World::IsConnectedCached())
         return TiltedPhoques::ThisCall(RealAddTarget, apThis, arData);
 
@@ -557,6 +562,7 @@ bool TP_MAKE_THISCALL(HookCheckAddEffectTargetData, MagicTarget::AddTargetData, 
 
 bool TP_MAKE_THISCALL(HookFindTargets, MagicCaster, float afEffectivenessMult, int32_t* aruiTargetCount, TESBoundObject* apSource, char abLoadCast, char abAdjust)
 {
+    RFAB_HOOK_CRUMB("HookFindTargets");
     bool enablePartyTeammateAuras = false;
     if (World::IsCreated() &&
         World::IsConnectedCached() &&

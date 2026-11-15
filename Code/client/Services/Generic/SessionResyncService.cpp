@@ -2,8 +2,14 @@
 
 #include <Services/SessionResyncService.h>
 
+#include <Actor.h>
+#include <Components.h>
+#include <CrashBreadcrumbs.h>
 #include <Events/UpdateEvent.h>
+#include <Forms/ActorValueInfo.h>
 #include <Forms/TESObjectCELL.h>
+#include <Games/ActorExtension.h>
+#include <Messages/ClientEntityDigest.h>
 #include <Messages/NotifyResyncComplete.h>
 #include <Messages/RequestResync.h>
 #include <PlayerCharacter.h>
@@ -16,7 +22,36 @@
 namespace
 {
 constexpr double kPollIntervalSec = 0.25;
+// The server confirms a difference when two reports at least four seconds apart show it.
+constexpr double kDigestIntervalSec = 5.0;
+
+// What this screen shows of a character that has a live actor here.
+void DescribeLiveActor(Actor& aActor, Session::EntityDigest::Facts& aFacts) noexcept
+{
+    using namespace Session::EntityDigest;
+
+    aFacts.Flags |= kFlagLive;
+    if (aActor.IsDead())
+        aFacts.Flags |= kFlagDead;
+    aFacts.HealthPct = HealthPercent(aActor.GetActorValue(ActorValueInfo::kHealth), aActor.GetActorPermanentValue(ActorValueInfo::kHealth));
+
+    // Equipment is compared for other players only: an NPC's outfit is put on by the engine here.
+    const ActorExtension* pExtension = aActor.GetExtension();
+    if (pExtension && pExtension->IsRemotePlayer())
+    {
+        aFacts.Flags |= kFlagPlayer;
+        EquipmentHasher hasher;
+        const Inventory worn = aActor.GetEquipment();
+        for (const auto& entry : worn.Entries)
+        {
+            if (entry.IsWorn())
+                hasher.Add(entry.BaseId.ModId, entry.BaseId.BaseId);
+        }
+        aFacts.EquipmentHash = hasher.Finish();
+        aFacts.Flags |= kFlagHasEquipment;
+    }
 }
+} // namespace
 
 SessionResyncService::SessionResyncService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport) noexcept
     : m_world(aWorld)
@@ -99,6 +134,11 @@ bool SessionResyncService::CanSendNow() const noexcept
     if (!m_transport.IsOnline() || !World::IsFeatureEnabled(Session::Feature::kSelfHealingResync))
         return false;
 
+    return IsWorldSettled();
+}
+
+bool SessionResyncService::IsWorldSettled() const noexcept
+{
     const auto& characters = m_world.GetCharacterService();
     if (characters.IsEngineWorldLoading() || characters.IsSavePurgeActive())
         return false;
@@ -109,8 +149,83 @@ bool SessionResyncService::CanSendNow() const noexcept
     return pPlayer && !pPlayer->IsStillLoading() && pPlayer->parentCell && pPlayer->parentCell->IsAttachedAndLoaded();
 }
 
+void SessionResyncService::SendEntityDigest() noexcept
+{
+    using namespace Session::EntityDigest;
+
+    // While the world loads, what is listed here and what the server expects are both in motion.
+    if (!m_transport.IsOnline() || !World::IsFeatureEnabled(Session::Feature::kDesyncDetector) || !IsWorldSettled())
+        return;
+
+    ClientEntityDigest message{};
+    message.Sequence = ++m_digestSequence;
+
+    const auto remoteView = m_world.view<RemoteComponent>();
+    for (const entt::entity entity : remoteView)
+    {
+        if (message.Entries.size() >= kMaxEntries)
+        {
+            message.Truncated = true;
+            break;
+        }
+
+        Facts facts{};
+        facts.ServerId = remoteView.get<RemoteComponent>(entity).Id;
+        if (const auto* pFormId = m_world.try_get<FormIdComponent>(entity))
+        {
+            if (Actor* pActor = Cast<Actor>(TESForm::GetById(pFormId->Id)))
+                DescribeLiveActor(*pActor, facts);
+        }
+        message.Entries.push_back(facts);
+    }
+
+    // The characters this client simulates: it is the source of their state, so only the fact that
+    // it simulates them is reported.
+    const auto localView = m_world.view<LocalComponent>();
+    for (const entt::entity entity : localView)
+    {
+        if (message.Entries.size() >= kMaxEntries)
+        {
+            message.Truncated = true;
+            break;
+        }
+
+        Facts facts{};
+        facts.ServerId = localView.get<LocalComponent>(entity).Id;
+        facts.Flags |= kFlagOwnedByReporter;
+
+        // This client's own player also says what it carries: the server keeps a copy of that
+        // inventory and restores from it at a rollback, so the two had better be the same.
+        if (const auto* pFormId = m_world.try_get<FormIdComponent>(entity); pFormId && pFormId->Id == 0x14)
+        {
+            if (PlayerCharacter* pPlayer = PlayerCharacter::Get())
+            {
+                InventoryHasher hasher;
+                const Inventory carried = pPlayer->GetInventory();
+                for (const auto& entry : carried.Entries)
+                    hasher.Add(entry.BaseId.ModId, entry.BaseId.BaseId, entry.Count);
+                const InventoryHasher::Summary summary = hasher.Finish();
+                facts.InventoryHash = summary.Hash;
+                facts.InventoryKinds = summary.Kinds;
+                facts.InventoryItems = summary.Items;
+                facts.Flags |= kFlagHasInventory;
+            }
+        }
+        message.Entries.push_back(facts);
+    }
+
+    m_transport.Send(message);
+}
+
 void SessionResyncService::OnUpdate(const UpdateEvent& acEvent) noexcept
 {
+    m_digestAccumulatorSec += acEvent.Delta;
+    if (m_digestAccumulatorSec >= kDigestIntervalSec)
+    {
+        m_digestAccumulatorSec = 0.0;
+        SendEntityDigest();
+    }
+
     m_pollAccumulatorSec += acEvent.Delta;
     if (m_pollAccumulatorSec < kPollIntervalSec)
         return;
@@ -159,11 +274,14 @@ void SessionResyncService::OnResyncComplete(const NotifyResyncComplete& acMessag
 
 void SessionResyncService::OnSessionBegin(const Session::Transition&) noexcept
 {
+    RFAB_EVENT_CRUMB("session-begin");
     m_pollAccumulatorSec = 0.0;
+    m_digestAccumulatorSec = 0.0;
 }
 
 void SessionResyncService::OnSessionEnd(const Session::Transition&) noexcept
 {
+    RFAB_EVENT_CRUMB("session-end");
     LogStats("session end");
     m_ledger.Reset();
     m_outgoing.clear();
@@ -174,8 +292,14 @@ void SessionResyncService::OnWorldLoadBegin(const Session::Transition& acTransit
     // World packets queued during the pause are discarded with the reload and spawns arriving during
     // the load are dropped: ask for the whole session once the load is over (sent only when the player
     // stands in a loaded cell again). Offline loads have no session to resync.
+    RFAB_EVENT_CRUMB("world-load-begin", acTransition.Online ? 1u : 0u);
     if (acTransition.Online)
         NoteWorldReloadStarted();
+}
+
+void SessionResyncService::OnWorldLoadEnd(const Session::Transition& acTransition) noexcept
+{
+    RFAB_EVENT_CRUMB("world-load-end", acTransition.Online ? 1u : 0u);
 }
 
 void SessionResyncService::LogStats(const char* acpWhen) const noexcept

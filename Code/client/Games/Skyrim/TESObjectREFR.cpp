@@ -1,4 +1,5 @@
 #include <TiltedOnlinePCH.h>
+#include <CrashBreadcrumbs.h>
 
 #include <common/CoopInventoryDiff.h>
 #include <common/CoopWorldStabilizer.h>
@@ -1245,16 +1246,15 @@ bool TESObjectREFR::PlayAnimationAndWait(BSFixedString* apAnimation, BSFixedStri
 
     PAPYRUS_FUNCTION(bool, ObjectReference, PlayAnimationAndWait, BSFixedString*, BSFixedString*);
 
-    s_cancelAnimationWaitEvent = true;
-    bool result = s_pPlayAnimationAndWait(this, apAnimation, apEventName);
-    s_cancelAnimationWaitEvent = false;
-    return result;
+    ScopedTlsValue<bool> applyingRemoteAnimation(s_cancelAnimationWaitEvent, true);
+    return s_pPlayAnimationAndWait(this, apAnimation, apEventName);
 }
 
 #define OBJECT_ANIM_SYNC 1
 
 bool TP_MAKE_THISCALL(HookPlayAnimationAndWait, void, uint32_t auiStackID, TESObjectREFR* apSelf, BSFixedString* apAnimation, BSFixedString* apEventName)
 {
+    RFAB_HOOK_CRUMB("HookPlayAnimationAndWait", 0, apSelf ? apSelf->formID : 0);
     const char* animStr = apAnimation ? apAnimation->AsAscii() : nullptr;
     const char* evtStr = apEventName ? apEventName->AsAscii() : nullptr;
     spdlog::debug("Animation: {}, EventName: {}", animStr ? animStr : "<null>", evtStr ? evtStr : "<null>");
@@ -1285,10 +1285,8 @@ bool TESObjectREFR::PlayAnimation(BSFixedString* apEventName) noexcept
 
     PAPYRUS_FUNCTION(bool, ObjectReference, PlayAnimation, BSFixedString*);
 
-    s_cancelAnimationEvent = true;
-    bool result = s_pPlayAnimation(this, apEventName);
-    s_cancelAnimationEvent = false;
-    return result;
+    ScopedTlsValue<bool> applyingRemoteAnimation(s_cancelAnimationEvent, true);
+    return s_pPlayAnimation(this, apEventName);
 }
 
 bool TESObjectREFR::SendAnimationEvent(BSFixedString* apEventName) noexcept
@@ -1298,6 +1296,7 @@ bool TESObjectREFR::SendAnimationEvent(BSFixedString* apEventName) noexcept
 
 bool TP_MAKE_THISCALL(HookPlayAnimation, void, uint32_t auiStackID, TESObjectREFR* apSelf, BSFixedString* apEventName)
 {
+    RFAB_HOOK_CRUMB("HookPlayAnimation", 0, apSelf ? apSelf->formID : 0);
     const char* animStr = apEventName ? apEventName->AsAscii() : nullptr;
     spdlog::debug("EventName: {}", animStr ? animStr : "<null>");
 
@@ -1376,6 +1375,7 @@ bool ShouldAutoUnlockCoopArenaBarrier(TESObjectREFR* apDoor, Actor* apActivator)
 
 bool TP_MAKE_THISCALL(HookActivate, TESObjectREFR, TESObjectREFR* apActivator, uint8_t aUnk1, TESBoundObject* apObjectToGet, int32_t aCount, char aDefaultProcessing)
 {
+    RFAB_HOOK_CRUMB("HookActivate", apThis ? apThis->formID : 0, apActivator ? apActivator->formID : 0);
     if (!apThis)
         return false;
 
@@ -1484,7 +1484,7 @@ bool TP_MAKE_THISCALL(HookActivate, TESObjectREFR, TESObjectREFR* apActivator, u
             if (World::IsMainThread())
                 checkUnlockedAndEmit();
             else
-                World::Get().GetRunner().Queue(std::move(checkUnlockedAndEmit));
+                World::Get().GetRunner().QueueForThisWorld(std::move(checkUnlockedAndEmit));
         }
 
         if (CoopWorldStabilizer::ShouldBroadcastObjectActivation(isTargetActor, isTempTarget, isTeleportLoadDoor))
@@ -1561,6 +1561,7 @@ void MarkSharedCoopKeyOrClawAsQuestItem(TESObjectREFR* apOwner, TESForm* apItem,
 
 void TP_MAKE_THISCALL(HookAddInventoryItem, TESObjectREFR, TESBoundObject* apItem, ExtraDataList* apExtraData, int32_t aCount, TESObjectREFR* apOldOwner)
 {
+    RFAB_HOOK_CRUMB("HookAddInventoryItem", apThis ? apThis->formID : 0, apItem ? apItem->formID : 0);
     if (World::IsCreated() &&
         World::IsConnectedCached() &&
         !ScopedInventoryOverride::IsOverriden() &&
@@ -1670,6 +1671,7 @@ void TP_MAKE_THISCALL(HookRotateZ, TESObjectREFR, float aAngle)
 
 bool TP_MAKE_THISCALL(HookInternalMoveTo, TESObjectREFR, uint32_t* apTargetHandle, TESObjectCELL* apTargetCell, TESWorldSpace* apTargetWorldSpace, const NiPoint3& acPosition, const NiPoint3& acRotation)
 {
+    RFAB_HOOK_CRUMB("HookInternalMoveTo", apThis ? apThis->formID : 0);
     if (!apThis)
         return false;
 
@@ -1706,6 +1708,7 @@ bool TP_MAKE_THISCALL(HookInternalMoveTo, TESObjectREFR, uint32_t* apTargetHandl
 
 void TP_MAKE_THISCALL(HookLockChange, TESObjectREFR)
 {
+    RFAB_HOOK_CRUMB("HookLockChange", apThis ? apThis->formID : 0);
     if (!apThis)
         return;
 

@@ -46,9 +46,11 @@ public:
         std::unordered_map<std::string, float> SyncedGlobals{};
         std::vector<AmbushRecord> RecentAmbushes{};
         std::unordered_map<uint32_t, bool> BossGhostStates{};
-        std::unordered_set<uint32_t> LockedBossEntities{};
         std::vector<std::string> SlainDragonKeys{};
-        std::vector<GameId> LearnedWordWalls{};
+        // Shared XP already held per persistent player identity (late-join catch-up, M1). Part of
+        // the snapshot so that a rollback restores it together with TotalSharedXp.
+        std::unordered_map<std::string, int64_t> SharedXpCredits{};
+        int64_t SharedXpCreditBaseline{};
     };
 
     struct XpGrantOutcome
@@ -218,9 +220,6 @@ public:
         if (aServerEntityId == 0)
             return false;
 
-        if (aIsGhost)
-            m_lockedBossEntities.insert(aServerEntityId);
-
         const auto it = m_bossGhostStates.find(aServerEntityId);
         const bool current = (it != m_bossGhostStates.end()) ? it->second : false;
         if (current == aIsGhost)
@@ -234,25 +233,31 @@ public:
         return true;
     }
 
-    void SetBossEncounterLocked(uint32_t aServerEntityId, bool aLocked) noexcept
+    // The lock says "this boss is in a fight that `aOwnerPlayerId` simulates". It is the owner's
+    // statement and it is void as soon as someone else simulates the boss: a lock left behind by a
+    // previous owner used to pin the boss for the rest of its life.
+    void SetBossEncounterLocked(uint32_t aServerEntityId, bool aLocked, uint32_t aOwnerPlayerId) noexcept
     {
         if (aServerEntityId == 0)
             return;
         if (aLocked)
-            m_lockedBossEntities.insert(aServerEntityId);
+            m_bossLockOwners[aServerEntityId] = aOwnerPlayerId;
         else
-            m_lockedBossEntities.erase(aServerEntityId);
+            m_bossLockOwners.erase(aServerEntityId);
     }
 
-    [[nodiscard]] bool IsBossEncounterLocked(uint32_t aServerEntityId) const noexcept
+    [[nodiscard]] bool IsBossEncounterLocked(uint32_t aServerEntityId, uint32_t aCurrentOwnerPlayerId) const noexcept
     {
-        return m_lockedBossEntities.contains(aServerEntityId) || IsBossGhost(aServerEntityId);
+        if (IsBossGhost(aServerEntityId))
+            return true; // an invulnerable phase is in progress
+        const auto it = m_bossLockOwners.find(aServerEntityId);
+        return it != m_bossLockOwners.end() && it->second == aCurrentOwnerPlayerId;
     }
 
     void ClearBossGhostState(uint32_t aServerEntityId) noexcept
     {
         m_bossGhostStates.erase(aServerEntityId);
-        m_lockedBossEntities.erase(aServerEntityId);
+        m_bossLockOwners.erase(aServerEntityId);
     }
 
     [[nodiscard]] bool IsBossGhost(uint32_t aServerEntityId) const noexcept
@@ -263,8 +268,6 @@ public:
 
     [[nodiscard]] RfabCoopProgression::DragonSoulLedger& GetDragonSoulLedger() noexcept { return m_dragonSouls; }
     [[nodiscard]] const RfabCoopProgression::DragonSoulLedger& GetDragonSoulLedger() const noexcept { return m_dragonSouls; }
-    [[nodiscard]] RfabCoopProgression::WordWallLedger& GetWordWallLedger() noexcept { return m_wordWalls; }
-    [[nodiscard]] const RfabCoopProgression::WordWallLedger& GetWordWallLedger() const noexcept { return m_wordWalls; }
 
     [[nodiscard]] Snapshot CaptureSnapshot() const
     {
@@ -275,9 +278,9 @@ public:
             m_syncedGlobals,
             m_recentAmbushes,
             m_bossGhostStates,
-            m_lockedBossEntities,
             m_dragonSouls.GetOrderedDragonKeys(),
-            m_wordWalls.GetLearnedWords(),
+            m_xpCredits.GetCredits(),
+            m_xpCredits.GetBaselineXp(),
         };
     }
 
@@ -289,12 +292,16 @@ public:
         m_syncedGlobals = acSnapshot.SyncedGlobals;
         m_recentAmbushes = acSnapshot.RecentAmbushes;
         m_bossGhostStates = acSnapshot.BossGhostStates;
-        m_lockedBossEntities = acSnapshot.LockedBossEntities;
+        // Encounter locks are not part of a snapshot: after a rollback every client reloads its
+        // save and the owners report the fights that are really going on.
+        m_bossLockOwners.clear();
         m_dragonSouls.RestoreDragonKeys(acSnapshot.SlainDragonKeys);
-        m_wordWalls.RestoreWords(acSnapshot.LearnedWordWalls);
+        m_xpCredits.Restore(acSnapshot.SharedXpCredits, acSnapshot.SharedXpCreditBaseline);
     }
 
     [[nodiscard]] int64_t GetTotalSharedXp() const noexcept { return m_totalSharedXp; }
+    [[nodiscard]] RfabCoopProgression::SharedXpCreditLedger& GetXpCredits() noexcept { return m_xpCredits; }
+    [[nodiscard]] const RfabCoopProgression::SharedXpCreditLedger& GetXpCredits() const noexcept { return m_xpCredits; }
     [[nodiscard]] const std::vector<GameId>& GetReadBooks() const noexcept { return m_readBooks; }
     [[nodiscard]] const std::unordered_map<std::string, float>& GetSyncedGlobals() const noexcept { return m_syncedGlobals; }
     [[nodiscard]] const std::unordered_map<uint32_t, bool>& GetBossGhostStates() const noexcept { return m_bossGhostStates; }
@@ -316,9 +323,9 @@ private:
     std::unordered_map<std::string, float> m_syncedGlobals{};
     std::vector<AmbushRecord> m_recentAmbushes{};
     std::unordered_map<uint32_t, bool> m_bossGhostStates{};
-    std::unordered_set<uint32_t> m_lockedBossEntities{};
+    std::unordered_map<uint32_t, uint32_t> m_bossLockOwners{}; // boss server id -> owner that reported the fight
     RfabCoopProgression::DragonSoulLedger m_dragonSouls{};
-    RfabCoopProgression::WordWallLedger m_wordWalls{};
+    RfabCoopProgression::SharedXpCreditLedger m_xpCredits{};
 };
 
 class RfabProgressionService
@@ -339,12 +346,23 @@ private:
     void OnSyncProgressionEvent(const PacketEvent<SyncRfabProgressionEvent>& acMessage) noexcept;
     void OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept;
     void OnPlayerLeave(const PlayerLeaveEvent& acEvent) noexcept;
+public:
+    // RFAB XP was relayed to the party (CharacterService::OnSyncRfabExperienceRequest). This is how
+    // shared XP really travels, so it is what the party total and the per-player credits count.
+    void OnSharedRfabXpRelayed(uint32_t aBaseXp) noexcept;
+
+    // A dragon went from alive to dead on the server (ActorValueService, the one place where that
+    // transition is decided). `apKiller` is the player whose death report was accepted.
+    void OnDragonSlain(entt::entity aDragon, Player* apKiller) noexcept;
+
+private:
+    // Records that every connected player now holds `aXpDelta` more shared XP.
+    void CreditConnectedPlayers(int32_t aXpDelta, int64_t aTotalAfterGrant) noexcept;
 
     World& m_world;
     RfabProgressionLedger m_ledger;
     bool m_allyProtectionEnabled{true};
     RfabCoopProgression::DifficultyHandshakeState m_hostDifficultyState{};
-    RfabCoopProgression::LateJoinCatchUpTracker m_lateJoinCatchUp{};
 
     struct PingRateBucket
     {

@@ -4,6 +4,7 @@
 #include <common/CoopPacketSafety.h>
 #include <common/CoopWorldView.h>
 #include <common/RfabModpackCompat.h>
+#include <common/Compat/SafeFs.h>
 #include <Components.h>
 #include <Events/PlayerLeaveEvent.h>
 #include <Events/UpdateEvent.h>
@@ -57,6 +58,9 @@ Console::Setting uPostCombatAutosaveInterval{
 // id, count, dropper, entry, cell, worldspace, position, rotation. Drop cookies are not stored: they
 // only pair a live echo (WorldItems::Registry::Import clears them anyway).
 constexpr uint32_t kWorldItemsChunkVersion = 1u;
+constexpr uint32_t kSharedXpCreditsChunkVersion = 1u;
+// Upper bound for an XP amount read from disk: a corrupted varint must not become a 2^63 credit.
+constexpr uint64_t kMaxPersistedSharedXp = 1000000000000ULL;
 
 void WriteWorldItemRecords(TiltedPhoques::Buffer::Writer& aWriter, const std::vector<WorldItemRecord>& acRecords)
 {
@@ -176,13 +180,10 @@ void SerializeProgressionSnapshot(TiltedPhoques::Buffer::Writer& aWriter, const 
         Serialization::WriteFloat(aWriter, pEntry->second);
     }
 
-    const auto bossGhostStates = SortedEntries(acProg.BossGhostStates);
-    Serialization::WriteVarInt(aWriter, bossGhostStates.size());
-    for (const auto* pEntry : bossGhostStates)
-    {
-        Serialization::WriteVarInt(aWriter, pEntry->first);
-        Serialization::WriteBool(aWriter, pEntry->second);
-    }
+    // Ghost phases are keyed by server entity ids, and those mean nothing to the next process:
+    // after a restart the same number belongs to whatever registered first. The list keeps its
+    // place in the layout and is written empty (M18).
+    Serialization::WriteVarInt(aWriter, 0u);
 }
 
 void DeserializeProgressionSnapshot(TiltedPhoques::Buffer::Reader& aReader, RfabProgressionLedger::Snapshot& aOutProg)
@@ -217,12 +218,14 @@ void DeserializeProgressionSnapshot(TiltedPhoques::Buffer::Reader& aReader, Rfab
         aOutProg.SyncedGlobals[edid] = val;
     }
 
+    // A checkpoint of an earlier build may carry ghost phases keyed by the server entity ids of the
+    // process that wrote it. They are read past: restoring them made whichever creature received
+    // the same number in this process invulnerable on every client (M18).
     const uint64_t ghostCount = std::min<uint64_t>(Serialization::ReadVarInt(aReader), 65536ULL);
     for (uint64_t i = 0; i < ghostCount; ++i)
     {
-        const uint32_t id = static_cast<uint32_t>(Serialization::ReadVarInt(aReader));
-        const bool ghost = Serialization::ReadBool(aReader);
-        aOutProg.BossGhostStates[id] = ghost;
+        (void)Serialization::ReadVarInt(aReader);
+        (void)Serialization::ReadBool(aReader);
     }
 }
 
@@ -281,9 +284,14 @@ std::string MakePlayerIdentityKey(const Player* apPlayer)
 }
 } // namespace
 
+std::string SaveSnapshotService::GetPlayerIdentityKey(const Player* apPlayer)
+{
+    return MakePlayerIdentityKey(apPlayer);
+}
+
 std::filesystem::path SaveSnapshotService::GetDefaultCheckpointStorePath()
 {
-    return std::filesystem::current_path() / "Data" / "rfab_checkpoints.bin";
+    return Compat::SafeFs::CurrentPathOr(std::filesystem::path(".")) / "Data" / "rfab_checkpoints.bin";
 }
 
 SaveSnapshotService::SaveSnapshotService(World& aWorld, entt::dispatcher& aDispatcher) noexcept
@@ -497,7 +505,9 @@ bool SaveSnapshotService::SaveCheckpointsToDisk(const std::filesystem::path& acP
                 worldItemsWriter.Size(),
                 kWorldItemsChunkVersion);
 
-            // v4.1.1 Phase 3B: shared Dragon Soul kills & Word Wall discoveries. Older builds skip unknown tag.
+            // The dragons the party has slain. The chunk also has a list of Words of Power, kept
+            // empty: sharing them was never wired to a client (M4), but the layout stays so that a
+            // checkpoint written by either build is read by the other.
             TiltedPhoques::Buffer drgWordBuf(32 * 1024);
             TiltedPhoques::Buffer::Writer drgWordWriter(&drgWordBuf);
             Serialization::WriteVarInt(drgWordWriter, m_snapshots.size());
@@ -506,15 +516,35 @@ bool SaveSnapshotService::SaveCheckpointsToDisk(const std::filesystem::path& acP
                 Serialization::WriteVarInt(drgWordWriter, snap.Progression.SlainDragonKeys.size());
                 for (const auto& key : snap.Progression.SlainDragonKeys)
                     WriteStdString(drgWordWriter, key);
-                Serialization::WriteVarInt(drgWordWriter, snap.Progression.LearnedWordWalls.size());
-                for (const auto& wordId : snap.Progression.LearnedWordWalls)
-                    wordId.Serialize(drgWordWriter);
+                Serialization::WriteVarInt(drgWordWriter, 0u); // Words of Power: always empty
             }
             tlvBuilder.AppendChunk(
                 CoopCheckpoint::TlvTag::kDragonSoulsAndWordWalls,
                 drgWordBuf.GetWriteData(),
                 drgWordWriter.Size(),
                 1u);
+
+            // Shared XP already held per player identity: without it a restart would make every
+            // returning player look like a late joiner who is owed the whole party total (M1).
+            TiltedPhoques::Buffer xpCreditBuf(64 * 1024);
+            TiltedPhoques::Buffer::Writer xpCreditWriter(&xpCreditBuf);
+            Serialization::WriteVarInt(xpCreditWriter, m_snapshots.size());
+            for (const auto& snap : m_snapshots)
+            {
+                Serialization::WriteVarInt(xpCreditWriter, static_cast<uint64_t>(std::max<int64_t>(snap.Progression.SharedXpCreditBaseline, 0)));
+                const auto credits = SortedEntries(snap.Progression.SharedXpCredits);
+                Serialization::WriteVarInt(xpCreditWriter, credits.size());
+                for (const auto* pEntry : credits)
+                {
+                    WriteStdString(xpCreditWriter, pEntry->first);
+                    Serialization::WriteVarInt(xpCreditWriter, static_cast<uint64_t>(std::max<int64_t>(pEntry->second, 0)));
+                }
+            }
+            tlvBuilder.AppendChunk(
+                CoopCheckpoint::TlvTag::kSharedXpCredits,
+                xpCreditBuf.GetWriteData(),
+                xpCreditWriter.Size(),
+                kSharedXpCreditsChunkVersion);
             const std::vector<uint8_t> tlvBytes = tlvBuilder.Bytes();
             if (!tlvBytes.empty())
             {
@@ -558,6 +588,7 @@ bool SaveSnapshotService::LoadCheckpointsFromDisk(const std::filesystem::path& a
 
         const uint64_t snapCount = std::min<uint64_t>(Serialization::ReadVarInt(reader), kMaxSerializedSnapshots);
         std::deque<WorldSnapshot> loadedSnapshots;
+        bool sawSharedXpCredits = false;
         for (uint64_t sIdx = 0; sIdx < snapCount; ++sIdx)
         {
             WorldSnapshot snap{};
@@ -756,6 +787,35 @@ bool SaveSnapshotService::LoadCheckpointsFromDisk(const std::filesystem::path& a
                                     continue;
                                 }
 
+                                if (chunk.Tag == static_cast<uint32_t>(CoopCheckpoint::TlvTag::kSharedXpCredits) &&
+                                    chunk.Data && chunk.ByteLength != 0 && chunk.Version == kSharedXpCreditsChunkVersion)
+                                {
+                                    TiltedPhoques::Buffer creditBuffer(chunk.ByteLength);
+                                    std::memcpy(creditBuffer.GetWriteData(), chunk.Data, chunk.ByteLength);
+                                    TiltedPhoques::Buffer::Reader creditReader(&creditBuffer);
+                                    const uint64_t creditSnapCount = std::min<uint64_t>(
+                                        Serialization::ReadVarInt(creditReader),
+                                        loadedSnapshots.size());
+                                    for (uint64_t sIdx = 0; sIdx < creditSnapCount && !creditReader.Eof(); ++sIdx)
+                                    {
+                                        auto& prog = loadedSnapshots[static_cast<size_t>(sIdx)].Progression;
+                                        prog.SharedXpCreditBaseline = static_cast<int64_t>(
+                                            std::min<uint64_t>(Serialization::ReadVarInt(creditReader), kMaxPersistedSharedXp));
+                                        const uint64_t creditCount = std::min<uint64_t>(Serialization::ReadVarInt(creditReader), 4096ULL);
+                                        prog.SharedXpCredits.clear();
+                                        for (uint64_t c = 0; c < creditCount && !creditReader.Eof(); ++c)
+                                        {
+                                            std::string identityKey = ReadStdString(creditReader);
+                                            const auto credited = static_cast<int64_t>(
+                                                std::min<uint64_t>(Serialization::ReadVarInt(creditReader), kMaxPersistedSharedXp));
+                                            if (!identityKey.empty())
+                                                prog.SharedXpCredits[std::move(identityKey)] = credited;
+                                        }
+                                    }
+                                    sawSharedXpCredits = true;
+                                    continue;
+                                }
+
                                 if (chunk.Tag == static_cast<uint32_t>(CoopCheckpoint::TlvTag::kDragonSoulsAndWordWalls) &&
                                     chunk.Data && chunk.ByteLength != 0 && chunk.Version == 1u)
                                 {
@@ -774,14 +834,12 @@ bool SaveSnapshotService::LoadCheckpointsFromDisk(const std::filesystem::path& a
                                         for (uint64_t d = 0; d < dragonCount && !dwReader.Eof(); ++d)
                                             prog.SlainDragonKeys.push_back(ReadStdString(dwReader));
 
+                                        // Words of Power from a checkpoint of an earlier build: read past them.
                                         const uint64_t wordCount = std::min<uint64_t>(Serialization::ReadVarInt(dwReader), 4096ULL);
-                                        prog.LearnedWordWalls.clear();
-                                        prog.LearnedWordWalls.reserve(static_cast<size_t>(wordCount));
                                         for (uint64_t w = 0; w < wordCount && !dwReader.Eof(); ++w)
                                         {
-                                            GameId wid{};
-                                            wid.Deserialize(dwReader);
-                                            prog.LearnedWordWalls.push_back(wid);
+                                            GameId skippedWord{};
+                                            skippedWord.Deserialize(dwReader);
                                         }
                                     }
                                     continue;
@@ -847,6 +905,15 @@ bool SaveSnapshotService::LoadCheckpointsFromDisk(const std::filesystem::path& a
             autoCursor,
             lastCommittedEpoch,
             lastCommittedSlot);
+        // A checkpoint written before shared XP credits were tracked says nothing about who holds
+        // what. Assume everyone holds everything earned so far: nobody is owed XP from a time
+        // nothing was recorded about, and returning players are not paid the party total again.
+        if (!sawSharedXpCredits)
+        {
+            for (auto& snap : loadedSnapshots)
+                snap.Progression.SharedXpCreditBaseline = std::max<int64_t>(snap.Progression.TotalSharedXp, 0);
+        }
+
         m_snapshots = std::move(loadedSnapshots);
         HydratePersistedWorldState();
 
@@ -1327,7 +1394,14 @@ void SaveSnapshotService::ApplyWorldSnapshot(const WorldSnapshot& acSnapshot, bo
     const bool preferLiveEssBarrier = !acSnapshot.SlotName.empty();
 
     // 1. Restore RFAB progression ledger
-    m_world.GetRfabProgressionService().GetLedger().RestoreSnapshot(acSnapshot.Progression);
+    {
+        auto& progressionLedger = m_world.GetRfabProgressionService().GetLedger();
+        progressionLedger.RestoreSnapshot(acSnapshot.Progression);
+        // A player who joined after this checkpoint is not in its XP credits. They are connected,
+        // so nothing is owed to them for the past: a reconnect must not pay the restored total.
+        for (const Player* pConnected : m_world.GetPlayerManager())
+            progressionLedger.GetXpCredits().LevelWithParty(GetPlayerIdentityKey(pConnected), progressionLedger.GetTotalSharedXp());
+    }
 
     // 2. Restore quest logs for connected players AND flush transient 30s QuestStageDedupHistory + SceneMaster
     auto& partyService = m_world.GetPartyService();
@@ -1532,6 +1606,7 @@ void SaveSnapshotService::ApplyWorldSnapshot(const WorldSnapshot& acSnapshot, bo
                 m_world.destroy(entity);
             }
         }
+        m_world.GetObjectService().ForgetUnregisteredUnlocks();
         for (const auto& objRec : acSnapshot.TrackedObjects)
         {
             m_world.GetObjectService().UpsertRestoredObject(
@@ -1794,6 +1869,7 @@ bool SaveSnapshotService::TriggerRollbackToLatest(bool aIsPartyWipe) noexcept
                 m_world.destroy(entity);
         }
     }
+    m_world.GetObjectService().ForgetUnregisteredUnlocks();
 
     BeginWorldReloadBarrier(0, preJoinSlot, nowMs);
 

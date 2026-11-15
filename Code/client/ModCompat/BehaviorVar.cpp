@@ -28,6 +28,7 @@
 //
 
 #include <immersive_launcher/launcher.h>
+#include <common/Compat/SafeFs.h>
 #include <BSAnimationGraphManager.h>
 #include <Games/ActorExtension.h>
 #include <CoopAnimationState.h>
@@ -508,10 +509,14 @@ void BehaviorVar::FailList(uint64_t hash)
 // Find all the subdirectories of behavior variables
 TiltedPhoques::Vector<std::filesystem::path> BehaviorVar::LoadDirs(const std::filesystem::path& acPath)
 {
+    // The paths stay paths: path::string() throws when the game folder has a character outside the
+    // machine's ANSI code page (a Cyrillic folder on a non-Cyrillic Windows), and this runs from
+    // World's constructor at start-up (M14). The walk itself cannot throw either.
     TiltedPhoques::Vector<std::filesystem::path> result;
-    for (auto& p : std::filesystem::directory_iterator(acPath))
-        if (p.is_directory())
-            result.push_back(p.path().string());
+    Compat::SafeFs::ForEachEntry(acPath, [&result](const std::filesystem::directory_entry& acEntry) {
+        if (Compat::SafeFs::IsDirectory(acEntry))
+            result.push_back(acEntry.path());
+    });
     return result;
 }
 
@@ -530,16 +535,17 @@ BehaviorVar::Replacer* BehaviorVar::LoadReplacerFromDir(const std::filesystem::p
     // modded actor, that we can use to connect the actor to their modded behavior variables.
     // It's not actually sync'ed, just there so we can find the match. For example, currently
     // bSTRMaster is used for humanoid/Player actors, and bSTRDragon for dragon behavior.
-    TiltedPhoques::String hashFile;
-    TiltedPhoques::String signatureFile;
-    TiltedPhoques::Vector<TiltedPhoques::String> floatVarsFile;
-    TiltedPhoques::Vector<TiltedPhoques::String> intVarsFile;
-    TiltedPhoques::Vector<TiltedPhoques::String> boolVarsFile;
+    // Files are kept as paths and opened as paths; names are only turned into UTF-8 text to look
+    // at their suffix and to log them (see LoadDirs).
+    std::filesystem::path hashFile;
+    std::filesystem::path signatureFile;
+    TiltedPhoques::Vector<std::filesystem::path> floatVarsFile;
+    TiltedPhoques::Vector<std::filesystem::path> intVarsFile;
+    TiltedPhoques::Vector<std::filesystem::path> boolVarsFile;
 
-    for (auto& p : std::filesystem::directory_iterator(aDir))
-    {
-        TiltedPhoques::String path(p.path().string());
-        TiltedPhoques::String base_filename = path.substr(path.find_last_of("/\\") + 1);
+    Compat::SafeFs::ForEachEntry(aDir, [&](const std::filesystem::directory_entry& acEntry) {
+        const std::filesystem::path& path = acEntry.path();
+        const std::string base_filename = Compat::SafeFs::FileNameUtf8Lossy(path);
 
         spdlog::debug("base_path: {}", base_filename);
 
@@ -547,51 +553,51 @@ BehaviorVar::Replacer* BehaviorVar::LoadReplacerFromDir(const std::filesystem::p
         {
             signatureFile = path;
 
-            spdlog::debug("signature variable file: {}", signatureFile);
+            spdlog::debug("signature variable file: {}", base_filename);
         }
         else if (base_filename.find("__hash.txt") != std::string::npos)
         {
             hashFile = path;
 
-            spdlog::debug("hash file: {}", hashFile);
+            spdlog::debug("hash file: {}", base_filename);
         }
         else if (base_filename.find("__float.txt") != std::string::npos)
         {
             floatVarsFile.push_back(path);
 
-            spdlog::debug("float file: {}", path);
+            spdlog::debug("float file: {}", base_filename);
         }
         else if (base_filename.find("__int.txt") != std::string::npos)
         {
             intVarsFile.push_back(path);
 
-            spdlog::debug("int file: {}", path);
+            spdlog::debug("int file: {}", base_filename);
         }
         else if (base_filename.find("__bool.txt") != std::string::npos)
         {
             boolVarsFile.push_back(path);
 
-            spdlog::debug("bool file: {}", path);
+            spdlog::debug("bool file: {}", base_filename);
         }
-    }
+    });
 
     // Check that there is a signature file (an identifying variable)
     // When an Actor's behavior is modified, it's animation signature doesn't match
     // any of the base STR built-in descriptors. We try to match up on a distinguishing
     // animation variable added by the animation. But without such a distinquishing
-    if (signatureFile == "")
+    if (signatureFile.empty())
         return nullptr;
 
     // Prepare reading files
     TiltedPhoques::String sigVar;
-    TiltedPhoques::String creatureName(aDir.filename().string());
+    TiltedPhoques::String creatureName(Compat::SafeFs::FileNameUtf8Lossy(aDir).c_str());
     TiltedPhoques::Vector<TiltedPhoques::String> floatVar;
     TiltedPhoques::Vector<TiltedPhoques::String> intVar;
     TiltedPhoques::Vector<TiltedPhoques::String> boolVar;
     TiltedPhoques::String tempString; // Temp string
 
     // If signature file is unreadable, this directory is useless.
-    std::ifstream fileSig(signatureFile.c_str(), std::ifstream::in);
+    std::ifstream fileSig(signatureFile, std::ifstream::in);
     if (!fileSig.is_open())
         return nullptr;
 
@@ -615,9 +621,9 @@ BehaviorVar::Replacer* BehaviorVar::LoadReplacerFromDir(const std::filesystem::p
     // on. So stripped off the need to provide the new hash, we'll just calculate it.
     //
     uint64_t orgHash = 0;
-    if (hashFile.size())
+    if (!hashFile.empty())
     {
-        std::ifstream file(hashFile.c_str(), std::ifstream::in);
+        std::ifstream file(hashFile, std::ifstream::in);
         if (file.is_open())
         {
             getline(file, tempString);
@@ -633,7 +639,7 @@ BehaviorVar::Replacer* BehaviorVar::LoadReplacerFromDir(const std::filesystem::p
     spdlog::debug("reading float var");
     for (auto& item : floatVarsFile)
     {
-        std::ifstream file(item.c_str(), std::ifstream::in);
+        std::ifstream file(item, std::ifstream::in);
         if (file.is_open())
         {
             while (std::getline(file, tempString))
@@ -650,7 +656,7 @@ BehaviorVar::Replacer* BehaviorVar::LoadReplacerFromDir(const std::filesystem::p
     spdlog::debug("reading int vars");
     for (auto& item : intVarsFile)
     {
-        std::ifstream file(item.c_str(), std::ifstream::in);
+        std::ifstream file(item, std::ifstream::in);
         if (file.is_open())
         {
             while (std::getline(file, tempString))
@@ -667,7 +673,7 @@ BehaviorVar::Replacer* BehaviorVar::LoadReplacerFromDir(const std::filesystem::p
     spdlog::debug("reading bool vars");
     for (auto& item : boolVarsFile)
     {
-        std::ifstream file(item.c_str(), std::ifstream::in);
+        std::ifstream file(item, std::ifstream::in);
         if (file.is_open())
         {
             while (std::getline(file, tempString))
@@ -732,18 +738,31 @@ void BehaviorVar::Init()
     std::filesystem::path pBehaviorsPath;
     pBehaviorsPath = launcher::GetLaunchContext()->gamePath / L"Data" / L"SkyrimTogetherRebornBehaviors";
 
-    if (!std::filesystem::is_directory(pBehaviorsPath))
+    if (!Compat::SafeFs::IsDirectory(pBehaviorsPath))
         return;
 
-    auto behaviorDirs = LoadDirs(pBehaviorsPath);
-
-    for (auto& dir : behaviorDirs)
+    // This runs inside World's constructor: an exception here would end the game at start-up with
+    // nothing in the log. A folder that cannot be read costs its own behavior variables only.
+    try
     {
-        Replacer* sig = LoadReplacerFromDir(dir);
-        if (sig)
+        auto behaviorDirs = LoadDirs(pBehaviorsPath);
+
+        for (auto& dir : behaviorDirs)
         {
-            behaviorPool.push_back(*sig);
+            Replacer* sig = LoadReplacerFromDir(dir);
+            if (sig)
+            {
+                behaviorPool.push_back(*sig);
+            }
         }
+    }
+    catch (const std::exception& acError)
+    {
+        spdlog::error("[RFAB] behavior variable folders could not be read completely: {}", acError.what());
+    }
+    catch (...)
+    {
+        spdlog::error("[RFAB] behavior variable folders could not be read completely");
     }
 
     // Ambiguousness check.

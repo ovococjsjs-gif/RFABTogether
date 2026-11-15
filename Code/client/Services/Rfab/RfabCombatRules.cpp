@@ -434,6 +434,11 @@ void RfabCombatRules::PollBossEncounterState(
     if (!aTransport.IsConnected())
         return;
 
+    // Bosses this client reported as "in a fight" and still simulates after this pass. A boss that
+    // was handed to another client drops out here: its lock is that client's to report now, and a
+    // boss that comes back later has to be reported again.
+    std::unordered_set<uint32_t> stillSimulatedLocks;
+
     auto view = aWorld.view<LocalComponent, FormIdComponent>();
     for (auto entity : view)
     {
@@ -447,6 +452,8 @@ void RfabCombatRules::PollBossEncounterState(
             continue;
 
         const uint32_t serverId = localComp.Id;
+        if (m_lockedBossServerIds.contains(serverId))
+            stillSimulatedLocks.insert(serverId);
         if (pActor->IsDead())
         {
             if (m_lockedBossServerIds.erase(serverId) > 0)
@@ -460,17 +467,8 @@ void RfabCombatRules::PollBossEncounterState(
                 aTransport.Send(unlockEv);
             }
 
-            if (pActor->IsDragon() && m_reportedDragonSoulServerIds.insert(serverId).second)
-            {
-                GameId dragonFormId{};
-                aWorld.GetModSystem().GetServerModId(formIdComp.Id, dragonFormId);
-                SyncRfabProgressionEvent soulEv{};
-                soulEv.Kind = SyncRfabProgressionEvent::EventKind::DragonSoulSync;
-                soulEv.EpochId = aWorldEpoch;
-                soulEv.BookId = dragonFormId;
-                soulEv.XpDelta = static_cast<int32_t>(serverId);
-                aTransport.Send(soulEv);
-            }
+            // A dead dragon is not reported from here: the server sees the death itself
+            // (RfabProgressionService::OnDragonSlain) and decides who is owed a shared soul.
             continue;
         }
 
@@ -478,15 +476,29 @@ void RfabCombatRules::PollBossEncounterState(
         const bool wasTracked = (prevIt != m_lastBossGhostByServerId.end());
         const bool isBoss = wasTracked || IsBossActor(pActor, acResolver);
 
-        if (isBoss && pActor->IsInCombat() && m_lockedBossServerIds.insert(serverId).second)
+        // The lock lasts as long as the fight: it is taken when the boss enters combat and given
+        // back when the boss leaves it. It used to be given back only on death, so a boss the party
+        // retreated from stayed with its first owner for good.
+        if (isBoss)
         {
-            SyncRfabProgressionEvent lockEv{};
-            lockEv.Kind = SyncRfabProgressionEvent::EventKind::BossEncounterSync;
-            lockEv.EpochId = aWorldEpoch;
-            lockEv.SourceKey = String("boss_lock");
-            lockEv.XpDelta = static_cast<int32_t>(serverId);
-            lockEv.GlobalValue = 1.0f;
-            aTransport.Send(lockEv);
+            const bool inCombat = pActor->IsInCombat();
+            const bool lockChanged = inCombat ? m_lockedBossServerIds.insert(serverId).second
+                                              : (m_lockedBossServerIds.erase(serverId) > 0);
+            if (lockChanged)
+            {
+                if (inCombat)
+                    stillSimulatedLocks.insert(serverId);
+                else
+                    stillSimulatedLocks.erase(serverId);
+
+                SyncRfabProgressionEvent lockEv{};
+                lockEv.Kind = SyncRfabProgressionEvent::EventKind::BossEncounterSync;
+                lockEv.EpochId = aWorldEpoch;
+                lockEv.SourceKey = String("boss_lock");
+                lockEv.XpDelta = static_cast<int32_t>(serverId);
+                lockEv.GlobalValue = inCombat ? 1.0f : 0.0f;
+                aTransport.Send(lockEv);
+            }
         }
 
         if (!isBoss && !pActor->IsGhost())
@@ -507,6 +519,11 @@ void RfabCombatRules::PollBossEncounterState(
         ev.GlobalValue = isGhost ? 1.0f : 0.0f;
         aTransport.Send(ev);
     }
+
+    // Forget the locks of bosses this client no longer simulates (see stillSimulatedLocks).
+    std::erase_if(m_lockedBossServerIds, [&stillSimulatedLocks](uint32_t aServerId) {
+        return !stillSimulatedLocks.contains(aServerId);
+    });
 }
 
 void RfabCombatRules::ApplyBossEncounterSyncEvent(

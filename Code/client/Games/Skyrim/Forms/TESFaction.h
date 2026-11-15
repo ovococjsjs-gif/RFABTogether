@@ -30,6 +30,20 @@ struct FactionCrimeData
 };
 static_assert(sizeof(FactionCrimeData) == 0x48);
 
+// VENV / VENC of a vendor faction. Layout as in CommonLibSSE (FACTION_VENDOR_DATA, SE 1.5.97).
+// Only merchantContainer is used, and only by comparing the pointer: it is never dereferenced.
+struct FactionVendorData
+{
+    uint8_t vendorValues[0x10];        // 00 - opening hours, radius, buy/sell flags, padding
+    void* vendorLocation;              // 10
+    void* vendorConditions;            // 18
+    BGSListForm* vendorSellBuyList;    // 20
+    TESObjectREFR* merchantContainer;  // 28 - VENC (the chest the faction's merchants trade from)
+    uint32_t lastDayReset;             // 30
+    uint32_t pad34;                    // 34
+};
+static_assert(sizeof(FactionVendorData) == 0x38);
+
 struct TESFaction : TESForm
 {
     TESFullName fullname;            // 020 (size 0x10)
@@ -38,10 +52,13 @@ struct TESFaction : TESForm
     uint32_t factionFlags;           // 058
     uint32_t pad5C;                  // 05C
     FactionCrimeData crimeData;      // 060
-    uint8_t vendorAndRankPad[0x100 - 0xA8];
+    FactionVendorData vendorData;    // 0A8
+    uint8_t rankAndCrimeCountPad[0x100 - 0xE0];
 };
 
 static_assert(offsetof(TESFaction, crimeData) == 0x60);
 static_assert(offsetof(TESFaction, crimeData.factionStolenContainer) == 0x70);
 static_assert(offsetof(TESFaction, crimeData.factionPlayerInventoryContainer) == 0x78);
+static_assert(offsetof(TESFaction, vendorData) == 0xA8);
+static_assert(offsetof(TESFaction, vendorData.merchantContainer) == 0xD0);
 static_assert(sizeof(TESFaction) == 0x100);

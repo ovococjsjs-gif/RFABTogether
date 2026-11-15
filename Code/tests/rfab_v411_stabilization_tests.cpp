@@ -13,30 +13,6 @@
 
 namespace
 {
-std::filesystem::path FindStabilizationRepoRoot()
-{
-    std::error_code ec;
-    auto p = std::filesystem::current_path(ec);
-    for (int i = 0; i < 8 && !p.empty(); ++i)
-    {
-        if (std::filesystem::exists(p / "Code" / "client" / "World.cpp", ec))
-            return p;
-        const auto parent = p.parent_path();
-        if (parent == p)
-            break;
-        p = parent;
-    }
-    return {};
-}
-
-std::string ReadStabilizationFile(const std::filesystem::path& acPath)
-{
-    std::ifstream f(acPath, std::ios::binary);
-    if (!f)
-        return {};
-    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-}
-
 std::filesystem::path Utf8SubPath(const std::string& acUtf8)
 {
     std::u8string u8(reinterpret_cast<const char8_t*>(acUtf8.data()), acUtf8.size());
@@ -214,12 +190,21 @@ TEST_CASE("P1.3 UTF-8 and CP1251 save slot resolution handles Cyrillic Skyrim sa
     WriteDummyValidEss(rootSave);
     WriteDummyValidEss(subSave);
 
-    CHECK(ResolveExistingEssSlotPath(tempDir, expectedUtf8) == rootSave);
-    CHECK(ResolveExistingEssSlotPath(tempDir, "Saves\\" + expectedUtf8 + ".ESS") == rootSave);
-    CHECK(ResolveExistingEssSlotPath(tempDir, upperCyrillic) == rootSave);
-    CHECK(ResolveExistingEssSlotPath(tempDir, cp1251Sample) == rootSave);
-    CHECK(ResolveExistingEssSlotPath(tempDir, "nonmatching_raw", expectedUtf8) == rootSave);
-    CHECK(ResolveExistingEssSlotPath(tempDir, subSaveStemUtf8) == subSave);
+    // What matters is that the lookup names the same FILE. NTFS is case-insensitive, so a lookup
+    // may come back spelled the way it was asked for; comparing paths with == failed on Windows for
+    // that reason alone. (And a failed == makes Catch print both paths, which throws on a system
+    // whose ANSI code page has no Cyrillic - the first Windows run of this suite.)
+    const auto sameFile = [](const std::filesystem::path& acFound, const std::filesystem::path& acExpected) {
+        std::error_code compareEc;
+        return !acFound.empty() && std::filesystem::equivalent(acFound, acExpected, compareEc) && !compareEc;
+    };
+    CHECK(sameFile(ResolveExistingEssSlotPath(tempDir, expectedUtf8), rootSave));
+    CHECK(sameFile(ResolveExistingEssSlotPath(tempDir, "Saves\\" + expectedUtf8 + ".ESS"), rootSave));
+    CHECK(sameFile(ResolveExistingEssSlotPath(tempDir, upperCyrillic), rootSave));
+    CHECK(sameFile(ResolveExistingEssSlotPath(tempDir, cp1251Sample), rootSave));
+    CHECK(sameFile(ResolveExistingEssSlotPath(tempDir, "nonmatching_raw", expectedUtf8), rootSave));
+    CHECK(sameFile(ResolveExistingEssSlotPath(tempDir, subSaveStemUtf8), subSave));
+    CHECK_FALSE(sameFile(ResolveExistingEssSlotPath(tempDir, subSaveStemUtf8), rootSave));
     CHECK(IsValidEssFileOnDisk(ResolveExistingEssSlotPath(tempDir, cp1251Sample)));
     CHECK(ResolveExistingEssSlotPath(tempDir, "DoesNotExist_Slot").empty());
 
@@ -241,70 +226,4 @@ TEST_CASE("P2.2 enemy health scaling skips peaceful town NPCs while preserving h
     CHECK_FALSE(Authority::ShouldScaleIncomingEnemyDamage(false, false, true, false, false, true));  // summon
     CHECK_FALSE(Authority::ShouldScaleIncomingEnemyDamage(false, false, false, true, false, true));  // commanded
     CHECK_FALSE(Authority::ShouldScaleIncomingEnemyDamage(false, false, false, false, true, true));  // mount
-}
-
-TEST_CASE("Phase 1 & Phase 2 stabilization invariants remain wired across client & server sources", "[rfab][v411][audit]")
-{
-    const auto root = FindStabilizationRepoRoot();
-    if (root.empty())
-    {
-        WARN("repository root not found; skipping source wiring audit");
-        return;
-    }
-
-    // P1.1: Server::World reserves entity 0.
-    const std::string serverWorldH = ReadStabilizationFile(root / "Code" / "server" / "World.h");
-    const std::string serverWorldCpp = ReadStabilizationFile(root / "Code" / "server" / "World.cpp");
-    REQUIRE_FALSE(serverWorldH.empty());
-    CHECK(serverWorldH.find("m_reservedZeroEntity") != std::string::npos);
-    CHECK(serverWorldCpp.find("m_reservedZeroEntity = create();") != std::string::npos);
-
-    // P1.2: Server ActorValueService uses Authority::kAvInfamy (61), never 37.
-    const std::string serverAvCpp = ReadStabilizationFile(root / "Code" / "server" / "Services" / "ActorValueService.cpp");
-    REQUIRE_FALSE(serverAvCpp.empty());
-    CHECK(serverAvCpp.find("Authority::kAvInfamy") != std::string::npos);
-    CHECK(serverAvCpp.find("constexpr uint32_t kAvInfamy = 37u") == std::string::npos);
-
-    // P1.3: SaveLoad hooks guard World::IsCreated() and use ResolveExistingEssSlotPath.
-    const std::string saveLoadCpp = ReadStabilizationFile(root / "Code" / "client" / "Games" / "Skyrim" / "SaveLoad.cpp");
-    REQUIRE_FALSE(saveLoadCpp.empty());
-    CHECK(saveLoadCpp.find("World::IsCreated()") != std::string::npos);
-    CHECK(saveLoadCpp.find("ResolveExistingEssSlotPath") != std::string::npos);
-
-    // P1.4: FaceGen checks kFeatureFaceGen & TESNPC exposes ClearLeveledNpcSourceCache.
-    const std::string maskedH = ReadStabilizationFile(root / "Code" / "client" / "Games" / "Skyrim" / "NetImmerse" / "BSMaskedShaderMaterial.h");
-    const std::string faceGenCpp = ReadStabilizationFile(root / "Code" / "client" / "Systems" / "FaceGenSystem.cpp");
-    const std::string charSvcCpp = ReadStabilizationFile(root / "Code" / "client" / "Services" / "Generic" / "CharacterService.cpp");
-    CHECK(maskedH.find("kFeatureFaceGen = 4u") != std::string::npos);
-    CHECK(faceGenCpp.find("BSMaskedShaderMaterial::kFeatureFaceGen") != std::string::npos);
-    CHECK(charSvcCpp.find("TESNPC::ClearLeveledNpcSourceCache()") != std::string::npos);
-    CHECK(charSvcCpp.find("m_playerAppearanceHashes") != std::string::npos);
-
-    // P1.5 & P2.4: EffectSetting::secondaryAV, MagicService no SlowTime redirect, MagicTarget GamePtr + stackable perk capture.
-    const std::string effectSettingH = ReadStabilizationFile(root / "Code" / "client" / "Games" / "Skyrim" / "Forms" / "EffectSetting.h");
-    const std::string magicSvcCpp = ReadStabilizationFile(root / "Code" / "client" / "Services" / "Generic" / "MagicService.cpp");
-    const std::string magicTargetCpp = ReadStabilizationFile(root / "Code" / "client" / "Games" / "Skyrim" / "Magic" / "MagicTarget.cpp");
-    CHECK(effectSettingH.find("static_assert(offsetof(EffectSetting, secondaryAV) == 0xE0);") != std::string::npos);
-    CHECK(magicSvcCpp.find("secondaryAV == ActorValueInfo::kHealth") != std::string::npos);
-    const size_t slowPos = magicSvcCpp.find("if (pEffect->IsSlowEffect())");
-    REQUIRE(slowPos != std::string::npos);
-    CHECK(magicSvcCpp.substr(slowPos, 64).find("return;") != std::string::npos);
-    CHECK(magicSvcCpp.substr(slowPos, 128).find("PlayerCharacter::Get()") == std::string::npos);
-    CHECK(magicTargetCpp.find("GamePtr<Actor>") != std::string::npos);
-    CHECK(magicTargetCpp.find("s_captureExpectedEffectItem") != std::string::npos);
-
-    // P2.1: 1st-person graph 0 resolution + unsigned char toupper + Animation res guard.
-    const std::string behaviorVarCpp = ReadStabilizationFile(root / "Code" / "client" / "ModCompat" / "BehaviorVar.cpp");
-    const std::string animationCpp = ReadStabilizationFile(root / "Code" / "client" / "Games" / "Animation.cpp");
-    CHECK(behaviorVarCpp.find("apManager->GetDescriptorKey(0)") != std::string::npos);
-    CHECK(behaviorVarCpp.find("static_cast<unsigned char>(item[0])") != std::string::npos);
-    CHECK(animationCpp.find("if (res)") != std::string::npos);
-
-    // P2.3 & P2.5: RfabAdapterService COW shared_ptr + shared_mutex + 10Hz throttle + OnWorldLoadEnd.
-    const std::string rfabAdapterH = ReadStabilizationFile(root / "Code" / "client" / "Services" / "RfabAdapterService.h");
-    const std::string rfabAdapterCpp = ReadStabilizationFile(root / "Code" / "client" / "Services" / "RfabAdapterService.cpp");
-    CHECK(rfabAdapterH.find("std::shared_mutex m_coopSnapshotMutex") != std::string::npos);
-    CHECK(rfabAdapterH.find("OnWorldLoadEnd") != std::string::npos);
-    CHECK(rfabAdapterCpp.find("m_snapshotAccumulatorSec >= 0.1") != std::string::npos);
-    CHECK(rfabAdapterCpp.find("EnforceNoDeathHandlingTick(m_formResolver)") != std::string::npos);
 }

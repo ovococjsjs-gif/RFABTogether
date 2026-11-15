@@ -50,6 +50,7 @@ struct SessionResyncService final : Session::IParticipant
     void OnSessionBegin(const Session::Transition& acTransition) noexcept override;
     void OnSessionEnd(const Session::Transition& acTransition) noexcept override;
     void OnWorldLoadBegin(const Session::Transition& acTransition) noexcept override;
+    void OnWorldLoadEnd(const Session::Transition& acTransition) noexcept override;
 
 private:
     void OnUpdate(const UpdateEvent& acEvent) noexcept;
@@ -59,6 +60,12 @@ private:
     void OnResyncComplete(const NotifyResyncComplete& acMessage) noexcept;
 
     [[nodiscard]] bool CanSendNow() const noexcept;
+    // The local player stands in a loaded world: state can be applied, and what is on screen is
+    // worth describing.
+    [[nodiscard]] bool IsWorldSettled() const noexcept;
+    // Desync detector (common/Session/EntityDigest.h): tells the server what this client believes
+    // about every character it knows by server id.
+    void SendEntityDigest() noexcept;
     [[nodiscard]] static uint64_t NowMs() noexcept;
     void LogStats(const char* acpWhen) const noexcept;
 
@@ -67,6 +74,8 @@ private:
     Session::Resync::ClientLedger m_ledger{};
     std::vector<Session::Resync::Request> m_outgoing{};
     double m_pollAccumulatorSec{0.0};
+    double m_digestAccumulatorSec{0.0};
+    uint32_t m_digestSequence{0};
 
     entt::scoped_connection m_updateConnection;
     entt::scoped_connection m_resyncCompleteConnection;

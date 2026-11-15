@@ -62,6 +62,51 @@ Console::Setting bEnableSelfHealingResync{"Gameplay:bEnableSelfHealingResync", "
 Console::Setting bEnableServerOwnedWorldItems{"Gameplay:bEnableServerOwnedWorldItems",
                                               "Dropped items get a server id: every player sees them (also after joining or reloading) and only one player can pick each up",
                                               true};
+// Off by default, which is 4.1.0: every creature that is not on the players' side gets the
+// party health multiplier. Switched on, creatures that never start a fight (permanent Aggression 0,
+// under 800 HP, not a dragon) keep their normal health.
+Console::Setting bEnablePeacefulNpcsUnscaled{"Gameplay:bEnablePeacefulNpcsUnscaled",
+                                             "Enemy health scaling skips peaceful NPCs and animals", false};
+// The desync detector (common/Session/EntityDigest.h). On: clients report what they believe about
+// each character, the server compares it with its own state and writes every confirmed difference
+// to the log as "[RFAB Desync] ...". That alone changes nothing in the game.
+Console::Setting bEnableDesyncDetector{"Gameplay:bEnableDesyncDetector",
+                                       "Clients report what they see of each character; the server logs every confirmed difference", true};
+// Off by default, which leaves the game exactly as 4.1.0 plays it. Switched on, a confirmed
+// difference in presence or life state is also repaired by resending the character to that client
+// (at most twice per character in two minutes). Owner, health and equipment are only logged.
+Console::Setting bEnableDesyncAutoRepair{"Gameplay:bEnableDesyncAutoRepair",
+                                         "The desync detector also resends a character whose state differs on a client", false};
+// On: a gameplay event a client's engine hook produced before or during a coordinated reload is
+// dropped instead of being applied to the reloaded world (common/Session/MainThreadQueue.h).
+// Off restores 4.1.0, where such an event ran after the reload.
+Console::Setting bEnableWorldScopedHookEvents{"Gameplay:bEnableWorldScopedHookEvents",
+                                              "Clients drop gameplay events that were produced before or during a coordinated reload", true};
+// On: a quest's RFAB XP reaches each player once also when the partner's copy of the award
+// arrives before the player's own quest script pays (common/CoopExperienceLedger.h, order C).
+// Off restores 4.1.0, where that order paid the player twice.
+Console::Setting bEnableQuestXpSingleAward{"Gameplay:bEnableQuestXpSingleAward",
+                                           "A quest's RFAB XP is paid once per player, whichever copy of the award arrives first", true};
+// On: a merchant's chest, and a container a script opens from another place (RFAB's secure
+// chest), stay each player's own; the client does not register them (RfabCompat::IsPersonalContainer).
+// Off restores 4.1.0: they are shared like a chest of loot, and the server takes back from a trade
+// whatever its copy of the chest does not hold.
+Console::Setting bEnablePersonalMerchantStock{"Gameplay:bEnablePersonalMerchantStock",
+                                              "Merchants' stock and gold, and storage chests opened from another place, are each player's own and not shared", true};
+// On: outdoors the client registers, on every cell change, the containers of the cells around the
+// player that stand within reach of his cell, so a chest by a cell border has one list of contents
+// before anyone can loot it across the border (RfabCompat::ShouldScanNeighbourCells; the rest of
+// defect M11). Off restores 4.1.0: such a chest is registered by the first take, and the second
+// player to loot it the same way keeps one item of his own roll.
+Console::Setting bEnableNeighbourCellContainers{"Gameplay:bEnableNeighbourCellContainers",
+                                                "Outdoors, containers within reach of a player's cell are registered before they can be looted across a cell border", true};
+// On: a take or a put made between the client's registration of a container (by the cell scan, an
+// activation or an earlier take) and the server's answer is sent to the server when the answer
+// arrives (CoopLootLedger::ShouldReplayPendingDelta, defect M28). Off restores 4.1.0: such a
+// change is dropped, and a taken item is both in the player's pack and back in the container for
+// everybody.
+Console::Setting bEnableEarlyTakeReplay{"Gameplay:bEnableEarlyTakeReplay",
+                                        "A take made before the server answered the container's registration is sent again instead of being dropped", true};
 extern Console::Setting<bool> bEnableItemDrops;
 extern Console::Setting<bool> bEnableXpSync;
 extern Console::Setting<bool> bEnableRfabXpSync;
@@ -220,6 +265,13 @@ uint32_t GetDisabledCoopFeatureMask() noexcept
     mask = Session::WithFeature(mask, Feature::kSelfHealingResync, bEnableSelfHealingResync);
     // Without Gameplay:bEnableItemDrops no dropped item is synced at all, server-owned or not.
     mask = Session::WithFeature(mask, Feature::kServerOwnedWorldItems, bEnableServerOwnedWorldItems && bEnableItemDrops);
+    mask = Session::WithFeature(mask, Feature::kPeacefulNpcsUnscaled, bEnablePeacefulNpcsUnscaled);
+    mask = Session::WithFeature(mask, Feature::kDesyncDetector, bEnableDesyncDetector);
+    mask = Session::WithFeature(mask, Feature::kWorldScopedHookEvents, bEnableWorldScopedHookEvents);
+    mask = Session::WithFeature(mask, Feature::kQuestXpSingleAward, bEnableQuestXpSingleAward);
+    mask = Session::WithFeature(mask, Feature::kPersonalMerchantStock, bEnablePersonalMerchantStock);
+    mask = Session::WithFeature(mask, Feature::kNeighbourCellContainers, bEnableNeighbourCellContainers);
+    mask = Session::WithFeature(mask, Feature::kEarlyTakeReplay, bEnableEarlyTakeReplay);
     return mask;
 }
 

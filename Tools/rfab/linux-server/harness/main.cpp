@@ -47,15 +47,33 @@
 #include <Events/PacketEvent.h>
 #include <Events/PlayerLeaveEvent.h>
 #include <Events/PlayerJoinEvent.h>
+#include <Messages/ActivateRequest.h>
 #include <Messages/AssignCharacterRequest.h>
 #include <Messages/AssignCharacterResponse.h>
+#include <Messages/AssignObjectsResponse.h>
+#include <Messages/AssignObjectsRequest.h>
 #include <Messages/CharacterSpawnRequest.h>
+#include <Messages/ClientEntityDigest.h>
 #include <Messages/ClientMessageFactory.h>
 #include <Messages/ClientReferencesMoveRequest.h>
 #include <Messages/CoordinatedSaveAck.h>
+#include <Messages/NotifyPlayerCellChanged.h>
+#include <Messages/EnterInteriorCellRequest.h>
+#include <Messages/ServerReferencesMoveRequest.h>
+#include <Messages/NotifyActivate.h>
+#include <Messages/LockChangeRequest.h>
+#include <Messages/NotifyLockChange.h>
+#include <Messages/ScriptAnimationRequest.h>
+#include <Messages/NotifyScriptAnimation.h>
+#include <Messages/RequestQuestUpdate.h>
+#include <Messages/NotifyQuestUpdate.h>
 #include <Messages/MountRequest.h>
+#include <Messages/DrawWeaponRequest.h>
+#include <Messages/NotifyDrawWeapon.h>
 #include <Messages/NotifyActorValueChanges.h>
 #include <Messages/NotifyDeathStateChange.h>
+#include <Messages/NotifyExecuteLoad.h>
+#include <Messages/NotifyEquipmentChanges.h>
 #include <Messages/NotifyHealthChangeBroadcast.h>
 #include <Messages/NotifyMount.h>
 #include <Messages/NotifyOwnershipTransfer.h>
@@ -65,13 +83,17 @@
 #include <Messages/NotifyRfabProgressionEvent.h>
 #include <Messages/NotifySpawnData.h>
 #include <Messages/RequestActorValueChanges.h>
+#include <Messages/RequestCoordinatedSaveLoad.h>
 #include <Messages/RequestDeathStateChange.h>
+#include <Messages/RequestEquipmentChanges.h>
 #include <Messages/RequestHealthChangeBroadcast.h>
 #include <Messages/RequestInventoryChanges.h>
 #include <Messages/RequestOwnershipClaim.h>
 #include <Messages/RequestOwnershipTransfer.h>
 #include <Messages/RequestResync.h>
 #include <Messages/SyncRfabProgressionEvent.h>
+#include <Messages/NotifySyncRfabExperience.h>
+#include <Messages/SyncRfabExperienceRequest.h>
 #include <Messages/NotifyInventoryChanges.h>
 #include <Messages/NotifyWorldItemDespawn.h>
 #include <Messages/NotifyWorldItemSnapshot.h>
@@ -83,6 +105,7 @@
 #include <Services/CharacterService.h>
 #include <Services/PartyService.h>
 #include <Services/SaveSnapshotService.h>
+#include <Services/SessionResyncService.h>
 #include <Services/WorldItemService.h>
 
 #include "TransportSpy.h"
@@ -94,6 +117,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -104,6 +129,15 @@
 // v4.1.0: the self-healing switch lives in GameServer.cpp; the harness flips it like an operator would.
 extern Console::Setting<bool> bEnableSelfHealingResync;
 extern Console::Setting<bool> bEnableServerOwnedWorldItems;
+extern Console::Setting<bool> bEnableLateJoinCatchUpXp;
+extern Console::Setting<bool> bEnableSharedDragonSouls;
+extern Console::Setting<bool> bEnableMountRideGuard;
+extern Console::Setting<bool> bEnableDesyncDetector;
+extern Console::Setting<bool> bEnableDesyncAutoRepair;
+extern Console::Setting<bool> bEnableBossLeaseRenewal;
+extern Console::Setting<bool> bEnableUnlockMemory;
+extern Console::Setting<bool> bEnableBodyLootAuthority;
+extern Console::Setting<bool> bEnableSummonDismissal;
 
 namespace
 {
@@ -227,6 +261,21 @@ std::vector<uint32_t> OutboxOpcodesFor(TiltedPhoques::ConnectionId_t aConn)
             opcodes.push_back(static_cast<uint32_t>(pMsg->GetOpcode()));
     }
     return opcodes;
+}
+
+// A connection that ends, the way the transport reports it: GameServer::OnDisconnection, the code
+// that runs when a player's game closes or the link drops. It is protected in the transport's base
+// class; this reaches it without changing the server. A scene that only fires PlayerLeaveEvent and
+// removes the player skips what the real path does with the entities that player simulated.
+struct TransportAccess : TiltedPhoques::Server
+{
+    using TiltedPhoques::Server::OnDisconnection;
+};
+
+void Disconnect(GameServer& aServer, TiltedPhoques::ConnectionId_t aConnectionId)
+{
+    TiltedPhoques::Server& transport = aServer;
+    (transport.*(&TransportAccess::OnDisconnection))(aConnectionId, TiltedPhoques::Server::EDisconnectReason::Quit);
 }
 
 template <class TMap>
@@ -729,6 +778,8 @@ int main(int argc, char** argv)
         Check(calendar.SetDate(12, 4, 205), "the checkpoint date is set");
         Check(calendar.SetTime(13, 17, 33.0f), "the checkpoint time is set");
         Check(ledger.TryGrantXp("restart-test", 123).Accepted, "the checkpoint progression is set");
+        // A creature is in an invulnerable phase when the checkpoint is taken (M18).
+        Check(ledger.UpdateBossGhostState(World::ToInteger(actor), true), "an invulnerable phase is in progress at the checkpoint");
         Check(pOwner->GetId() == 1, "the checkpoint claimant is player ID 1");
 
         LockData lock{};
@@ -915,6 +966,8 @@ int main(int argc, char** argv)
         const auto progress = restored.GetRfabProgressionService().GetLedger().CaptureSnapshot();
         Check(progress.GrantedXpBySource.count("restart-test") == 1,
               "the fresh server restores the progression ledger");
+        Check(progress.BossGhostStates.empty(),
+              "an invulnerable phase is not restored into a new process, where its server id belongs to another creature");
         Check(restored.GetCalendarService().GetDate() == CalendarService::TDate{12, 4, 205},
               "the fresh server restores the checkpoint date");
         Check(restored.GetCalendarService().GetTime() == CalendarService::TTime{13, 17},
@@ -1786,23 +1839,34 @@ int main(int argc, char** argv)
 
         const uint64_t epoch = world.GetSaveSnapshotService().GetCurrentWorldEpoch();
 
-        // 8.1 Boss Lease Lock: Host locks a boss -> Guest claim is rejected until unlocked!
+        // 8.1 Boss encounter lock (M7): it is the owner's statement, it lasts as long as the fight,
+        //     and nothing about it outlives the owner, the boss or the server process.
         {
             const entt::entity boss = world.create();
             const uint32_t bossId = World::ToInteger(boss);
             world.emplace<OwnerComponent>(boss, pHost);
             world.emplace<CellIdComponent>(boss, kCell);
             world.emplace<CharacterComponent>(boss);
+            const auto& ledger = world.GetRfabProgressionService().GetLedger();
 
-            SyncRfabProgressionEvent lockReq{};
-            lockReq.Kind = SyncRfabProgressionEvent::EventKind::BossEncounterSync;
-            lockReq.EpochId = epoch;
-            lockReq.SourceKey = "boss_lock";
-            lockReq.XpDelta = static_cast<int32_t>(bossId);
-            lockReq.GlobalValue = 1.0f;
-            Check(DeliverWire(world, lockReq, pHost), "boss_lock packet accepted by server");
-            Check(world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(bossId),
-                  "boss entity is marked locked in progression ledger");
+            // What the owner's client sends when a boss it simulates enters or leaves combat, and
+            // when the boss turns invulnerable for a phase.
+            const auto report = [&](Player* apSender, const char* acWhat, bool aOn) {
+                SyncRfabProgressionEvent packet{};
+                packet.Kind = SyncRfabProgressionEvent::EventKind::BossEncounterSync;
+                packet.EpochId = epoch;
+                packet.SourceKey = acWhat;
+                packet.XpDelta = static_cast<int32_t>(bossId);
+                packet.GlobalValue = aOn ? 1.0f : 0.0f;
+                return DeliverWire(world, packet, apSender);
+            };
+
+            Check(report(pGuest, "boss_lock", true) && !ledger.IsBossEncounterLocked(bossId, pGuest->GetId()) &&
+                      !ledger.IsBossEncounterLocked(bossId, pHost->GetId()),
+                  "a player who does not simulate the boss cannot lock it");
+
+            Check(report(pHost, "boss_lock", true) && ledger.IsBossEncounterLocked(bossId, pHost->GetId()),
+                  "the simulating player locks the boss when it enters combat");
 
             Harness::ClearOutbox();
             RequestOwnershipClaim steal{};
@@ -1813,45 +1877,103 @@ int main(int argc, char** argv)
             Check(!DecodeOutboxMessagesFor<NotifyRelinquishControl>(kGuestConn).empty(),
                   "guest receives NotifyRelinquishControl rejecting locked boss claim");
 
-            world.GetRfabProgressionService().GetLedger().ClearBossGhostState(bossId);
-            Check(!world.GetRfabProgressionService().GetLedger().IsBossEncounterLocked(bossId),
-                  "ClearBossGhostState releases boss encounter lock on boss death");
+            Check(!ledger.IsBossEncounterLocked(bossId, pGuest->GetId()),
+                  "the lock is void once another player simulates the boss");
+
+            Check(report(pHost, "boss_lock", false) && !ledger.IsBossEncounterLocked(bossId, pHost->GetId()),
+                  "the lock is given back when the boss leaves combat, not only when it dies");
+
+            // An invulnerable phase holds the boss by itself and lets go when it ends. It used to
+            // leave a lock behind that only the boss's death removed.
+            Check(report(pHost, "boss_ghost", true) && ledger.IsBossEncounterLocked(bossId, pHost->GetId()) &&
+                      ledger.IsBossEncounterLocked(bossId, pGuest->GetId()),
+                  "an invulnerable phase holds the boss whoever simulates it");
+            Check(report(pHost, "boss_ghost", false) && !ledger.IsBossEncounterLocked(bossId, pHost->GetId()),
+                  "the end of the invulnerable phase leaves no lock behind");
+
+            // The boss is gone: nothing keyed by its server id stays.
+            Check(report(pHost, "boss_ghost", true) && report(pHost, "boss_lock", true) && ledger.GetBossGhostStates().count(bossId) == 1,
+                  "a phase and a lock are recorded for the living boss");
             world.destroy(boss);
+            Check(ledger.GetBossGhostStates().count(bossId) == 0 && !ledger.IsBossEncounterLocked(bossId, pHost->GetId()),
+                  "destroying the boss entity removes its phase and its lock");
         }
 
-        // 8.2 Shared Dragon Souls & Word Walls + deduplication
+        // 8.1b Boss lease (work plan 5.1). The player who simulates a locked boss goes silent - a
+        //      menu that pauses his game - while the other player keeps fighting next to him. The
+        //      boss window is 15 s. Before 4.1.1 the owner's own packets renewed the lease with the
+        //      ordinary 8 s window, so the boss changed hands in the middle of the fight (M22).
         {
-            Harness::ClearOutbox();
-            SyncRfabProgressionEvent dragonKill{};
-            dragonKill.Kind = SyncRfabProgressionEvent::EventKind::DragonSoulSync;
-            dragonKill.EpochId = epoch;
-            dragonKill.BookId = GameId{0u, 0x0001CA03u};
-            dragonKill.XpDelta = 777;
-            Check(DeliverWire(world, dragonKill, pHost), "DragonSoulSync packet delivered");
-            const auto guestSouls = DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kGuestConn);
-            Check(guestSouls.size() == 1 && guestSouls[0].Kind == NotifyRfabProgressionEvent::EventKind::DragonSoulSync &&
-                      guestSouls[0].XpDelta == 1,
-                  "peer receives +1 shared Dragon Soul on unique dragon kill");
+            auto& characters = world.GetCharacterService();
+            const auto& ledger = world.GetRfabProgressionService().GetLedger();
 
-            // Duplicate dragon kill report must NOT grant a 2nd soul!
-            Harness::ClearOutbox();
-            Check(DeliverWire(world, dragonKill, pGuest), "duplicate DragonSoulSync delivered");
-            Check(DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kHostConn).empty() &&
-                      DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kGuestConn).empty(),
-                  "duplicate DragonSoulSync does not double-grant souls");
+            const auto makeLockedBoss = [&]() {
+                const entt::entity boss = world.create();
+                world.emplace<OwnerComponent>(boss, pHost);
+                world.emplace<CellIdComponent>(boss, kCell);
+                world.emplace<CharacterComponent>(boss);
 
-            // Word Wall sync + dedupe
+                SyncRfabProgressionEvent packet{};
+                packet.Kind = SyncRfabProgressionEvent::EventKind::BossEncounterSync;
+                packet.EpochId = epoch;
+                packet.SourceKey = "boss_lock";
+                packet.XpDelta = static_cast<int32_t>(World::ToInteger(boss));
+                packet.GlobalValue = 1.0f;
+                const bool delivered = DeliverWire(world, packet, pHost);
+                Check(delivered && ledger.IsBossEncounterLocked(World::ToInteger(boss), pHost->GetId()),
+                      "the host locks the boss it simulates");
+                return boss;
+            };
+            const auto ownerOf = [&](entt::entity aBoss) { return world.get<OwnerComponent>(aBoss).GetOwner(); };
+            const auto countFor = [](const auto& acMessages, entt::entity aBoss) {
+                size_t count = 0;
+                for (const auto& message : acMessages)
+                    count += message.ServerId == World::ToInteger(aBoss) ? 1u : 0u;
+                return count;
+            };
+
+            Check(static_cast<bool>(bEnableBossLeaseRenewal), "Gameplay:bEnableBossLeaseRenewal is on by default");
+
+            // Switch on: the owner's last packet is at t0, the guest keeps sending.
+            const entt::entity bossOn = makeLockedBoss();
+            const uint64_t t0 = 7'000'000'000ull;
+            characters.NotePlayerSimulationActivity(pHost, t0);
+            characters.NotePlayerSimulationActivity(pGuest, t0 + 9'500ull);
             Harness::ClearOutbox();
-            SyncRfabProgressionEvent wordLearn{};
-            wordLearn.Kind = SyncRfabProgressionEvent::EventKind::WordWallSync;
-            wordLearn.EpochId = epoch;
-            wordLearn.BookId = GameId{0u, 0x00013E22u};
-            Check(DeliverWire(world, wordLearn, pHost), "WordWallSync delivered");
-            const auto guestWords = DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kGuestConn);
-            Check(guestWords.size() == 1 && guestWords[0].Kind == NotifyRfabProgressionEvent::EventKind::WordWallSync &&
-                      guestWords[0].BookId == GameId{0u, 0x00013E22u},
-                  "peer receives newly discovered Word Wall");
+            characters.SweepExpiredWorldNpcLeases(t0 + 10'000ull);
+            Check(ownerOf(bossOn) == pHost &&
+                      countFor(DecodeOutboxMessagesFor<NotifyRelinquishControl>(kHostConn), bossOn) == 0,
+                  "a locked boss stays with its owner through 10 s of silence");
+
+            characters.NotePlayerSimulationActivity(pGuest, t0 + 15'500ull);
+            Harness::ClearOutbox();
+            characters.SweepExpiredWorldNpcLeases(t0 + 16'000ull);
+            const auto lapsedRelinquish = DecodeOutboxMessagesFor<NotifyRelinquishControl>(kHostConn);
+            const auto lapsedGrant = DecodeOutboxMessagesFor<NotifyOwnershipTransfer>(kGuestConn);
+            Check(ownerOf(bossOn) == pGuest && countFor(lapsedRelinquish, bossOn) == 1 && countFor(lapsedGrant, bossOn) == 1,
+                  "after 15 s of silence the boss goes to the player who is still fighting, told to both");
+            Check(!ledger.IsBossEncounterLocked(World::ToInteger(bossOn), pGuest->GetId()),
+                  "the previous owner's lock does not follow the boss to its new owner");
+
+            // Switch off: the code as it was. The same ten seconds are enough to lose the boss.
+            bEnableBossLeaseRenewal = false;
+            const entt::entity bossOff = makeLockedBoss();
+            const uint64_t t1 = t0 + 100'000ull;
+            characters.NotePlayerSimulationActivity(pHost, t1);
+            characters.NotePlayerSimulationActivity(pGuest, t1 + 9'500ull);
+            Harness::ClearOutbox();
+            characters.SweepExpiredWorldNpcLeases(t1 + 10'000ull);
+            Check(ownerOf(bossOff) == pGuest &&
+                      countFor(DecodeOutboxMessagesFor<NotifyRelinquishControl>(kHostConn), bossOff) == 1,
+                  "with Gameplay:bEnableBossLeaseRenewal off a locked boss changes hands after 8 s, as it did before 4.1.1");
+            bEnableBossLeaseRenewal = true;
+
+            world.destroy(bossOn);
+            world.destroy(bossOff);
         }
+
+        // 8.2 Shared dragon souls have their own scene (10). Shared Words of Power were removed: no
+        //     client ever sent them (M4).
 
         // 8.3 RFAB_StartMenu Difficulty & Cursed Handshake mismatch detection
         {
@@ -1891,59 +2013,7 @@ int main(int argc, char** argv)
                   "personal SaveBlessing/CrimeGold global is NEVER replicated to teammates");
         }
 
-        // 8.5 Mount Hijack & Saddlebag Anti-Dupe protection
-        {
-            const entt::entity horse = world.create();
-            const uint32_t horseId = World::ToInteger(horse);
-            world.emplace<OwnerComponent>(horse, pHost);
-            world.emplace<CellIdComponent>(horse, kCell);
-            auto& horseChar = world.emplace<CharacterComponent>(horse);
-            horseChar.SetMount(true);
-            world.emplace<InventoryComponent>(horse);
-
-            Inventory::Entry apple{};
-            apple.BaseId = GameId{0u, 0x00064B2Eu};
-            apple.Count = 5;
-            world.get<InventoryComponent>(horse).Content.AddOrRemoveEntry(apple);
-
-            // Host mounts the horse
-            MountRequest hostMount{};
-            hostMount.RiderId = World::ToInteger(hostChar);
-            hostMount.MountId = horseId;
-            Check(DeliverWire(world, hostMount, pHost), "Host mounts horse cleanly");
-            Check(world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseId) == pHost->GetId(),
-                  "MountGuard binds horse to Host while mounted");
-
-            // Guest tries to hijack the horse mid-ride -> rejected!
-            Harness::ClearOutbox();
-            MountRequest guestHijack{};
-            guestHijack.RiderId = World::ToInteger(guestChar);
-            guestHijack.MountId = horseId;
-            Check(DeliverWire(world, guestHijack, pGuest), "Guest hijack attempt processed");
-            Check(world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseId) == pHost->GetId(),
-                  "Guest cannot hijack an actively ridden horse");
-            Check(world.get<OwnerComponent>(horse).GetOwner() == pHost,
-                  "Horse ownership remains with Host rider");
-
-            // Guest tries to steal from Host's horse saddlebag -> rejected!
-            Inventory::Entry stealApple{};
-            stealApple.BaseId = apple.BaseId;
-            stealApple.Count = -1;
-            Check(!world.GetInventoryService().ApplyInventoryDelta(pGuest, horseId, stealApple, false, false, true),
-                  "Bystander saddlebag mutation is blocked while Host owns/rides horse");
-
-            // Host dismounts -> Guest can now mount cleanly!
-            MountRequest hostDismount{};
-            hostDismount.RiderId = World::ToInteger(hostChar);
-            hostDismount.MountId = 0;
-            Check(DeliverWire(world, hostDismount, pHost), "Host dismounts cleanly");
-            Check(world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseId) == 0u,
-                  "MountGuard releases horse immediately upon dismount");
-
-            Check(DeliverWire(world, guestHijack, pGuest), "Guest can mount horse after Host dismounts");
-            Check(world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseId) == pGuest->GetId(),
-                  "MountGuard transfers active rider to Guest after dismount");
-        }
+        // 8.5 The mount ride guard has its own scene (11), driven by the packets a client really sends.
 
         // 8.6 EncounterCoordinator edge-case hardening (duplicate revive anti-reset + last-player disconnect cleanup)
         {
@@ -1967,6 +2037,2922 @@ int main(int argc, char** argv)
             Check(!coord.IsEncounterActiveWithLivingParticipants(),
                   "RemovePlayer clears active encounter state when last participant disconnects");
         }
+    }
+
+    // Scene 9: catch-up XP is counted per persistent player identity, never per connection (M1).
+    // Every step goes through the real join path and the real XP packet; the amounts are read from
+    // what the server actually sent to the joining connection.
+    {
+        std::printf("[scene 9] late-join catch-up XP: per identity, never per connection\n");
+        const auto storePath = SaveSnapshotService::GetDefaultCheckpointStorePath();
+        std::filesystem::remove(storePath, removeEc);
+
+        const auto joinAs = [](World& aWorld, TiltedPhoques::ConnectionId_t aConn, const char* acName) {
+            Player* pPlayer = aWorld.GetPlayerManager().Create(aConn);
+            if (acName != nullptr)
+                pPlayer->SetUsername(acName);
+            TimeModel joinTime{};
+            joinTime.Time = 8.0f;
+            joinTime.Day = 1;
+            joinTime.Month = 1;
+            joinTime.Year = 201;
+            Harness::ClearOutbox();
+            aWorld.GetDispatcher().trigger(PlayerJoinEvent{pPlayer, {}, {}, DateTime{joinTime}});
+            return pPlayer;
+        };
+        const auto leave = [](World& aWorld, Player* apPlayer) {
+            aWorld.GetDispatcher().trigger(PlayerLeaveEvent{apPlayer});
+            aWorld.GetPlayerManager().Remove(apPlayer);
+        };
+        // The packet a client really sends when its RFAB XP wallet grows: the relay to the party.
+        // (No client sends a keyed LedgerXpGrant; the first version of this scene used one and
+        // proved the accounting on a path nothing feeds.)
+        const auto earn = [](World& aWorld, Player* apPlayer, uint32_t aXp) {
+            SyncRfabExperienceRequest relay{};
+            relay.Experience = aXp;
+            return DeliverWire(aWorld, relay, apPlayer);
+        };
+        // Catch-up XP the server sent to this connection since the outbox was last cleared.
+        const auto catchUpSentTo = [](TiltedPhoques::ConnectionId_t aConn) {
+            int64_t total = 0;
+            for (const auto& message : DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(aConn))
+                if (message.Kind == NotifyRfabProgressionEvent::EventKind::LateJoinCatchUpXp)
+                    total += message.XpDelta;
+            return total;
+        };
+
+        bEnableLateJoinCatchUpXp = true;
+        {
+            GameServer server{registry};
+            World& world = server.GetWorld();
+            auto& ledger = world.GetRfabProgressionService().GetLedger();
+
+            Player* pHost = joinAs(world, 0x9001u, "HostS9");
+            Check(catchUpSentTo(0x9001u) == 0, "the first player of a new world is owed nothing");
+            Player* pGuest = joinAs(world, 0x9002u, "GuestS9");
+            Check(catchUpSentTo(0x9002u) == 0, "a player who joins before any XP is earned is owed nothing");
+
+            Harness::ClearOutbox();
+            Check(earn(world, pHost, 1000) && ledger.GetTotalSharedXp() == 1000, "the party earns 1000 XP while both are connected");
+            {
+                const auto relayed = DecodeOutboxMessagesFor<NotifySyncRfabExperience>(0x9002u);
+                Check(relayed.size() == 1 && relayed[0].Experience == 1000, "the guest is sent the 1000 XP by the ordinary relay");
+            }
+
+            // The defect: Player::GetId() is new on every connection, so this paid 1000 again.
+            leave(world, pGuest);
+            pGuest = joinAs(world, 0x9003u, "GuestS9");
+            Check(catchUpSentTo(0x9003u) == 0, "a reconnect pays nothing to a player who was there when the XP was earned");
+
+            leave(world, pGuest);
+            Check(earn(world, pHost, 500) && ledger.GetTotalSharedXp() == 1500, "the host earns 500 XP while the guest is away");
+            pGuest = joinAs(world, 0x9004u, "  guests9 ");
+            Check(catchUpSentTo(0x9004u) == 500, "the returning guest is paid exactly what was earned while away (name compared without case and padding)");
+            leave(world, pGuest);
+            pGuest = joinAs(world, 0x9005u, "GuestS9");
+            Check(catchUpSentTo(0x9005u) == 0, "and is not paid for it a second time");
+
+            Player* pLate = joinAs(world, 0x9006u, "LateS9");
+            Check(catchUpSentTo(0x9006u) == 1500, "a friend who joins the campaign late is paid the party total");
+            Harness::ClearOutbox();
+            world.GetDispatcher().trigger(PlayerJoinEvent{pLate});
+            Check(catchUpSentTo(0x9006u) == 0, "a second join event for the same connection pays nothing");
+
+            joinAs(world, 0x9007u, nullptr);
+            Check(catchUpSentTo(0x9007u) == 0, "a connection without a name or Discord id has no persistent identity and is owed nothing");
+
+            // A checkpoint carries the credits together with the total.
+            auto& saves = world.GetSaveSnapshotService();
+            auto& coordinator = saves.GetCoordinator();
+            Check(saves.TriggerCoordinatedSave(true, nullptr), "a checkpoint starts");
+            if (const auto pending = coordinator.GetPendingBarrier(); pending.has_value())
+            {
+                std::vector<Player*> connected;
+                world.GetPlayerManager().ForEach([&](Player* apPlayer) { connected.push_back(apPlayer); });
+                for (Player* pPlayer : connected)
+                {
+                    CoordinatedSaveAck ack{};
+                    ack.EpochId = pending->EpochId;
+                    ack.SlotName = String(pending->SlotName.c_str());
+                    ack.Success = true;
+                    Deliver(world, ack, pPlayer);
+                }
+            }
+            Check(!coordinator.HasPendingBarrier() && saves.GetSnapshotCount() == 1, "the checkpoint is committed");
+            Check(saves.SaveCheckpointsToDisk(storePath), "the checkpoint is written");
+        }
+
+        // The other half of the defect: after a restart the tracker was empty, so every player who
+        // had been there all along was paid up to the cap on the first join.
+        {
+            GameServer restarted{registry};
+            World& world = restarted.GetWorld();
+            const auto& ledger = world.GetRfabProgressionService().GetLedger();
+            Check(ledger.GetTotalSharedXp() == 1500, "the restarted server restores the party total");
+            Check(ledger.GetXpCredits().GetCreditedXp("name:hosts9") == 1500 && ledger.GetXpCredits().GetCreditedXp("name:guests9") == 1500,
+                  "the restarted server restores who already holds the shared XP");
+
+            joinAs(world, 0x9101u, "HostS9");
+            Check(catchUpSentTo(0x9101u) == 0, "a server restart pays nothing to a player who was there all along");
+            joinAs(world, 0x9102u, "NewAfterRestartS9");
+            Check(catchUpSentTo(0x9102u) == 1500, "a new friend joining after the restart is paid the party total once");
+
+            // Switched off, nothing is paid - and switching it on later does not pay for that time.
+            bEnableLateJoinCatchUpXp = false;
+            Player* pOff = joinAs(world, 0x9103u, "OffS9");
+            Check(catchUpSentTo(0x9103u) == 0, "with Gameplay:bEnableLateJoinCatchUpXp off a late joiner is paid nothing");
+            leave(world, pOff);
+            bEnableLateJoinCatchUpXp = true;
+            joinAs(world, 0x9104u, "OffS9");
+            Check(catchUpSentTo(0x9104u) == 0, "switching the setting on later does not pay for the time it was off");
+        }
+
+        bEnableLateJoinCatchUpXp = false;
+        std::filesystem::remove(storePath, removeEc);
+    }
+
+    // Scene 10: a dragon's soul is shared with the party members who were not there, once per
+    // death (M2). The trigger is the death the server itself accepts; nothing a client says about
+    // souls is trusted. Amounts are read from the packets sent to each connection.
+    {
+        std::printf("[scene 10] shared dragon soul: absent party members only, once per death\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kKillerConn = 0xA001u;
+        constexpr TiltedPhoques::ConnectionId_t kNearConn = 0xA002u;
+        constexpr TiltedPhoques::ConnectionId_t kFarConn = 0xA003u;
+        const GameId kLairCell{0u, 0x000A1001u};
+        const GameId kTownCell{0u, 0x000A1002u};
+        const GameId kDragonBase{0u, 0x000F811Au};
+
+        Player* pKiller = world.GetPlayerManager().Create(kKillerConn);
+        Player* pNear = world.GetPlayerManager().Create(kNearConn);
+        Player* pFar = world.GetPlayerManager().Create(kFarConn);
+        TimeModel t0{};
+        t0.Time = 9.0f;
+        t0.Day = 2;
+        t0.Month = 2;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pKiller, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pNear, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pFar, {}, {}, DateTime{t0}});
+        Check(world.GetPartyService().IsPlayerInParty(pNear) && world.GetPartyService().IsPlayerInParty(pFar),
+              "the three players are one party");
+
+        pKiller->SetCellComponent(CellIdComponent{kLairCell});
+        pNear->SetCellComponent(CellIdComponent{kLairCell});
+        pFar->SetCellComponent(CellIdComponent{kTownCell});
+
+        uint32_t nextCookie = 500u;
+        const auto spawn = [&](uint32_t aRefId, bool aIsDragon, bool aAlreadyDead) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest assign{};
+            assign.Cookie = nextCookie++;
+            assign.ReferenceId = GameId{0u, aRefId};
+            assign.FormId = kDragonBase;
+            assign.CellId = kLairCell;
+            assign.Position = {10.0f, 20.0f, 30.0f};
+            assign.CurrentActorData.BaseId = kDragonBase;
+            assign.CurrentActorData.InitialActorValues.ActorValuesList[24] = 3000.0f;
+            assign.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 3000.0f;
+            assign.CurrentActorData.IsDead = aAlreadyDead;
+            assign.IsDragon = aIsDragon;
+            (void)DeliverWire(world, assign, pKiller);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(kKillerConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const auto reportDeath = [&](uint32_t aServerId, Player* apBy, bool aIsDead) {
+            Harness::ClearOutbox();
+            RequestDeathStateChange death{};
+            death.Id = aServerId;
+            death.IsDead = aIsDead;
+            return DeliverWire(world, death, apBy);
+        };
+        // Souls the server granted to this connection since the outbox was last cleared.
+        const auto soulsSentTo = [](TiltedPhoques::ConnectionId_t aConn) {
+            int64_t total = 0;
+            for (const auto& message : DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(aConn))
+                if (message.Kind == NotifyRfabProgressionEvent::EventKind::DragonSoulSync)
+                    total += message.XpDelta;
+            return total;
+        };
+        const auto nobodyWasSentASoul = [&] {
+            return soulsSentTo(kKillerConn) == 0 && soulsSentTo(kNearConn) == 0 && soulsSentTo(kFarConn) == 0;
+        };
+
+        const uint32_t firstDragon = spawn(0x000A2001u, true, false);
+        Check(firstDragon != 0xFFFFFFFFu, "the killer's client registers a living dragon");
+        Check(reportDeath(firstDragon, pKiller, true) && nobodyWasSentASoul(),
+              "with Gameplay:bEnableSharedDragonSouls off (the default) a dragon's death sends no souls");
+
+        bEnableSharedDragonSouls = true;
+
+        Check(reportDeath(firstDragon, pNear, true) && nobodyWasSentASoul(),
+              "a second death packet for a dragon that is already dead sends no souls");
+
+        // What a 4.1.0 client sends for every dead dragon it simulates, corpses included.
+        {
+            Harness::ClearOutbox();
+            SyncRfabProgressionEvent clientReport{};
+            clientReport.Kind = SyncRfabProgressionEvent::EventKind::DragonSoulSync;
+            clientReport.EpochId = world.GetSaveSnapshotService().GetCurrentWorldEpoch();
+            clientReport.BookId = GameId{0u, 0x000A2001u};
+            clientReport.XpDelta = static_cast<int32_t>(firstDragon);
+            Check(DeliverWire(world, clientReport, pKiller) && nobodyWasSentASoul(),
+                  "a client's own report about a dead dragon sends no souls");
+            clientReport.SourceKey = "dragon:made-up-key";
+            Check(DeliverWire(world, clientReport, pNear) && nobodyWasSentASoul(),
+                  "a client cannot invent a dragon by sending a key of its own");
+        }
+
+        const uint32_t secondDragon = spawn(0x000A2002u, true, false);
+        Check(reportDeath(secondDragon, pKiller, true), "the second dragon dies");
+        {
+            const auto farGrants = DecodeOutboxMessagesFor<NotifyRfabProgressionEvent>(kFarConn);
+            int64_t grantCount = 0;
+            for (const auto& message : farGrants)
+                if (message.Kind == NotifyRfabProgressionEvent::EventKind::DragonSoulSync)
+                    ++grantCount;
+            Check(grantCount == 1 && soulsSentTo(kFarConn) == 1, "the party member in another cell is sent exactly one soul, as +1");
+        }
+        Check(soulsSentTo(kKillerConn) == 0 && soulsSentTo(kNearConn) == 0,
+              "the killer and the member standing at the dragon are sent nothing: they absorb the soul the native way");
+
+        const uint32_t corpse = spawn(0x000A2003u, true, true);
+        Check(corpse != 0xFFFFFFFFu && reportDeath(corpse, pKiller, true) && nobodyWasSentASoul(),
+              "a dragon that is registered already dead (a corpse someone walked up to) sends no souls");
+
+        const uint32_t ordinaryEnemy = spawn(0x000A2004u, false, false);
+        Check(ordinaryEnemy != 0xFFFFFFFFu && reportDeath(ordinaryEnemy, pKiller, true) && nobodyWasSentASoul(),
+              "an ordinary enemy's death sends no souls");
+
+        // The owner brings the dragon back (a rollback does this) and it dies again: a new death.
+        Check(reportDeath(secondDragon, pKiller, false) && nobodyWasSentASoul(), "resurrecting a dragon sends no souls");
+        Check(reportDeath(secondDragon, pKiller, true) && soulsSentTo(kFarConn) == 1,
+              "a dragon that came back to life and died again counts as one more death");
+
+        // Everyone at the dragon: nothing to share.
+        pFar->SetCellComponent(CellIdComponent{kLairCell});
+        const uint32_t thirdDragon = spawn(0x000A2005u, true, false);
+        Check(reportDeath(thirdDragon, pKiller, true) && nobodyWasSentASoul(),
+              "when the whole party is at the dragon nobody is sent a soul");
+
+        bEnableSharedDragonSouls = false;
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+    }
+
+    // Scene 11: the mount ride guard (M3). Clients report the start of a ride and never its end,
+    // so the scene ends rides the three ways they really end: the rider's dismount animation, the
+    // rider walking away, the rider leaving the server. Every step is a packet a client sends.
+    {
+        std::printf("[scene 11] mount ride guard: a ride ends without a dismount packet\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xB001u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xB002u;
+        const GameId kStableCell{0u, 0x000B1001u};
+        const GameId kHorseBase{0u, 0x000109E3u};
+        const GameId kApple{0u, 0x00064B2Eu};
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 10.0f;
+        t0.Day = 3;
+        t0.Month = 3;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+        pHost->SetCellComponent(CellIdComponent{kStableCell});
+        pGuest->SetCellComponent(CellIdComponent{kStableCell});
+
+        uint32_t nextCookie = 700u;
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kGuardBase{0u, 0x000B4001u};
+        const auto assign = [&](Player* apOwner, TiltedPhoques::ConnectionId_t aConn, const GameId& acRefId, bool aIsMount, const glm::vec3& acPosition) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            request.ReferenceId = acRefId;
+            // A client sends no base form for its own character (the server refuses one).
+            if (acRefId != kPlayerRef)
+                request.FormId = aIsMount ? kHorseBase : kGuardBase;
+            request.CellId = kStableCell;
+            request.Position = acPosition;
+            request.CurrentActorData.BaseId = request.FormId;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[24] = 300.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 300.0f;
+            if (aIsMount)
+            {
+                Inventory::Entry apples{};
+                apples.BaseId = kApple;
+                apples.Count = 5;
+                request.CurrentActorData.InitialInventory.AddOrRemoveEntry(apples);
+            }
+            request.IsMount = aIsMount;
+            (void)DeliverWire(world, request, apOwner);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const auto requestMount = [&](Player* apRider, uint32_t aRiderId, uint32_t aMountId) {
+            Harness::ClearOutbox();
+            MountRequest request{};
+            request.RiderId = aRiderId;
+            request.MountId = aMountId;
+            return DeliverWire(world, request, apRider);
+        };
+        // The other player is told about a mount only when the server accepted the request.
+        const auto wasToldAboutMount = [](TiltedPhoques::ConnectionId_t aConn, uint32_t aRiderId, uint32_t aMountId) {
+            for (const auto& notify : DecodeOutboxMessagesFor<NotifyMount>(aConn))
+                if (notify.RiderId == aRiderId && notify.MountId == aMountId)
+                    return true;
+            return false;
+        };
+        const auto wasGrantedSimulation = [](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& grant : DecodeOutboxMessagesFor<NotifyOwnershipTransfer>(aConn))
+                if (grant.ServerId == aServerId)
+                    return true;
+            return false;
+        };
+        // One movement report for an entity the sender simulates, optionally with an animation event.
+        const auto reportMovement = [&](Player* apSender, uint32_t aServerId, const glm::vec3& acPosition, const char* acAnimationEvent) {
+            ClientReferencesMoveRequest request{};
+            request.Tick = 1000u;
+            ReferenceUpdate update{};
+            update.UpdatedMovement.CellId = kStableCell;
+            update.UpdatedMovement.Position = acPosition;
+            if (acAnimationEvent != nullptr)
+            {
+                ActionEvent action{};
+                action.ActorId = aServerId;
+                action.EventName = acAnimationEvent;
+                update.ActionEvents.push_back(action);
+            }
+            request.Updates[aServerId] = update;
+            Harness::ClearOutbox();
+            Deliver(world, request, apSender);
+        };
+        const auto takeApple = [&](Player* apTaker, uint32_t aHorseId) {
+            Harness::ClearOutbox();
+            RequestInventoryChanges request{};
+            request.ServerId = aHorseId;
+            request.Item.BaseId = kApple;
+            request.Item.Count = -1;
+            request.UpdateClients = true;
+            return DeliverWire(world, request, apTaker);
+        };
+        const auto applesLeft = [&](uint32_t aHorseId) {
+            GameId apple = kApple;
+            return world.get<InventoryComponent>(static_cast<entt::entity>(aHorseId)).Content.GetEntryCountById(apple);
+        };
+
+        const glm::vec3 kAtStable{100.0f, 100.0f, 0.0f};
+        const uint32_t hostChar = assign(pHost, kHostConn, kPlayerRef, false, kAtStable);
+        const uint32_t guestChar = assign(pGuest, kGuestConn, kPlayerRef, false, kAtStable);
+        const uint32_t horseA = assign(pHost, kHostConn, GameId{0u, 0x000B2001u}, true, kAtStable);
+        const uint32_t horseB = assign(pHost, kHostConn, GameId{0u, 0x000B2002u}, true, kAtStable);
+        Check(hostChar != 0xFFFFFFFFu && guestChar != 0xFFFFFFFFu && horseA != 0xFFFFFFFFu && horseB != 0xFFFFFFFFu,
+              "two player characters and two horses are registered");
+
+        // --- Off (the default): the behaviour of 4.1.0, whoever mounts takes the horse over.
+        Check(requestMount(pHost, hostChar, horseA) && wasToldAboutMount(kGuestConn, hostChar, horseA),
+              "the host mounts a horse and the guest is told");
+        Check(requestMount(pGuest, guestChar, horseA) && wasToldAboutMount(kHostConn, guestChar, horseA) &&
+                  wasGrantedSimulation(kGuestConn, horseA),
+              "with Gameplay:bEnableMountRideGuard off (the default) a second mount request is honoured as in 4.1.0");
+        Check(takeApple(pHost, horseA) && applesLeft(horseA) == 4,
+              "with the guard off a player who does not simulate the horse can still use its saddlebag");
+
+        // --- On.
+        bEnableMountRideGuard = true;
+        reportMovement(pGuest, guestChar, kAtStable, "HorseExit");
+        Check(requestMount(pHost, hostChar, horseA) && wasToldAboutMount(kGuestConn, hostChar, horseA) &&
+                  wasGrantedSimulation(kHostConn, horseA),
+              "with the guard on the host mounts horse A");
+        Check(requestMount(pGuest, guestChar, horseA) && !wasToldAboutMount(kHostConn, guestChar, horseA) &&
+                  !wasGrantedSimulation(kGuestConn, horseA),
+              "the guest cannot mount the horse the host is riding");
+        Check(takeApple(pGuest, horseA) && applesLeft(horseA) == 4, "the guest cannot change the saddlebag of the horse the host is riding");
+        Check(takeApple(pHost, horseA) && applesLeft(horseA) == 3, "the rider can use the saddlebag of the horse they ride");
+
+        // 1. The rider's own animation: the only dismount report a client produces.
+        reportMovement(pHost, hostChar, kAtStable, "HorseExit");
+        Check(takeApple(pGuest, horseA) && applesLeft(horseA) == 2, "after the host's dismount animation the saddlebag is open to the guest");
+        Check(requestMount(pGuest, guestChar, horseA) && wasToldAboutMount(kHostConn, guestChar, horseA) &&
+                  wasGrantedSimulation(kGuestConn, horseA),
+              "after the host's dismount animation the guest can mount the horse");
+
+        // 2. No animation event arrives (lost, or the game used another one): the rider walks away.
+        reportMovement(pGuest, guestChar, kAtStable, "HorseExit");
+        Check(requestMount(pHost, hostChar, horseB), "the host mounts horse B");
+        reportMovement(pHost, hostChar, {100.0f + 400.0f, 100.0f, 0.0f}, nullptr);
+        Check(requestMount(pGuest, guestChar, horseB) && !wasToldAboutMount(kHostConn, guestChar, horseB),
+              "a rider whose position report lags a little behind the horse is still riding");
+        reportMovement(pHost, hostChar, {100.0f + 5000.0f, 100.0f, 0.0f}, nullptr);
+        Check(requestMount(pGuest, guestChar, horseB) && wasToldAboutMount(kHostConn, guestChar, horseB),
+              "once the rider is far from the horse the ride is over, without any dismount report");
+
+        // 3. An NPC the host simulates mounts a horse: no ride is recorded under the host's name.
+        reportMovement(pGuest, guestChar, kAtStable, "HorseExit");
+        reportMovement(pHost, hostChar, kAtStable, nullptr);
+        const uint32_t hostNpc = assign(pHost, kHostConn, GameId{0u, 0x000B3001u}, false, kAtStable);
+        Check(requestMount(pHost, hostChar, horseA), "the host mounts horse A again");
+        Check(hostNpc != 0xFFFFFFFFu && requestMount(pHost, hostNpc, horseB) && wasToldAboutMount(kGuestConn, hostNpc, horseB),
+              "an NPC simulated by the host mounts horse B");
+        Check(requestMount(pGuest, guestChar, horseA) && !wasToldAboutMount(kHostConn, guestChar, horseA),
+              "the NPC's mount did not overwrite the host's own ride: horse A is still the host's");
+
+        // 4. The rider leaves the server.
+        world.GetDispatcher().trigger(PlayerLeaveEvent{pHost});
+        Check(requestMount(pGuest, guestChar, horseA) && world.GetCharacterService().GetMountGuard().GetActiveRiderPlayerId(horseA) == pGuest->GetId(),
+              "after the rider left the server the guest can mount the horse");
+
+        bEnableMountRideGuard = false;
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+    }
+
+    // Scene 12: a container that is registered only when someone takes from it (M11). QuickLootIE and
+    // the auto-loot cloak take items without activating the container, and a container outside the
+    // player's own cell is not registered in advance. Each client rolls its own levelled contents,
+    // so the second player may be looking at items the server has never heard of. The rules:
+    //  - an item the server lists is taken by exactly one player, whatever the order of packets;
+    //  - an item the server does not list is granted ONCE (CoopLootLedger case 3: a script may have
+    //    put it there on that client only, and refusing would eat quest rewards), never twice.
+    // The second rule is what is left of M11: the second player keeps the one item of its own roll
+    // that it took before the server's contents reached it.
+    {
+        std::printf("[scene 12] loot from a container registered on the first take\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kFirstConn = 0xC001u;
+        constexpr TiltedPhoques::ConnectionId_t kSecondConn = 0xC002u;
+        const GameId kRuinCell{0u, 0x000C1001u};
+        const GameId kChest{0u, 0x000C2001u};
+        const GameId kGold{0u, 0x0000000Fu};
+        const GameId kSword{0u, 0x000139B9u};
+        const GameId kAxe{0u, 0x000139B3u};
+
+        Player* pFirst = world.GetPlayerManager().Create(kFirstConn);
+        Player* pSecond = world.GetPlayerManager().Create(kSecondConn);
+        TimeModel t0{};
+        t0.Time = 11.0f;
+        t0.Day = 4;
+        t0.Month = 4;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pFirst, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pSecond, {}, {}, DateTime{t0}});
+        pFirst->SetCellComponent(CellIdComponent{kRuinCell});
+        pSecond->SetCellComponent(CellIdComponent{kRuinCell});
+
+        const auto registerPlayerCharacter = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, uint32_t aCookie) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = aCookie;
+            request.ReferenceId = GameId{0u, 0x14u};
+            request.CellId = kRuinCell;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[24] = 100.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 100.0f;
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const auto stack = [](const GameId& acItem, int32_t aCount) {
+            Inventory::Entry entry{};
+            entry.BaseId = acItem;
+            entry.Count = aCount;
+            return entry;
+        };
+        // What the client sends for a container it has not registered: the contents as it sees them now.
+        const auto registerChest = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, std::initializer_list<Inventory::Entry> aLocalContents) {
+            Harness::ClearOutbox();
+            AssignObjectsRequest request{};
+            ObjectData chest{};
+            chest.Id = kChest;
+            chest.CellId = kRuinCell;
+            for (const auto& entry : aLocalContents)
+                chest.CurrentInventory.AddOrRemoveEntry(entry);
+            request.Objects.push_back(chest);
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignObjectsResponse>(aConn);
+            return (responses.size() == 1 && responses[0].Objects.size() == 1) ? responses[0].Objects[0] : ObjectData{};
+        };
+        const auto take = [&](Player* apPlayer, uint32_t aChestServerId, const GameId& acItem, int32_t aCount) {
+            Harness::ClearOutbox();
+            RequestInventoryChanges request{};
+            request.ServerId = aChestServerId;
+            request.Item = stack(acItem, -aCount);
+            request.UpdateClients = true;
+            return DeliverWire(world, request, apPlayer);
+        };
+        // Net change the server told this connection to apply to the given entity, for one item.
+        const auto toldToChange = [](TiltedPhoques::ConnectionId_t aConn, uint32_t aEntityServerId, const GameId& acItem) {
+            int32_t total = 0;
+            for (const auto& notify : DecodeOutboxMessagesFor<NotifyInventoryChanges>(aConn))
+                if (notify.ServerId == aEntityServerId && notify.Item.BaseId == acItem)
+                    total += notify.Item.Count;
+            return total;
+        };
+        const auto countOf = [](const Inventory& acInventory, const GameId& acItem) {
+            GameId lookup = acItem;
+            return acInventory.GetEntryCountById(lookup);
+        };
+
+        const uint32_t firstChar = registerPlayerCharacter(pFirst, kFirstConn, 900u);
+        const uint32_t secondChar = registerPlayerCharacter(pSecond, kSecondConn, 901u);
+        Check(firstChar != 0xFFFFFFFFu && secondChar != 0xFFFFFFFFu, "both player characters are registered");
+
+        // The first player's game rolled 10 gold and a sword. It takes the gold through the loot
+        // window, so the container reaches the server already without it.
+        const ObjectData asFirst = registerChest(pFirst, kFirstConn, {stack(kSword, 1)});
+        Check(asFirst.IsSenderFirst && asFirst.ServerId != 0, "the first taker's view of the chest becomes the server's");
+        const uint32_t chestId = asFirst.ServerId;
+
+        // The second player's game rolled an axe instead of the sword. It took the axe before the
+        // chest was known to it, and registers the chest as it sees it now: empty.
+        const ObjectData asSecond = registerChest(pSecond, kSecondConn, {});
+        Check(!asSecond.IsSenderFirst && asSecond.ServerId == chestId, "the second taker is told the chest already exists");
+        Check(countOf(asSecond.CurrentInventory, kSword) == 1 && countOf(asSecond.CurrentInventory, kAxe) == 0,
+              "and receives the server's contents (a sword), not its own roll (an axe)");
+
+        // Its queued take of the axe now reaches the server.
+        Check(take(pSecond, chestId, kAxe, 1), "the queued take of an item only the second client rolled is processed");
+        Check(toldToChange(kSecondConn, secondChar, kAxe) == 0,
+              "an item the server never listed is granted once: the second player keeps the axe of its own roll");
+        Check(toldToChange(kFirstConn, chestId, kSword) == 0, "the server's own contents are untouched by it");
+        Check(take(pFirst, chestId, kAxe, 1) && toldToChange(kFirstConn, firstChar, kAxe) == -1,
+              "but not twice: another player claiming the same unlisted item is told to give it back");
+
+        // Both players go for the single sword; the packets arrive one after the other.
+        Check(take(pSecond, chestId, kSword, 1) && toldToChange(kFirstConn, chestId, kSword) == -1 &&
+                  toldToChange(kSecondConn, secondChar, kSword) == 0,
+              "the take that arrives first is granted and the other player sees the sword leave the chest");
+        Check(take(pFirst, chestId, kSword, 1) && toldToChange(kFirstConn, firstChar, kSword) == -1,
+              "the take that arrives second is refused: that player is told to give the sword back");
+        Check(toldToChange(kSecondConn, chestId, kSword) == 0, "and the winner is not told about a second sword leaving the chest");
+
+        // A third registration (a player who walks in later) gets the chest as it is now.
+        const ObjectData later = registerChest(pFirst, kFirstConn, {stack(kSword, 1), stack(kGold, 10)});
+        Check(!later.IsSenderFirst && countOf(later.CurrentInventory, kSword) == 0 && countOf(later.CurrentInventory, kGold) == 0,
+              "a later registration cannot put taken items back into the chest");
+
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+    }
+
+    // Scene 13: the desync detector (work plan 3.3). A client reports what it believes about every
+    // character; the server compares the report with its own state for that observer. Every report
+    // below is the packet a client sends, through the wire encoding.
+    {
+        std::printf("[scene 13] desync detector: reports, confirmation, bounded resend\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+        auto& resync = world.ctx().at<SessionResyncService>();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xD001u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xD002u;
+        const GameId kCell{0u, 0x000D1001u};
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kGuardBase{0u, 0x000D4001u};
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 10.0f;
+        t0.Day = 3;
+        t0.Month = 3;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+        pHost->SetCellComponent(CellIdComponent{kCell});
+        pGuest->SetCellComponent(CellIdComponent{kCell});
+
+        uint32_t nextCookie = 900u;
+        const auto assign = [&](Player* apOwner, TiltedPhoques::ConnectionId_t aConn, const GameId& acRefId) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            request.ReferenceId = acRefId;
+            if (acRefId != kPlayerRef)
+                request.FormId = kGuardBase;
+            request.CellId = kCell;
+            request.Position = glm::vec3{100.0f, 100.0f, 0.0f};
+            request.CurrentActorData.BaseId = request.FormId;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[24] = 300.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 300.0f;
+            (void)DeliverWire(world, request, apOwner);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+
+        const uint32_t hostChar = assign(pHost, kHostConn, kPlayerRef);
+        const uint32_t guestChar = assign(pGuest, kGuestConn, kPlayerRef);
+        Harness::ClearOutbox();
+        const uint32_t guard = assign(pHost, kHostConn, GameId{0u, 0x000D2001u});
+        Check(hostChar != 0xFFFFFFFFu && guestChar != 0xFFFFFFFFu && guard != 0xFFFFFFFFu,
+              "two player characters and a guard simulated by the host are registered");
+        Check(world.GetCharacterService().GetInterestRegistry().IsMarkedInRange(pGuest->GetId(), guard),
+              "the server considers the guard delivered to the guest");
+
+        using Session::EntityDigest::Facts;
+        const auto row = [](uint32_t aServerId, uint8_t aFlags, uint8_t aHealth = Session::EntityDigest::kNoHealth) {
+            Facts facts{};
+            facts.ServerId = aServerId;
+            facts.Flags = aFlags;
+            facts.HealthPct = aHealth;
+            return facts;
+        };
+        using Session::EntityDigest::kFlagDead;
+        using Session::EntityDigest::kFlagLive;
+        using Session::EntityDigest::kFlagOwnedByReporter;
+
+        uint32_t sequence = 0;
+        // One report from the guest, five seconds after the previous one.
+        const auto report = [&](std::initializer_list<Facts> aRows) {
+            resync.SkewClockForTesting(5000);
+            Harness::ClearOutbox();
+            ClientEntityDigest digest{};
+            digest.Sequence = ++sequence;
+            for (const Facts& facts : aRows)
+                digest.Entries.push_back(facts);
+            return DeliverWire(world, digest, pGuest);
+        };
+        const auto resentToGuest = [&](uint32_t aServerId) {
+            for (const auto& spawn : DecodeOutboxMessagesFor<CharacterSpawnRequest>(kGuestConn))
+                if (spawn.ServerId == aServerId)
+                    return true;
+            return false;
+        };
+        const auto removedForGuest = [&](uint32_t aServerId) {
+            for (const auto& removal : DecodeOutboxMessagesFor<NotifyRemoveCharacter>(kGuestConn))
+                if (removal.ServerId == aServerId)
+                    return true;
+            return false;
+        };
+        const auto totals = [&]() { return resync.GetDesyncTotals(); };
+
+        const Facts mine = row(guestChar, kFlagOwnedByReporter);
+        const Facts hostSeen = row(hostChar, kFlagLive, 100);
+        const Facts guardAlive = row(guard, kFlagLive, 100);
+        const Facts guardDead = row(guard, kFlagLive | kFlagDead, 0);
+
+        // --- In sync: nothing is said, however often it is reported.
+        Check(report({mine, hostSeen, guardAlive}) && report({mine, hostSeen, guardAlive}) && report({mine, hostSeen, guardAlive}),
+              "the guest's reports are accepted");
+        Check(totals().Reports == 3 && totals().Confirmed == 0 && totals().Repaired == 0,
+              "a client that agrees with the server produces no finding");
+
+        // --- The guest never got the guard. Seen once it is a suspicion; seen again it is a finding.
+        (void)report({mine, hostSeen});
+        Check(totals().Confirmed == 0, "a difference reported once is not a finding yet (the spawn may be in flight)");
+        (void)report({mine, hostSeen});
+        Check(totals().Confirmed == 1, "the same difference in the next report is confirmed and logged");
+        Check(!resentToGuest(guard) && totals().Repaired == 0,
+              "with Gameplay:bEnableDesyncAutoRepair off (the default) the detector only writes to the log");
+
+        bEnableDesyncAutoRepair = true;
+        (void)report({mine, hostSeen});
+        Check(resentToGuest(guard) && totals().Repaired == 1, "switched on, the missing guard is resent to that client");
+        (void)report({mine, hostSeen, guardAlive});
+        Check(totals().Healed == 1 && !resentToGuest(guard), "the next report has the guard: the repair is recorded, nothing more is sent");
+
+        // --- The host kills the guard; the guest's screen still shows it alive.
+        RequestDeathStateChange death{};
+        death.Id = guard;
+        death.IsDead = true;
+        Check(DeliverWire(world, death, pHost) && world.get<CharacterComponent>(static_cast<entt::entity>(guard)).IsDead(),
+              "the host reports the guard's death");
+        const uint64_t confirmedBeforeDeath = totals().Confirmed;
+        (void)report({mine, hostSeen, guardAlive});
+        Check(!resentToGuest(guard), "one report with the guard alive may be the death still in flight");
+        (void)report({mine, hostSeen, guardAlive});
+        bool resentAsDead = false;
+        for (const auto& spawn : DecodeOutboxMessagesFor<CharacterSpawnRequest>(kGuestConn))
+            resentAsDead = resentAsDead || (spawn.ServerId == guard && spawn.IsDead);
+        Check(totals().Confirmed == confirmedBeforeDeath + 1 && resentAsDead,
+              "the second one is a life-state desync: logged, and the guard is resent as dead");
+        (void)report({mine, hostSeen, guardDead});
+        Check(totals().Healed == 2, "the guest agrees after the resend");
+
+        // --- A resend that changes nothing is not repeated forever.
+        const uint64_t repairedBefore = totals().Repaired;
+        for (int i = 0; i < 12; ++i)
+            (void)report({mine, hostSeen, guardAlive});
+        Check(totals().Repaired == repairedBefore + 1,
+              "a client that keeps showing the guard alive gets one more resend in the window, not one per report");
+
+        // --- A character the guest still shows and the server does not have at all.
+        const uint32_t kGhost = 0x000ABCDEu;
+        (void)report({mine, hostSeen, guardDead, row(kGhost, kFlagLive, 100)});
+        Check(!removedForGuest(kGhost), "an unknown character reported once may be a removal in flight");
+        (void)report({mine, hostSeen, guardDead, row(kGhost, kFlagLive, 100)});
+        Check(removedForGuest(kGhost), "reported again, the guest is told to remove it");
+
+        // --- Who simulates it: said, never "repaired" with a second copy.
+        const uint64_t confirmedBeforeOwner = totals().Confirmed;
+        (void)report({mine, hostSeen, row(guard, kFlagOwnedByReporter)});
+        (void)report({mine, hostSeen, row(guard, kFlagOwnedByReporter)});
+        Check(totals().Confirmed == confirmedBeforeOwner + 1 && !resentToGuest(guard),
+              "a guest that believes it simulates the host's guard is logged and not sent a copy of it");
+
+        // --- Whatever a client reports, the server's work for it is bounded.
+        ClientEntityDigest flood{};
+        for (uint32_t id = 0; id < 400; ++id)
+            flood.Entries.push_back(row(0x00F00000u + id, kFlagLive, 100));
+        resync.SkewClockForTesting(5000);
+        (void)DeliverWire(world, flood, pGuest);
+        resync.SkewClockForTesting(5000);
+        Harness::ClearOutbox();
+        (void)DeliverWire(world, flood, pGuest);
+        const size_t removalsForFlood = DecodeOutboxMessagesFor<NotifyRemoveCharacter>(kGuestConn).size();
+        Check(removalsForFlood > 0 && removalsForFlood <= 24,
+              "a report full of unknown characters costs the server at most its per-player resend budget");
+
+        // --- The guest's own inventory against the server's copy of it (work plan 5.3). The copy is
+        //     what a rollback restores from. The server can only say that it is wrong: it never hands
+        //     out or takes away items, and it never resends a character for it.
+        {
+            using Session::EntityDigest::InventoryHasher;
+            using Session::EntityDigest::kFlagHasInventory;
+            const GameId kGold{0u, 0x0000000Fu};
+            const GameId kSword{0u, 0x000139B9u};
+
+            // What the guest's game holds, as that client would sum it up.
+            const auto carrying = [&](std::initializer_list<std::pair<GameId, int32_t>> aItems) {
+                InventoryHasher hasher;
+                for (const auto& [id, count] : aItems)
+                    hasher.Add(id.ModId, id.BaseId, count);
+                const InventoryHasher::Summary summary = hasher.Finish();
+                Facts facts = row(guestChar, kFlagOwnedByReporter | kFlagHasInventory);
+                facts.InventoryHash = summary.Hash;
+                facts.InventoryKinds = summary.Kinds;
+                facts.InventoryItems = summary.Items;
+                return facts;
+            };
+            // The packet the guest's client sends when its player gains or loses an item.
+            const auto guestItemDelta = [&](const GameId& acItem, int32_t aCount) {
+                RequestInventoryChanges request{};
+                request.ServerId = guestChar;
+                request.Item.BaseId = acItem;
+                request.Item.Count = aCount;
+                request.UpdateClients = true;
+                return DeliverWire(world, request, pGuest);
+            };
+            const auto sentToGuestAsRepair = [&]() {
+                return !DecodeOutboxMessagesFor<CharacterSpawnRequest>(kGuestConn).empty() ||
+                       !DecodeOutboxMessagesFor<NotifyRemoveCharacter>(kGuestConn).empty();
+            };
+
+            // The rest of this client's view agrees with the server from here on (the guard is dead on
+            // both sides), so every finding below is about the inventory. Two reports close whatever
+            // the checks above left open.
+            (void)report({mine, hostSeen, guardDead});
+            (void)report({mine, hostSeen, guardDead});
+
+            bEnableDesyncAutoRepair = true;  // even with repairs on, an inventory is never "repaired"
+            const uint64_t confirmedBefore = totals().Confirmed;
+            const uint64_t repairedBeforeInventory = totals().Repaired;
+
+            Check(guestItemDelta(kGold, 250) && guestItemDelta(kSword, 1), "the guest's client reports 250 gold and a sword gained");
+            (void)report({carrying({{kGold, 250}, {kSword, 1}}), hostSeen, guardDead});
+            (void)report({carrying({{kGold, 250}, {kSword, 1}}), hostSeen, guardDead});
+            Check(totals().Confirmed == confirmedBefore, "an inventory the server's copy agrees with produces no finding");
+
+            // The player picks up 30 more gold; the digest leaves before the item packet does.
+            (void)report({carrying({{kGold, 280}, {kSword, 1}}), hostSeen, guardDead});
+            Check(guestItemDelta(kGold, 30), "the item packet arrives after the digest that already counted it");
+            (void)report({carrying({{kGold, 280}, {kSword, 1}}), hostSeen, guardDead});
+            Check(totals().Confirmed == confirmedBefore, "a pickup that was still in flight is not reported as a desync");
+
+            // A change the client never told the server about (a script, a hook that did not fire):
+            // the player has 5 more gold than the server's copy, report after report.
+            (void)report({carrying({{kGold, 285}, {kSword, 1}}), hostSeen, guardDead});
+            Check(totals().Confirmed == confirmedBefore, "seen once it is only a suspicion");
+            (void)report({carrying({{kGold, 285}, {kSword, 1}}), hostSeen, guardDead});
+            Check(totals().Confirmed == confirmedBefore + 1, "seen again it is a confirmed inventory difference, written to the log");
+            Check(!sentToGuestAsRepair() && totals().Repaired == repairedBeforeInventory,
+                  "nothing is resent for it, with auto-repair on: the server cannot make a player's inventory right");
+
+            // The copy catches up (the client reports the missing gold): the difference is gone.
+            Check(guestItemDelta(kGold, 5), "the missing gold is reported after all");
+            const uint64_t confirmedAfter = totals().Confirmed;
+            (void)report({carrying({{kGold, 285}, {kSword, 1}}), hostSeen, guardDead});
+            (void)report({carrying({{kGold, 285}, {kSword, 1}}), hostSeen, guardDead});
+            Check(totals().Confirmed == confirmedAfter, "once the copy agrees again nothing more is said");
+            bEnableDesyncAutoRepair = false;
+        }
+
+        // --- The detector's own switch.
+        bEnableDesyncDetector = false;
+        const uint64_t reportsBefore = totals().Reports;
+        (void)report({mine, hostSeen});
+        Check(totals().Reports == reportsBefore, "with Gameplay:bEnableDesyncDetector off reports are ignored");
+        bEnableDesyncDetector = true;
+        bEnableDesyncAutoRepair = false;
+    }
+
+    // Scene 14: the party leader asks for a rollback (work plan 4.4, defect M15). A client can send
+    // three such requests. The one for the checkpoint BEFORE the newest was implemented on the server
+    // since 4.0 and had no sender until 4.1.1 (Shift+F9, common/Save/LoadRequest.h); this is the first
+    // time that server path runs anywhere. Every request below goes through the wire encoding.
+    {
+        std::printf("[scene 14] rollback requests: newest, previous, by name; only from the leader\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+        auto& saves = world.GetSaveSnapshotService();
+        auto& coordinator = saves.GetCoordinator();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xE001u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xE002u;
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 9.0f;
+        t0.Day = 4;
+        t0.Month = 4;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+
+        const auto ack = [](uint64_t aEpochId, const std::string& acSlot) {
+            CoordinatedSaveAck message{};
+            message.EpochId = aEpochId;
+            message.SlotName = String(acSlot.c_str());
+            message.Success = true;
+            return message;
+        };
+
+        // A committed checkpoint: the server starts the barrier, both clients report their file written.
+        const auto checkpoint = [&]() -> std::string {
+            if (!saves.TriggerCoordinatedSave(false, nullptr))
+                return {};
+            const auto pending = coordinator.GetPendingBarrier();
+            if (!pending.has_value())
+                return {};
+            const std::string slot = pending->SlotName;
+            (void)DeliverWire(world, ack(pending->EpochId, slot), pHost);
+            (void)DeliverWire(world, ack(pending->EpochId, slot), pGuest);
+            return slot;
+        };
+
+        const std::string first = checkpoint();
+        const std::string second = checkpoint();
+        const std::string third = checkpoint();
+        Check(!first.empty() && !second.empty() && !third.empty() && first != second && second != third && first != third,
+              "three checkpoints are committed, each in its own slot");
+        Check(saves.GetSnapshotCount() == 3, "the server keeps all three");
+
+        const auto request = [&](Player* apFrom, RequestCoordinatedSaveLoad::ActionType aAction, const std::string& acSlot = {}) {
+            Harness::ClearOutbox();
+            RequestCoordinatedSaveLoad message{};
+            message.Action = aAction;
+            message.SlotName = String(acSlot.c_str());
+            (void)DeliverWire(world, message, apFrom);
+        };
+        // The slot a player was told to load by the last request ("" when he was told nothing).
+        const auto toldToLoad = [](TiltedPhoques::ConnectionId_t aConn) -> std::string {
+            const auto loads = DecodeOutboxMessagesFor<NotifyExecuteLoad>(aConn);
+            if (loads.empty())
+                return {};
+            if (loads.size() > 1)
+                return "<" + std::to_string(loads.size()) + " load orders>";
+            return std::string(loads[0].SlotName.c_str(), loads[0].SlotName.size());
+        };
+        // Both clients finished loading: the reload barrier of the last rollback is released.
+        const auto everyoneReloaded = [&](const std::string& acSlot) {
+            const auto* pReload = coordinator.GetReloadBarrier();
+            if (!pReload)
+                return;
+            const uint64_t encoded = CoopCheckpoint::EncodeReloadBarrierEpoch(pReload->EpochId);
+            (void)DeliverWire(world, ack(encoded, acSlot), pHost);
+            (void)DeliverWire(world, ack(encoded, acSlot), pGuest);
+        };
+
+        // --- Only the leader rolls the party back.
+        request(pGuest, RequestCoordinatedSaveLoad::ActionType::LoadPreviousCheckpoint);
+        Check(toldToLoad(kHostConn).empty() && toldToLoad(kGuestConn).empty(),
+              "a rollback request from a player who is not the leader loads nothing");
+        Check(saves.GetSnapshotCount() == 3, "and drops no checkpoint");
+
+        // --- The checkpoint before the newest.
+        request(pHost, RequestCoordinatedSaveLoad::ActionType::LoadPreviousCheckpoint);
+        Check(toldToLoad(kHostConn) == second, "the previous-checkpoint request tells the leader to load the checkpoint before the newest");
+        Check(toldToLoad(kGuestConn) == second, "and tells every other player the same slot");
+        Check(saves.GetSnapshotCount() == 2, "the newest checkpoint is dropped: it was the reason to go back");
+        Check(coordinator.GetReloadBarrier() != nullptr, "the party is held together until everyone has loaded");
+        everyoneReloaded(second);
+        Check(coordinator.GetReloadBarrier() == nullptr, "the hold is released when both clients report the load done");
+
+        // --- F9 after that: the newest is now the one just loaded, the dropped one cannot come back.
+        request(pHost, RequestCoordinatedSaveLoad::ActionType::LoadLatestCheckpoint);
+        Check(toldToLoad(kHostConn) == second && toldToLoad(kGuestConn) == second,
+              "a quickload after going back loads the same checkpoint, not the dropped one");
+        Check(saves.GetSnapshotCount() == 2, "and drops nothing");
+        everyoneReloaded(second);
+
+        // --- A slot picked in the load menu.
+        request(pHost, RequestCoordinatedSaveLoad::ActionType::LoadSpecificSlot, first);
+        Check(toldToLoad(kHostConn) == first && toldToLoad(kGuestConn) == first, "a slot picked by name is loaded by everybody");
+        Check(saves.GetSnapshotCount() == 1, "the checkpoints after it are dropped");
+        everyoneReloaded(first);
+
+        // --- Nothing before the only checkpoint: going back means loading it.
+        request(pHost, RequestCoordinatedSaveLoad::ActionType::LoadPreviousCheckpoint);
+        Check(toldToLoad(kHostConn) == first && toldToLoad(kGuestConn) == first,
+              "with one checkpoint left the previous-checkpoint request loads that one");
+        Check(saves.GetSnapshotCount() == 1, "and keeps it");
+        everyoneReloaded(first);
+
+        // --- A slot name the server never committed: the newest checkpoint, never an arbitrary file.
+        request(pHost, RequestCoordinatedSaveLoad::ActionType::LoadSpecificSlot, "Quicksave0_of_somebody");
+        Check(toldToLoad(kHostConn) == first && toldToLoad(kGuestConn) == first,
+              "a slot name that is not a party checkpoint loads the newest checkpoint instead");
+    }
+
+    // Scene 15: the player who simulates the enemies of a fight disconnects in the middle of it
+    // (work plan 5.1 / 5.2). The other player in the cell must become their simulator without the
+    // fight changing: a wounded enemy keeps its wounds, a dead one stays dead, and the new simulator
+    // is told. Every request goes through the wire encoding.
+    {
+        std::printf("[scene 15] the simulating player leaves in the middle of a fight\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xF001u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xF002u;
+        const GameId kCell{0u, 0x000F1001u};
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kBanditBase{0u, 0x000F4001u};
+        constexpr uint32_t kHealthIndex = ActorValuesComponent::kHealthActorValueIndex;
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 12.0f;
+        t0.Day = 5;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+        pHost->SetCellComponent(CellIdComponent{kCell});
+        pGuest->SetCellComponent(CellIdComponent{kCell});
+
+        uint32_t nextCookie = 1500u;
+        const auto assign = [&](Player* apOwner, TiltedPhoques::ConnectionId_t aConn, const GameId& acRefId) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            request.ReferenceId = acRefId;
+            if (acRefId != kPlayerRef)
+                request.FormId = kBanditBase;
+            request.CellId = kCell;
+            request.Position = glm::vec3{200.0f, 200.0f, 0.0f};
+            request.CurrentActorData.BaseId = request.FormId;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 300.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 300.0f;
+            (void)DeliverWire(world, request, apOwner);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+
+        const uint32_t hostChar = assign(pHost, kHostConn, kPlayerRef);
+        const uint32_t guestChar = assign(pGuest, kGuestConn, kPlayerRef);
+        const uint32_t wounded = assign(pHost, kHostConn, GameId{0u, 0x000F2001u});
+        const uint32_t corpse = assign(pHost, kHostConn, GameId{0u, 0x000F2002u});
+        const uint32_t untouched = assign(pHost, kHostConn, GameId{0u, 0x000F2003u});
+        Check(hostChar != 0xFFFFFFFFu && guestChar != 0xFFFFFFFFu && wounded != 0xFFFFFFFFu && corpse != 0xFFFFFFFFu &&
+                  untouched != 0xFFFFFFFFu,
+              "two players and three bandits simulated by the host are registered");
+
+        const auto entityOf = [](uint32_t aServerId) { return static_cast<entt::entity>(aServerId); };
+        const auto ownerOf = [&](uint32_t aServerId) { return world.get<OwnerComponent>(entityOf(aServerId)).GetOwner(); };
+        const auto healthOf = [&](uint32_t aServerId) {
+            float health = -1.0f;
+            (void)world.get<ActorValuesComponent>(entityOf(aServerId)).TryGetHealth(health);
+            return health;
+        };
+        Check(ownerOf(wounded) == pHost && ownerOf(corpse) == pHost && ownerOf(untouched) == pHost, "the host simulates all three");
+
+        // The fight: the host's client reports one bandit down to 120 of 300 and another one dead.
+        RequestActorValueChanges hit{};
+        hit.Id = wounded;
+        hit.Values[kHealthIndex] = 120.0f;
+        // The revision the host's client holds for this actor (it came with the assignment).
+        hit.HealthRevision = world.get<ActorValuesComponent>(entityOf(wounded)).HealthRevision;
+        Check(DeliverWire(world, hit, pHost) && std::fabs(healthOf(wounded) - 120.0f) < 0.01f, "the host wounds a bandit to 120 of 300");
+        RequestDeathStateChange death{};
+        death.Id = corpse;
+        death.IsDead = true;
+        Check(DeliverWire(world, death, pHost) && world.get<CharacterComponent>(entityOf(corpse)).IsDead(), "the host kills another bandit");
+
+        const uint64_t woundedEpochBefore = world.get<OwnerComponent>(entityOf(wounded)).GetLease().Epoch;
+        const uint32_t woundedRevisionBefore = world.get<ActorValuesComponent>(entityOf(wounded)).HealthRevision;
+
+        // The host's connection drops: the transport reports it, as it does when a game closes.
+        Harness::ClearOutbox();
+        Disconnect(server, kHostConn);
+        pHost = nullptr;
+        Check(world.GetPlayerManager().GetByConnectionId(kHostConn) == nullptr, "the host is gone from the server");
+
+        Check(world.valid(entityOf(wounded)) && world.valid(entityOf(corpse)) && world.valid(entityOf(untouched)),
+              "the bandits outlive the player who simulated them");
+        Check(ownerOf(wounded) == pGuest && ownerOf(untouched) == pGuest, "the guest, who stands in the same cell, simulates the living bandits now");
+
+        const auto transfers = DecodeOutboxMessagesFor<NotifyOwnershipTransfer>(kGuestConn);
+        const auto transferOf = [&](uint32_t aServerId) -> const NotifyOwnershipTransfer* {
+            for (const auto& transfer : transfers)
+                if (transfer.ServerId == aServerId)
+                    return &transfer;
+            return nullptr;
+        };
+        const NotifyOwnershipTransfer* pWoundedTransfer = transferOf(wounded);
+        Check(pWoundedTransfer != nullptr && transferOf(untouched) != nullptr, "the guest is told about each bandit it took over");
+        Check(pWoundedTransfer != nullptr && pWoundedTransfer->OwnershipEpoch > woundedEpochBefore &&
+                  world.get<OwnerComponent>(entityOf(wounded)).GetLease().Epoch == pWoundedTransfer->OwnershipEpoch,
+              "with a newer ownership epoch than the host had, the one the server holds");
+        Check(pWoundedTransfer != nullptr && pWoundedTransfer->HealthRevision == world.get<ActorValuesComponent>(entityOf(wounded)).HealthRevision,
+              "and with the health revision its own readings must carry from now on");
+
+        Check(std::fabs(healthOf(wounded) - 120.0f) < 0.01f, "the wounded bandit is still at 120: the handover did not heal it");
+        Check(world.get<ActorValuesComponent>(entityOf(wounded)).HealthRevision >= woundedRevisionBefore,
+              "its health revision did not go backwards");
+        Check(std::fabs(healthOf(untouched) - 300.0f) < 0.01f, "the untouched bandit is still at full health");
+        Check(world.get<CharacterComponent>(entityOf(corpse)).IsDead(), "the dead bandit is still dead");
+        Check(!world.valid(entityOf(hostChar)) || !world.all_of<CharacterComponent>(entityOf(hostChar)) || ownerOf(hostChar) != pGuest,
+              "the departed player's own character is not handed to anybody");
+
+        // The new simulator goes on with the fight: its readings are accepted, with the new epoch.
+        RequestActorValueChanges secondHit{};
+        secondHit.Id = wounded;
+        secondHit.Values[kHealthIndex] = 60.0f;
+        // The revision the handover told the guest's client.
+        secondHit.HealthRevision = pWoundedTransfer != nullptr ? pWoundedTransfer->HealthRevision : 0u;
+        Check(DeliverWire(world, secondHit, pGuest) && std::fabs(healthOf(wounded) - 60.0f) < 0.01f,
+              "the guest's next hit on the bandit it now simulates is applied");
+
+        // The body is the guest's to keep as well: it is told, and the body is still a body.
+        Check(ownerOf(corpse) == pGuest || ownerOf(corpse) == nullptr, "the dead bandit is not left with the departed player");
+        Check(world.get<CharacterComponent>(entityOf(corpse)).IsDead(), "and it is still dead after the guest's hit on the other one");
+
+        // The guest leaves too: nobody is left to simulate, and placed NPCs wait as they are.
+        Harness::ClearOutbox();
+        Disconnect(server, kGuestConn);
+        Check(world.valid(entityOf(wounded)) && ownerOf(wounded) == nullptr, "with nobody left the wounded bandit stays in the world without a simulator");
+        Check(world.valid(entityOf(wounded)) && std::fabs(healthOf(wounded) - 60.0f) < 0.01f, "at the health the fight left it with");
+        Check(world.valid(entityOf(corpse)) && world.get<CharacterComponent>(entityOf(corpse)).IsDead(), "and the dead one remains dead for whoever comes next");
+    }
+
+    // Scene 16: one fight, two players, and the enemies one of them simulates (work plan 5.2).
+    // What reaches the server during such a fight comes from two games that disagree for a moment
+    // about everything: who hit first, whether the enemy is still alive, who simulates it. The
+    // scene sends those packets in the orders a real session produces and pins what the server
+    // makes of them: the kill by the player who does not simulate the target, the packets of the
+    // simulating player that were already on their way, a stagger, a drawn weapon, and a handover
+    // in the middle of the fight followed by the previous simulator's late packets.
+    {
+        std::printf("[scene 16] one fight seen by two players: kill, stagger, late packets, handover\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xF101u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xF102u;
+        const GameId kCell{0u, 0x00101001u};
+        const GameId kFarCell{0u, 0x00101999u};
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kBanditBase{0u, 0x00104001u};
+        constexpr uint32_t kHealthIndex = ActorValuesComponent::kHealthActorValueIndex;
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 12.0f;
+        t0.Day = 5;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+        pHost->SetCellComponent(CellIdComponent{kCell});
+        pGuest->SetCellComponent(CellIdComponent{kCell});
+
+        uint32_t nextCookie = 1600u;
+        const auto assign = [&](Player* apOwner, TiltedPhoques::ConnectionId_t aConn, const GameId& acRefId) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            request.ReferenceId = acRefId;
+            if (acRefId != kPlayerRef)
+                request.FormId = kBanditBase;
+            request.CellId = kCell;
+            request.Position = glm::vec3{200.0f, 200.0f, 0.0f};
+            request.CurrentActorData.BaseId = request.FormId;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 300.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 300.0f;
+            (void)DeliverWire(world, request, apOwner);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+
+        const uint32_t hostChar = assign(pHost, kHostConn, kPlayerRef);
+        const uint32_t guestChar = assign(pGuest, kGuestConn, kPlayerRef);
+        const uint32_t victim = assign(pHost, kHostConn, GameId{0u, 0x00102001u});
+        const uint32_t brawler = assign(pHost, kHostConn, GameId{0u, 0x00102002u});
+        Check(hostChar != 0xFFFFFFFFu && guestChar != 0xFFFFFFFFu && victim != 0xFFFFFFFFu && brawler != 0xFFFFFFFFu,
+              "two players and two bandits simulated by the host are registered");
+
+        const auto entityOf = [](uint32_t aServerId) { return static_cast<entt::entity>(aServerId); };
+        const auto ownerOf = [&](uint32_t aServerId) { return world.get<OwnerComponent>(entityOf(aServerId)).GetOwner(); };
+        const auto epochOf = [&](uint32_t aServerId) { return world.get<OwnerComponent>(entityOf(aServerId)).GetLease().Epoch; };
+        const auto revisionOf = [&](uint32_t aServerId) { return world.get<ActorValuesComponent>(entityOf(aServerId)).HealthRevision; };
+        const auto isDead = [&](uint32_t aServerId) { return world.get<CharacterComponent>(entityOf(aServerId)).IsDead(); };
+        const auto healthOf = [&](uint32_t aServerId) {
+            float health = -1.0f;
+            (void)world.get<ActorValuesComponent>(entityOf(aServerId)).TryGetHealth(health);
+            return health;
+        };
+        const auto near = [](float aLhs, float aRhs, float aTolerance = 0.01f) { return std::fabs(aLhs - aRhs) < aTolerance; };
+
+        uint32_t nextHitId = 16000u;
+        const auto swing = [&](uint32_t aTarget, float aDelta, float aStagger) {
+            RequestHealthChangeBroadcast hit{};
+            hit.Id = aTarget;
+            hit.DeltaHealth = aDelta;
+            hit.StaggerMagnitude = aStagger;
+            hit.StaggerDirection = aStagger > 0.0f ? 0.5f : 0.0f;
+            hit.HitId = nextHitId++;
+            return hit;
+        };
+        const auto reading = [&](uint32_t aTarget, float aHealth, uint32_t aRevision) {
+            RequestActorValueChanges snapshot{};
+            snapshot.Id = aTarget;
+            snapshot.Values[kHealthIndex] = aHealth;
+            snapshot.HealthRevision = aRevision;
+            return snapshot;
+        };
+
+        // --- 1. A power attack by the player who does not simulate the bandit -------------------
+        Harness::ClearOutbox();
+        const uint32_t revisionBeforeHit = revisionOf(victim);
+        const RequestHealthChangeBroadcast guestHit = swing(victim, -100.0f, 0.6f);
+        Check(DeliverWire(world, guestHit, pGuest) && near(healthOf(victim), 200.0f),
+              "a hit by the player who does not simulate the bandit is applied: 300 -> 200");
+        const auto hostSeesHit = DecodeOutboxMessagesFor<NotifyHealthChangeBroadcast>(kHostConn);
+        Check(hostSeesHit.size() == 1 && hostSeesHit[0].Id == victim && near(hostSeesHit[0].DeltaHealth, -100.0f) &&
+                  near(hostSeesHit[0].StaggerMagnitude, 0.6f, 0.02f) && revisionOf(victim) != revisionBeforeHit &&
+                  hostSeesHit[0].HealthRevision == revisionOf(victim),
+              "the simulating player gets the damage, the stagger order and the new health revision");
+        Check(DecodeOutboxMessagesFor<NotifyHealthChangeBroadcast>(kGuestConn).empty(), "the attacker is not sent his own hit back");
+        const auto guestAcks = DecodeOutboxMessagesFor<NotifyActorValueChanges>(kGuestConn);
+        Check(!guestAcks.empty() && guestAcks.back().Id == victim && guestAcks.back().HealthRevision == revisionOf(victim),
+              "the attacker is told the health revision his hit produced");
+
+        Check(DeliverWire(world, guestHit, pGuest) && near(healthOf(victim), 200.0f),
+              "the same swing delivered twice costs the bandit once");
+
+        // --- 2. The simulating player's own hit --------------------------------------------------
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, swing(victim, -50.0f, 0.9f), pHost) && near(healthOf(victim), 150.0f),
+              "the simulating player's hit is applied: 200 -> 150");
+        const auto guestSeesHit = DecodeOutboxMessagesFor<NotifyHealthChangeBroadcast>(kGuestConn);
+        Check(guestSeesHit.size() == 1 && near(guestSeesHit[0].DeltaHealth, -50.0f) && guestSeesHit[0].StaggerMagnitude == 0.0f,
+              "it travels without a stagger order: his game staggered the bandit already and the animation carries it");
+
+        // --- 3. The guest kills the bandit; the host's packets are already on their way ----------
+        const uint32_t hostRevisionBeforeKill = revisionOf(victim); // what the host's client holds
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, swing(victim, -150.0f, 0.0f), pGuest) && near(healthOf(victim), 0.0f),
+              "the guest's killing blow takes the bandit to 0");
+        RequestDeathStateChange death{};
+        death.Id = victim;
+        death.IsDead = true;
+        Check(DeliverWire(world, death, pGuest) && isDead(victim), "and the guest's client reports the death");
+        const auto hostSeesDeath = DecodeOutboxMessagesFor<NotifyDeathStateChange>(kHostConn);
+        Check(hostSeesDeath.size() == 1 && hostSeesDeath[0].Id == victim && hostSeesDeath[0].IsDead &&
+                  hostSeesDeath[0].HealthRevision == revisionOf(victim),
+              "the simulating player is told the bandit died, with the health revision of the death");
+        Check(revisionOf(victim) != hostRevisionBeforeKill, "the kill moved the health revision past what the host's client holds");
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, reading(victim, 150.0f, hostRevisionBeforeKill), pHost) && near(healthOf(victim), 0.0f) && isDead(victim),
+              "a health reading the simulating player sampled before the kill does not give the body its health back");
+        const auto corrections = DecodeOutboxMessagesFor<NotifyActorValueChanges>(kHostConn);
+        Check(!corrections.empty() && corrections.back().Id == victim && corrections.back().HealthRevision == revisionOf(victim) &&
+                  corrections.back().Values.count(kHealthIndex) == 1 && near(corrections.back().Values.at(kHealthIndex), 0.0f),
+              "he is answered with the truth: health 0 and the current revision");
+        Check(DecodeOutboxMessagesFor<NotifyActorValueChanges>(kGuestConn).empty(), "and the stale reading is not relayed to the other player");
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, swing(victim, 5.0f, 0.0f), pHost) && near(healthOf(victim), 0.0f),
+              "a regeneration tick that was on its way does not heal a corpse");
+        Check(DeliverWire(world, swing(victim, -40.0f, 0.5f), pGuest) && near(healthOf(victim), 0.0f) &&
+                  DecodeOutboxMessagesFor<NotifyHealthChangeBroadcast>(kHostConn).empty() &&
+                  DecodeOutboxMessagesFor<NotifyHealthChangeBroadcast>(kGuestConn).empty(),
+              "a second arrow that lands on the body is not relayed to anybody as damage");
+        Check(DeliverWire(world, death, pHost) && isDead(victim) && DecodeOutboxMessagesFor<NotifyDeathStateChange>(kGuestConn).empty(),
+              "the host's client noticing the death a moment later changes nothing and is not broadcast again");
+
+        // --- 3b. The body (work plan 5.3): the server is the one writer of what is on it ----------
+        // Each game rolls its own death items, so the two players see different things on the same
+        // body. What the simulating player's game put there is what the server lists.
+        {
+            const GameId kSword{0u, 0x00012EB7u};
+            const GameId kGold{0u, 0x0000000Fu};
+            const GameId kAxe{0u, 0x00013790u};
+            const auto stack = [](const GameId& acItem, int32_t aCount) {
+                Inventory::Entry entry{};
+                entry.BaseId = acItem;
+                entry.Count = aCount;
+                return entry;
+            };
+            const auto change = [&](Player* apPlayer, uint32_t aEntity, const GameId& acItem, int32_t aCount) {
+                Harness::ClearOutbox();
+                RequestInventoryChanges request{};
+                request.ServerId = aEntity;
+                request.Item = stack(acItem, aCount);
+                request.UpdateClients = true;
+                return DeliverWire(world, request, apPlayer);
+            };
+            const auto toldToChange = [](TiltedPhoques::ConnectionId_t aConn, uint32_t aEntityServerId, const GameId& acItem) {
+                int32_t total = 0;
+                for (const auto& notify : DecodeOutboxMessagesFor<NotifyInventoryChanges>(aConn))
+                    if (notify.ServerId == aEntityServerId && notify.Item.BaseId == acItem)
+                        total += notify.Item.Count;
+                return total;
+            };
+            const auto onBody = [&](const GameId& acItem) {
+                GameId lookup = acItem;
+                return world.get<InventoryComponent>(entityOf(victim)).Content.GetEntryCountById(lookup);
+            };
+
+            Check(change(pHost, victim, kSword, 1) && toldToChange(kGuestConn, victim, kSword) == 1 && onBody(kSword) == 1,
+                  "the death item the simulating player's game rolled is listed by the server and shown to the guest");
+            Check(change(pHost, victim, kGold, 25) && onBody(kGold) == 25, "so is the gold");
+
+            Check(change(pGuest, victim, kSword, -1) && onBody(kSword) == 0 && toldToChange(kHostConn, victim, kSword) == -1 &&
+                      toldToChange(kGuestConn, guestChar, kSword) == 0,
+                  "the take that arrives first is granted, and the other player sees the sword leave the body");
+            Check(change(pHost, victim, kSword, -1) && toldToChange(kHostConn, hostChar, kSword) == -1 && onBody(kSword) == 0,
+                  "the take that arrives second is refused: that player is told to give the sword back");
+
+            Check(change(pGuest, victim, kGold, -25) && onBody(kGold) == 0, "the guest takes all 25 gold");
+            Check(change(pHost, victim, kGold, -10) && toldToChange(kHostConn, hostChar, kGold) == -10,
+                  "gold that is no longer there is taken back from the player who was late, to the coin");
+
+            Check(change(pGuest, victim, kAxe, -1) && toldToChange(kGuestConn, guestChar, kAxe) == 0,
+                  "an item only the guest's game rolled is granted once (the same rule as for chests)");
+            Check(change(pHost, victim, kAxe, -1) && toldToChange(kHostConn, hostChar, kAxe) == -1,
+                  "and not a second time to the other player");
+
+            Check(change(pHost, victim, kGold, 7) && onBody(kGold) == 7, "the host puts 7 gold back on the body");
+            pGuest->SetCellComponent(CellIdComponent{kFarCell});
+            Check(change(pGuest, victim, kGold, -7) && onBody(kGold) == 7 && toldToChange(kHostConn, victim, kGold) == 0,
+                  "a player who is not in the cell cannot take from the body");
+            pGuest->SetCellComponent(CellIdComponent{kCell});
+
+            // --- M24: the body changes hands while it is being looted ---------------------------
+            // The host hands the body over and the server grants it to the guest. Before the
+            // guest's confirmation arrives, the host - now just a player standing next to the body
+            // - takes the ring and 5 of the 7 gold. The confirmation was built before those takes
+            // reached the guest: it lists the ring, 7 gold, and a dagger only the guest's game has.
+            const GameId kRing{0u, 0x000877C9u};
+            const GameId kDagger{0u, 0x0001397Eu};
+            const auto listed = [](const Inventory& acInventory, const GameId& acItem) {
+                GameId lookup = acItem;
+                return acInventory.GetEntryCountById(lookup);
+            };
+            Check(change(pHost, victim, kRing, 1) && onBody(kRing) == 1 && onBody(kGold) == 7,
+                  "the body holds a ring and 7 gold, and both players' games show them");
+
+            RequestOwnershipTransfer handBody{};
+            handBody.ServerId = victim;
+            Check(DeliverWire(world, handBody, pHost) && ownerOf(victim) == pGuest, "the host hands the body over: the guest simulates it now");
+            Check(change(pHost, victim, kRing, -1) && onBody(kRing) == 0 && change(pHost, victim, kGold, -5) && onBody(kGold) == 2,
+                  "before the guest's confirmation arrives the host takes the ring and 5 of the 7 gold");
+
+            RequestOwnershipClaim bodyClaim{};
+            bodyClaim.ServerId = victim;
+            bodyClaim.NewActorData.BaseId = kBanditBase;
+            bodyClaim.NewActorData.IsDead = true;
+            bodyClaim.NewActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 0.0f;
+            bodyClaim.NewActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 300.0f;
+            bodyClaim.NewActorData.InitialInventory.AddOrRemoveEntry(stack(kRing, 1));
+            bodyClaim.NewActorData.InitialInventory.AddOrRemoveEntry(stack(kGold, 7));
+            bodyClaim.NewActorData.InitialInventory.AddOrRemoveEntry(stack(kDagger, 1));
+            Harness::ClearOutbox();
+            Check(DeliverWire(world, bodyClaim, pGuest) && ownerOf(victim) == pGuest && isDead(victim),
+                  "the guest's confirmation arrives with the list his game showed a moment earlier");
+            Check(onBody(kRing) == 0, "the ring the host took does not come back with that list");
+            Check(onBody(kGold) == 2, "the gold is what the server counted (2), not what the list says (7)");
+            Check(onBody(kDagger) == 1, "an item the server never listed and nobody took is accepted from the new simulator");
+            const auto hostBodyUpdates = DecodeOutboxMessagesFor<NotifySpawnData>(kHostConn);
+            Check(hostBodyUpdates.size() == 1 && hostBodyUpdates[0].Id == victim &&
+                      listed(hostBodyUpdates[0].NewActorData.InitialInventory, kRing) == 0 &&
+                      listed(hostBodyUpdates[0].NewActorData.InitialInventory, kGold) == 2 &&
+                      listed(hostBodyUpdates[0].NewActorData.InitialInventory, kDagger) == 1,
+                  "the host's game is sent the server's list, so the ring does not reappear on the body in front of him");
+            Check(change(pGuest, victim, kRing, -1) && toldToChange(kGuestConn, guestChar, kRing) == -1 && onBody(kRing) == 0,
+                  "the guest clicking the ring his copy still shows is told to give it back");
+
+            // The switch off: the list of the player who simulates the body replaces the server's.
+            bEnableBodyLootAuthority = false;
+            Check(DeliverWire(world, bodyClaim, pGuest) && onBody(kRing) == 1 && onBody(kGold) == 7,
+                  "switch off: the same confirmation lists the ring and all 7 gold again (4.1.0)");
+            bEnableBodyLootAuthority = true;
+        }
+
+        // --- 4. Handover in the middle of the fight ---------------------------------------------
+        // The host fights the second bandit: it draws its weapon and is wounded to 120 of 300.
+        DrawWeaponRequest draw{};
+        draw.Id = brawler;
+        draw.IsWeaponDrawn = true;
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, draw, pHost) && world.get<CharacterComponent>(entityOf(brawler)).IsWeaponDrawn(),
+              "the bandit draws its weapon in the host's game");
+        const auto guestSeesDraw = DecodeOutboxMessagesFor<NotifyDrawWeapon>(kGuestConn);
+        Check(guestSeesDraw.size() == 1 && guestSeesDraw[0].Id == brawler && guestSeesDraw[0].IsWeaponDrawn, "the guest is told");
+        Check(DeliverWire(world, reading(brawler, 120.0f, revisionOf(brawler)), pHost) && near(healthOf(brawler), 120.0f),
+              "the host wounds it to 120 of 300");
+
+        // The host walks out of the cell. Its client lets the bandit go, with the bandit's position
+        // and the ownership epoch it holds.
+        const uint64_t hostEpoch = epochOf(brawler);
+        const uint32_t hostRevisionAtHandoff = revisionOf(brawler);
+        pHost->SetCellComponent(CellIdComponent{kFarCell});
+        RequestOwnershipTransfer handoff{};
+        handoff.ServerId = brawler;
+        handoff.CellId = kCell;
+        handoff.Position = glm::vec3{210.0f, 205.0f, 0.0f};
+        handoff.OwnershipEpoch = hostEpoch;
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, handoff, pHost) && ownerOf(brawler) == pGuest, "the bandit goes to the guest, who is still in the cell");
+        const auto grants = DecodeOutboxMessagesFor<NotifyOwnershipTransfer>(kGuestConn);
+        Check(grants.size() == 1 && grants[0].ServerId == brawler && grants[0].OwnershipEpoch > hostEpoch &&
+                  grants[0].OwnershipEpoch == epochOf(brawler) && grants[0].HealthRevision == revisionOf(brawler),
+              "the guest is told, with a newer ownership epoch and the health revision to quote from now on");
+        Check(near(healthOf(brawler), 120.0f) && !isDead(brawler), "the bandit keeps its wounds through the handover");
+        Check(world.get<CharacterComponent>(entityOf(brawler)).IsWeaponDrawn(), "and its drawn weapon: for the new simulator it is still in a fight");
+
+        // What the guest's client does with the grant: it takes the bandit over and confirms with
+        // the bandit as its own game shows it. Its copy missed the wounds: 300 of 300.
+        RequestOwnershipClaim confirm{};
+        confirm.ServerId = brawler;
+        confirm.NewActorData.BaseId = kBanditBase;
+        confirm.NewActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 300.0f;
+        confirm.NewActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 300.0f;
+        confirm.NewActorData.IsWeaponDrawn = true;
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, confirm, pGuest) && ownerOf(brawler) == pGuest && !grants.empty() &&
+                  epochOf(brawler) == grants[0].OwnershipEpoch,
+              "the new simulator's confirmation keeps the epoch it was granted");
+        Check(near(healthOf(brawler), 120.0f) && !isDead(brawler), "its copy of the bandit at full health does not heal the bandit");
+        const auto confirmAnswers = DecodeOutboxMessagesFor<NotifySpawnData>(kGuestConn);
+        Check(confirmAnswers.size() == 1 && confirmAnswers[0].Id == brawler &&
+                  confirmAnswers[0].NewActorData.InitialActorValues.ActorValuesList.count(kHealthIndex) == 1 &&
+                  near(confirmAnswers[0].NewActorData.InitialActorValues.ActorValuesList.at(kHealthIndex), 120.0f) &&
+                  confirmAnswers[0].HealthRevision == revisionOf(brawler),
+              "the new simulator is told the real health (120) and the revision that goes with it");
+        Check(DecodeOutboxMessagesFor<NotifyOwnershipTransfer>(kGuestConn).empty(), "and is not granted the bandit a second time");
+        // The health revision the guest's client holds from here on.
+        const uint32_t guestRevision = !confirmAnswers.empty() ? confirmAnswers[0].HealthRevision
+                                                               : (grants.empty() ? 0u : grants[0].HealthRevision);
+
+        // Packets the host's client had sent before it learned that it let go.
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, reading(brawler, 300.0f, hostRevisionAtHandoff), pHost) && near(healthOf(brawler), 120.0f),
+              "a health reading from the previous simulator is ignored: the bandit is not healed");
+        draw.IsWeaponDrawn = false;
+        Check(DeliverWire(world, draw, pHost) && world.get<CharacterComponent>(entityOf(brawler)).IsWeaponDrawn() &&
+                  DecodeOutboxMessagesFor<NotifyDrawWeapon>(kGuestConn).empty(),
+              "so is its 'weapon sheathed': the bandit does not leave the fight in the guest's game");
+        Check(DeliverWire(world, handoff, pHost) && ownerOf(brawler) == pGuest && epochOf(brawler) == grants[0].OwnershipEpoch,
+              "a repeated handoff quoting the old epoch does not take the bandit from the guest");
+        const auto refusals = DecodeOutboxMessagesFor<NotifyRelinquishControl>(kHostConn);
+        Check(!refusals.empty() && refusals.back().ServerId == brawler && refusals.back().OwnershipEpoch == epochOf(brawler),
+              "the previous simulator is answered with the epoch the server holds");
+        RequestEquipmentChanges lateEquip{};
+        lateEquip.ServerId = brawler;
+        lateEquip.ItemId = GameId{0u, 0x00012EB7u};
+        lateEquip.Count = 1;
+        lateEquip.Unequip = true;
+        Check(DeliverWire(world, lateEquip, pHost) && DecodeOutboxMessagesFor<NotifyEquipmentChanges>(kGuestConn).empty(),
+              "nor does its 'weapon unequipped' reach the guest's game");
+        RequestDeathStateChange farDeath{};
+        farDeath.Id = brawler;
+        farDeath.IsDead = true;
+        Check(DeliverWire(world, farDeath, pHost) && !isDead(brawler), "a death report from a player who left the cell is ignored");
+
+        // The fight goes on with the new simulator...
+        Check(DeliverWire(world, reading(brawler, 60.0f, guestRevision), pGuest) && near(healthOf(brawler), 60.0f),
+              "the new simulator's health reading is applied: 120 -> 60");
+
+        // ...and the host comes back and joins it as the player who does not simulate the bandit.
+        pHost->SetCellComponent(CellIdComponent{kCell});
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, swing(brawler, -30.0f, 0.4f), pHost) && near(healthOf(brawler), 30.0f),
+              "back in the cell, the previous simulator's hit counts like anybody's: 60 -> 30");
+        const auto guestOrders = DecodeOutboxMessagesFor<NotifyHealthChangeBroadcast>(kGuestConn);
+        Check(guestOrders.size() == 1 && near(guestOrders[0].StaggerMagnitude, 0.4f, 0.02f),
+              "and now it is the guest's game that is ordered to stagger the bandit");
+        Check(ownerOf(brawler) == pGuest, "hitting the bandit does not move its simulation back to the host");
+    }
+
+    // =========================================================================
+    // Scene 17: doors, chests, levers and quest stages seen by two players (work plan 5.4).
+    // =========================================================================
+    //
+    // The harness never sent a lock change, an activation, a script animation or a quest stage:
+    // this part of the server ran only in the game. The scene pins who is told what, and covers
+    // defect M23 - an unlock that reaches the server before anybody has registered the object.
+    {
+        std::printf("[scene 17] doors, chests, levers and quest stages for two players\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xF201u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xF202u;
+        constexpr TiltedPhoques::ConnectionId_t kLateConn = 0xF203u;
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kTamriel{0u, 0x0000003Cu};
+        // Two neighbouring exterior cells and one far away (outside the 5x5 loaded grid).
+        const GameId kCellA{0u, 0x00009001u};
+        const GameId kCellB{0u, 0x00009002u};
+        const GameId kCellFar{0u, 0x00009999u};
+        const CellIdComponent inA{kCellA, kTamriel, GridCellCoords{10, 10}};
+        const CellIdComponent inB{kCellB, kTamriel, GridCellCoords{11, 10}};
+        const CellIdComponent farAway{kCellFar, kTamriel, GridCellCoords{40, 40}};
+        constexpr uint32_t kHealthIndex = ActorValuesComponent::kHealthActorValueIndex;
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 12.0f;
+        t0.Day = 5;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+        pHost->SetCellComponent(inA);
+        pGuest->SetCellComponent(inA);
+
+        uint32_t nextCookie = 1700u;
+        const auto enterWorld = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, const QuestLog& acQuests) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            request.ReferenceId = kPlayerRef;
+            request.CellId = kCellA;
+            request.WorldSpaceId = kTamriel;
+            request.Position = glm::vec3{10.0f * 4096.0f + 200.0f, 10.0f * 4096.0f + 200.0f, 0.0f};
+            request.QuestContent = acQuests;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 300.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 300.0f;
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const uint32_t hostChar = enterWorld(pHost, kHostConn, QuestLog{});
+        const uint32_t guestChar = enterWorld(pGuest, kGuestConn, QuestLog{});
+        Check(hostChar != 0xFFFFFFFFu && guestChar != 0xFFFFFFFFu && hostChar != guestChar, "two players are in the world");
+
+        // ---- what a client sends ------------------------------------------------------------
+        const auto object = [&](const GameId& acId, const CellIdComponent& acWhere, bool aLocked, uint8_t aLevel) {
+            ObjectData data{};
+            data.Id = acId;
+            data.CellId = acWhere.Cell;
+            data.WorldSpaceId = acWhere.WorldSpaceId;
+            data.CurrentCoords = acWhere.CenterCoords;
+            data.CurrentLockData.IsLocked = aLocked;
+            data.CurrentLockData.LockLevel = aLevel;
+            return data;
+        };
+        // A client registers the doors and containers of the cell its player has just entered.
+        const auto registerObjects = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, const std::vector<ObjectData>& acObjects) {
+            Harness::ClearOutbox();
+            AssignObjectsRequest request{};
+            for (const ObjectData& data : acObjects)
+                request.Objects.push_back(data);
+            (void)DeliverWire(world, request, apPlayer);
+            std::vector<ObjectData> answered;
+            for (const auto& response : DecodeOutboxMessagesFor<AssignObjectsResponse>(aConn))
+            {
+                for (const ObjectData& data : response.Objects)
+                    answered.push_back(data);
+            }
+            return answered;
+        };
+        const auto lockChange = [](const GameId& acId, const GameId& acCell, bool aLocked, uint8_t aLevel) {
+            LockChangeRequest request{};
+            request.Id = acId;
+            request.CellId = acCell;
+            request.IsLocked = aLocked;
+            request.LockLevel = aLevel;
+            return request;
+        };
+        // What the server holds for an object: nothing until somebody registers it.
+        const auto lockOf = [&](const GameId& acId) -> std::optional<LockData> {
+            const auto view = world.view<FormIdComponent, ObjectComponent>();
+            for (const entt::entity entity : view)
+            {
+                if (view.get<FormIdComponent>(entity).Id == acId)
+                    return view.get<ObjectComponent>(entity).CurrentLockData;
+            }
+            return std::nullopt;
+        };
+        const auto isUnlocked = [&](const GameId& acId) {
+            const auto lock = lockOf(acId);
+            return lock.has_value() && !lock->IsLocked;
+        };
+        const auto isLocked = [&](const GameId& acId) {
+            const auto lock = lockOf(acId);
+            return lock.has_value() && lock->IsLocked;
+        };
+        const auto unlockNoticesFor = [&](TiltedPhoques::ConnectionId_t aConn, const GameId& acId) {
+            size_t count = 0;
+            for (const auto& notice : DecodeOutboxMessagesFor<NotifyLockChange>(aConn))
+            {
+                if (notice.Id == acId && !notice.IsLocked)
+                    ++count;
+            }
+            return count;
+        };
+
+        const GameId kLockpick{0u, 0x0000000Au};
+        const GameId kGold{0u, 0x0000000Fu};
+        const auto stack = [](const GameId& acItem, int32_t aCount) {
+            Inventory::Entry entry{};
+            entry.BaseId = acItem;
+            entry.Count = aCount;
+            return entry;
+        };
+        const auto countIn = [](const Inventory& acInventory, const GameId& acItem) {
+            GameId lookup = acItem;
+            return acInventory.GetEntryCountById(lookup);
+        };
+
+        // --- 1. Registration: the first player's game decides what the object is ----------------
+        const GameId kGate{0u, 0x000A0001u};
+        const GameId kChest{0u, 0x000A0002u};
+        ObjectData hostChest = object(kChest, inA, true, 25);
+        hostChest.CurrentInventory.AddOrRemoveEntry(stack(kLockpick, 3));
+        const auto hostRegistered = registerObjects(pHost, kHostConn, {object(kGate, inA, true, 50), hostChest});
+        Check(hostRegistered.size() == 2 && hostRegistered[0].IsSenderFirst && hostRegistered[1].IsSenderFirst &&
+                  hostRegistered[0].ServerId != hostRegistered[1].ServerId,
+              "the first player to enter a cell registers its gate and its chest as his game shows them");
+        Check(isLocked(kGate) && isLocked(kChest), "and the server holds both as locked");
+
+        // The guest's game rolled other chest contents: 40 gold instead of 3 lockpicks.
+        ObjectData guestChest = object(kChest, inA, true, 25);
+        guestChest.CurrentInventory.AddOrRemoveEntry(stack(kGold, 40));
+        const auto guestRegistered = registerObjects(pGuest, kGuestConn, {object(kGate, inA, true, 50), guestChest});
+        Check(guestRegistered.size() == 2 && !guestRegistered[0].IsSenderFirst && !guestRegistered[1].IsSenderFirst &&
+                  hostRegistered.size() == 2 && guestRegistered[0].ServerId == hostRegistered[0].ServerId &&
+                  guestRegistered[1].ServerId == hostRegistered[1].ServerId,
+              "the second player gets the same objects back, not objects of his own");
+        Check(guestRegistered.size() == 2 && guestRegistered[1].CurrentLockData.IsLocked &&
+                  countIn(guestRegistered[1].CurrentInventory, kLockpick) == 3 && countIn(guestRegistered[1].CurrentInventory, kGold) == 0,
+              "with the first player's chest contents: 3 lockpicks, not the 40 gold his own game rolled");
+
+        // --- 2. A lock picked in the cell both players stand in ---------------------------------
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, lockChange(kGate, kCellA, false, 50), pHost) && isUnlocked(kGate),
+              "the host picks the gate's lock: the server holds it as unlocked");
+        Check(unlockNoticesFor(kGuestConn, kGate) == 1, "the guest standing next to him is told once");
+        Check(DecodeOutboxMessagesFor<NotifyLockChange>(kHostConn).empty(), "the host is not told about his own lockpicking");
+        // The guest's game unlocks the gate and, as for any lock change, reports it.
+        Check(DeliverWire(world, lockChange(kGate, kCellA, false, 50), pGuest) && isUnlocked(kGate),
+              "the guest's game reporting the same unlock changes nothing");
+
+        // The guest walks away; the host locks the gate again with its key.
+        pGuest->SetCellComponent(farAway);
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, lockChange(kGate, kCellA, true, 50), pHost) && isLocked(kGate), "the host locks the gate again with its key");
+        Check(DecodeOutboxMessagesFor<NotifyLockChange>(kGuestConn).empty(), "a player far away is not told");
+        // He comes back: his game still shows the gate unlocked, and registers it that way.
+        pGuest->SetCellComponent(inA);
+        const auto guestBack = registerObjects(pGuest, kGuestConn, {object(kGate, inA, false, 50)});
+        Check(guestBack.size() == 1 && !guestBack[0].IsSenderFirst && guestBack[0].CurrentLockData.IsLocked &&
+                  guestBack[0].CurrentLockData.LockLevel == 50 && isLocked(kGate),
+              "coming back he is told the gate is locked: what the server holds wins over what his game remembers");
+
+        // --- 3. M23: a lock picked across a cell border, before anybody registered the object ---
+        // The host stands in cell A and picks the lock of a house door that belongs to cell B.
+        // Nobody has been in cell B, so the server has no record of the door. The guest is away.
+        const GameId kHouseDoor{0u, 0x000B0001u};
+        pGuest->SetCellComponent(farAway);
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, lockChange(kHouseDoor, kCellB, false, 75), pHost) && !lockOf(kHouseDoor).has_value(),
+              "an unlock of a door nobody registered creates no object on the server");
+        Check(DecodeOutboxMessagesFor<NotifyLockChange>(kGuestConn).empty(), "and the guest, far away, hears nothing of it");
+
+        // The guest is the first to walk into cell B. His game shows the door locked.
+        pGuest->SetCellComponent(inB);
+        const auto guestHouse = registerObjects(pGuest, kGuestConn, {object(kHouseDoor, inB, true, 75)});
+        Check(guestHouse.size() == 1 && guestHouse[0].IsSenderFirst, "the guest registers the house door first");
+        Check(isUnlocked(kHouseDoor), "the server holds it as unlocked: the host picked that lock");
+        const auto guestUnlocks = DecodeOutboxMessagesFor<NotifyLockChange>(kGuestConn);
+        Check(guestUnlocks.size() == 1 && guestUnlocks[0].Id == kHouseDoor && !guestUnlocks[0].IsLocked && guestUnlocks[0].LockLevel == 75,
+              "and the guest is told to unlock it, once");
+        Check(DecodeOutboxMessagesFor<NotifyLockChange>(kHostConn).empty(), "the host is not told again");
+        // The guest's game unlocks the door and reports the change.
+        Check(DeliverWire(world, lockChange(kHouseDoor, kCellB, false, 75), pGuest) && isUnlocked(kHouseDoor),
+              "the guest's game reporting that unlock leaves the door unlocked");
+
+        // The host walks in. In 4.1.0 he was answered "locked" and the door he picked locked again.
+        pHost->SetCellComponent(inB);
+        const auto hostHouse = registerObjects(pHost, kHostConn, {object(kHouseDoor, inB, false, 75)});
+        Check(hostHouse.size() == 1 && !hostHouse[0].IsSenderFirst && !hostHouse[0].CurrentLockData.IsLocked,
+              "the host, entering later, is answered 'unlocked': the door he picked does not lock again");
+        Check(unlockNoticesFor(kHostConn, kHouseDoor) == 0, "and needs no extra unlock notice");
+
+        // A second registration of the same door finds nothing left to remember.
+        pGuest->SetCellComponent(farAway);
+        pGuest->SetCellComponent(inB);
+        const auto guestHouseAgain = registerObjects(pGuest, kGuestConn, {object(kHouseDoor, inB, false, 75)});
+        Check(guestHouseAgain.size() == 1 && !guestHouseAgain[0].IsSenderFirst && unlockNoticesFor(kGuestConn, kHouseDoor) == 0,
+              "registering the door again later brings no second unlock notice");
+
+        // The player who picked the lock is also the first to register the door: nothing to tell.
+        const GameId kBarnDoor{0u, 0x000B0002u};
+        pHost->SetCellComponent(inA);
+        pGuest->SetCellComponent(farAway);
+        (void)DeliverWire(world, lockChange(kBarnDoor, kCellB, false, 25), pHost);
+        pHost->SetCellComponent(inB);
+        const auto hostBarn = registerObjects(pHost, kHostConn, {object(kBarnDoor, inB, false, 25)});
+        Check(hostBarn.size() == 1 && hostBarn[0].IsSenderFirst && isUnlocked(kBarnDoor) && unlockNoticesFor(kHostConn, kBarnDoor) == 0,
+              "the picker registering his own unlocked door first is told nothing");
+        pGuest->SetCellComponent(inB);
+        const auto guestBarn = registerObjects(pGuest, kGuestConn, {object(kBarnDoor, inB, true, 25)});
+        Check(guestBarn.size() == 1 && !guestBarn[0].IsSenderFirst && !guestBarn[0].CurrentLockData.IsLocked,
+              "and the guest, registering it locked afterwards, is answered 'unlocked'");
+
+        // Only unlocks are kept. "Locked" for an unknown object is not: an arena gate closes behind
+        // the party, a script opens it again without a report, and a player arriving later must
+        // not be locked out by a stale record.
+        const GameId kArenaGate{0u, 0x000B0003u};
+        pHost->SetCellComponent(inA);
+        pGuest->SetCellComponent(farAway);
+        (void)DeliverWire(world, lockChange(kArenaGate, kCellB, true, 100), pHost);
+        pGuest->SetCellComponent(inB);
+        const auto guestArena = registerObjects(pGuest, kGuestConn, {object(kArenaGate, inB, false, 0)});
+        Check(guestArena.size() == 1 && guestArena[0].IsSenderFirst && isUnlocked(kArenaGate) &&
+                  DecodeOutboxMessagesFor<NotifyLockChange>(kGuestConn).empty(),
+              "a 'locked' report for an unregistered gate is not kept: the first registration decides, as before");
+
+        // Unlocked and locked again before anybody registered it: the unlock is cancelled.
+        const GameId kShedDoor{0u, 0x000B0004u};
+        pGuest->SetCellComponent(farAway);
+        (void)DeliverWire(world, lockChange(kShedDoor, kCellB, false, 50), pHost);
+        (void)DeliverWire(world, lockChange(kShedDoor, kCellB, true, 50), pHost);
+        pGuest->SetCellComponent(inB);
+        const auto guestShed = registerObjects(pGuest, kGuestConn, {object(kShedDoor, inB, true, 50)});
+        Check(guestShed.size() == 1 && guestShed[0].IsSenderFirst && isLocked(kShedDoor) && unlockNoticesFor(kGuestConn, kShedDoor) == 0,
+              "a door unlocked and locked again before its registration stays locked");
+
+        // The switch off: as in 4.1.0 the unlock is forgotten and the first registration decides.
+        const GameId kCellarDoor{0u, 0x000B0005u};
+        bEnableUnlockMemory = false;
+        pGuest->SetCellComponent(farAway);
+        (void)DeliverWire(world, lockChange(kCellarDoor, kCellB, false, 50), pHost);
+        pGuest->SetCellComponent(inB);
+        const auto guestCellar = registerObjects(pGuest, kGuestConn, {object(kCellarDoor, inB, true, 50)});
+        Check(guestCellar.size() == 1 && isLocked(kCellarDoor) && unlockNoticesFor(kGuestConn, kCellarDoor) == 0,
+              "switch off: the guest's registration makes the picked door locked again (4.1.0)");
+        pHost->SetCellComponent(inB);
+        const auto hostCellar = registerObjects(pHost, kHostConn, {object(kCellarDoor, inB, false, 50)});
+        Check(hostCellar.size() == 1 && hostCellar[0].CurrentLockData.IsLocked,
+              "switch off: and the host is answered 'locked' for the door he picked (4.1.0)");
+        bEnableUnlockMemory = true;
+
+        // --- 4. Activations: relayed to the players in range, with the state before them --------
+        pHost->SetCellComponent(inA);
+        pGuest->SetCellComponent(inA);
+        Harness::ClearOutbox();
+        ActivateRequest openGate{};
+        openGate.Id = kGate;
+        openGate.CellId = kCellA;
+        openGate.ActivatorId = hostChar;
+        openGate.PreActivationOpenState = 3; // closed
+        Check(DeliverWire(world, openGate, pHost), "the host opens the gate");
+        const auto guestSeesGate = DecodeOutboxMessagesFor<NotifyActivate>(kGuestConn);
+        Check(guestSeesGate.size() == 1 && guestSeesGate[0].Id == kGate && guestSeesGate[0].ActivatorId == hostChar &&
+                  guestSeesGate[0].PreActivationOpenState == 3,
+              "the guest is told who opened which gate and that it was closed before");
+        Check(DecodeOutboxMessagesFor<NotifyActivate>(kHostConn).empty(), "the host is not sent his own activation");
+
+        pGuest->SetCellComponent(farAway);
+        Harness::ClearOutbox();
+        ActivateRequest closeGate = openGate;
+        closeGate.PreActivationOpenState = 1; // open
+        Check(DeliverWire(world, closeGate, pHost) && DecodeOutboxMessagesFor<NotifyActivate>(kGuestConn).empty(),
+              "an activation is not sent to a player far away");
+        (void)DeliverWire(world, openGate, pHost); // the gate stands open when the guest returns
+        pGuest->SetCellComponent(inA);
+        const auto guestReturns = registerObjects(pGuest, kGuestConn, {object(kGate, inA, true, 50)});
+        Check(guestReturns.size() == 1 && DecodeOutboxMessagesFor<NotifyActivate>(kGuestConn).empty(),
+              "known limit: the server keeps no open/closed state, a returning player is not told the gate stands open");
+
+        // --- 5. Script animations (levers, puzzle pillars): relayed in range --------------------
+        Harness::ClearOutbox();
+        ScriptAnimationRequest lever{};
+        lever.FormID = 0x000A0003u; // plugin 0, form A0003: the way the client packs it
+        lever.Animation = TiltedPhoques::String("PullLever");
+        Check(DeliverWire(world, lever, pHost), "the host's game plays a lever animation");
+        const auto guestSeesLever = DecodeOutboxMessagesFor<NotifyScriptAnimation>(kGuestConn);
+        Check(guestSeesLever.size() == 1 && guestSeesLever[0].FormID == 0x000A0003u && guestSeesLever[0].Animation == "PullLever" &&
+                  guestSeesLever[0].EventName.empty(),
+              "the guest's game is told to play it on the same lever");
+        Check(DecodeOutboxMessagesFor<NotifyScriptAnimation>(kHostConn).empty(), "the host is not sent his own animation");
+        pGuest->SetCellComponent(farAway);
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, lever, pHost) && DecodeOutboxMessagesFor<NotifyScriptAnimation>(kGuestConn).empty(),
+              "a script animation is not sent to a player far away");
+        pGuest->SetCellComponent(inA);
+        Harness::ClearOutbox();
+        ScriptAnimationRequest nothing{};
+        nothing.FormID = 0x000A0003u;
+        Check(DeliverWire(world, nothing, pHost) && DecodeOutboxMessagesFor<NotifyScriptAnimation>(kGuestConn).empty(),
+              "a request naming neither an animation nor an event is not relayed");
+
+        // --- 6. Quest stages: the party is one quest log -----------------------------------------
+        const GameId kQuest{0u, 0x000C0001u};
+        const GameId kOwnQuest{0u, 0x000C0002u};
+        constexpr uint8_t kMainQuest = 1;
+        const auto quest = [](const GameId& acId, uint16_t aStage, RequestQuestUpdate::StatusCode aStatus, uint8_t aType) {
+            RequestQuestUpdate update{};
+            update.Id = acId;
+            update.Stage = aStage;
+            update.Status = aStatus;
+            update.ClientQuestType = aType;
+            return update;
+        };
+        const auto stageOf = [](Player* apPlayer, const GameId& acId) -> int {
+            for (const auto& entry : apPlayer->GetQuestLogComponent().QuestContent.Entries)
+            {
+                if (entry.Id == acId)
+                    return static_cast<int>(entry.Stage);
+            }
+            return -1;
+        };
+        const auto questNoticesFor = [&](TiltedPhoques::ConnectionId_t aConn, const GameId& acId) {
+            std::vector<NotifyQuestUpdate> notices;
+            for (const auto& notice : DecodeOutboxMessagesFor<NotifyQuestUpdate>(aConn))
+            {
+                if (notice.Id == acId)
+                    notices.push_back(notice);
+            }
+            return notices;
+        };
+
+        // The guest stands far away: quest progress does not depend on where a player is.
+        pGuest->SetCellComponent(farAway);
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, quest(kQuest, 10, RequestQuestUpdate::Started, kMainQuest), pHost), "the host starts a quest");
+        auto guestQuest = questNoticesFor(kGuestConn, kQuest);
+        Check(guestQuest.size() == 1 && guestQuest[0].Status == NotifyQuestUpdate::Started && guestQuest[0].Stage == 10 &&
+                  guestQuest[0].ClientQuestType == kMainQuest,
+              "the guest is told the quest started, wherever he is");
+        Check(questNoticesFor(kHostConn, kQuest).empty() && stageOf(pHost, kQuest) == 10 && stageOf(pGuest, kQuest) == 10,
+              "the host is not, and the server's log shows the quest at stage 10 for both");
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, quest(kQuest, 20, RequestQuestUpdate::StageUpdate, kMainQuest), pHost), "the host advances it to stage 20");
+        guestQuest = questNoticesFor(kGuestConn, kQuest);
+        Check(guestQuest.size() == 1 && guestQuest[0].Status == NotifyQuestUpdate::StageUpdate && guestQuest[0].Stage == 20,
+              "the guest is told stage 20, once");
+
+        // The guest's game reached stage 20 by itself as well (both saw the same trigger): its
+        // report crosses the server's notice.
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, quest(kQuest, 20, RequestQuestUpdate::StageUpdate, kMainQuest), pGuest) &&
+                  questNoticesFor(kHostConn, kQuest).empty() && questNoticesFor(kGuestConn, kQuest).empty(),
+              "the guest reporting the stage it was just told does not bounce back to anybody");
+
+        // A stage advanced by the player who does not lead the party.
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, quest(kQuest, 30, RequestQuestUpdate::StageUpdate, kMainQuest), pGuest), "the guest pulls the lever: stage 30");
+        const auto hostQuest = questNoticesFor(kHostConn, kQuest);
+        Check(hostQuest.size() == 1 && hostQuest[0].Stage == 30 && hostQuest[0].Status == NotifyQuestUpdate::StageUpdate,
+              "the party leader is told stage 30");
+        Check(questNoticesFor(kGuestConn, kQuest).empty() && stageOf(pHost, kQuest) == 30 && stageOf(pGuest, kQuest) == 30,
+              "the guest is not, and both stand at stage 30");
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, quest(kQuest, 30, RequestQuestUpdate::StageUpdate, kMainQuest), pGuest) &&
+                  questNoticesFor(kHostConn, kQuest).empty(),
+              "the same stage reported twice by the same player is relayed once");
+
+        // A third player joins with an older save: the shared quest at stage 10, and a quest of
+        // his own that the party does not have.
+        Player* pLate = world.GetPlayerManager().Create(kLateConn);
+        world.GetDispatcher().trigger(PlayerJoinEvent{pLate, {}, {}, DateTime{t0}});
+        pLate->SetCellComponent(inA);
+        QuestLog lateLog{};
+        lateLog.Entries.emplace_back(kQuest, uint16_t{10});
+        lateLog.Entries.emplace_back(kOwnQuest, uint16_t{5});
+        const uint32_t lateChar = enterWorld(pLate, kLateConn, lateLog);
+        const auto lateQuest = questNoticesFor(kLateConn, kQuest);
+        Check(lateChar != 0xFFFFFFFFu && lateQuest.size() == 1 && lateQuest[0].Stage == 30 && lateQuest[0].Status == NotifyQuestUpdate::StageUpdate &&
+                  stageOf(pLate, kQuest) == 30,
+              "a player joining with the quest at stage 10 is brought to the party's stage 30, once");
+        Check(questNoticesFor(kLateConn, kOwnQuest).empty() && questNoticesFor(kHostConn, kOwnQuest).empty() &&
+                  questNoticesFor(kGuestConn, kOwnQuest).empty() && stageOf(pHost, kOwnQuest) == -1,
+              "his own quest stays his own: joining does not push it into the party's games");
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, quest(kQuest, 40, RequestQuestUpdate::StageUpdate, kMainQuest), pHost) &&
+                  questNoticesFor(kGuestConn, kQuest).size() == 1 && questNoticesFor(kLateConn, kQuest).size() == 1,
+              "the next stage reaches both other players");
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, quest(kQuest, 40, RequestQuestUpdate::Stopped, kMainQuest), pHost), "the host's game ends the quest");
+        const auto guestStop = questNoticesFor(kGuestConn, kQuest);
+        const auto lateStop = questNoticesFor(kLateConn, kQuest);
+        Check(guestStop.size() == 1 && guestStop[0].Status == NotifyQuestUpdate::Stopped && lateStop.size() == 1 &&
+                  lateStop[0].Status == NotifyQuestUpdate::Stopped,
+              "both other players are told the quest stopped");
+        Check(stageOf(pHost, kQuest) == -1 && stageOf(pGuest, kQuest) == -1 && stageOf(pLate, kQuest) == -1,
+              "and it leaves the server's log of every player");
+
+        // --- 7. A rollback: unlocks made after the checkpoint never happened --------------------
+        auto& saves = world.GetSaveSnapshotService();
+        Check(saves.TriggerCoordinatedSave(true, nullptr), "a checkpoint save starts");
+        if (const auto pending = saves.GetCoordinator().GetPendingBarrier(); pending.has_value())
+        {
+            CoordinatedSaveAck ack{};
+            ack.EpochId = pending->EpochId;
+            ack.SlotName = String(pending->SlotName.c_str());
+            ack.Success = true;
+            for (Player* pPlayer : {pHost, pGuest, pLate})
+                Deliver(world, ack, pPlayer);
+        }
+        Check(saves.GetSnapshotCount() > 0, "the checkpoint is recorded");
+
+        // After the checkpoint the host picks one more lock across the border.
+        const GameId kWellDoor{0u, 0x000B0006u};
+        pHost->SetCellComponent(inA);
+        pGuest->SetCellComponent(farAway);
+        (void)DeliverWire(world, lockChange(kWellDoor, kCellB, false, 50), pHost);
+
+        Check(saves.TriggerRollbackToLatest(false), "the party rolls back to the checkpoint");
+        Check(isUnlocked(kHouseDoor) && isLocked(kGate), "locks registered before the checkpoint come back as the checkpoint held them");
+        // Every game reloads the checkpoint's save, in which the well door is locked.
+        pGuest->SetCellComponent(inB);
+        const auto guestWell = registerObjects(pGuest, kGuestConn, {object(kWellDoor, inB, true, 50)});
+        Check(guestWell.size() == 1 && guestWell[0].IsSenderFirst && isLocked(kWellDoor) && unlockNoticesFor(kGuestConn, kWellDoor) == 0,
+              "an unlock made after the checkpoint is forgotten by the rollback");
+    }
+
+    // =========================================================================
+    // Scene 18: movement, animation events and load doors for two players (work plan 5.5).
+    // =========================================================================
+    //
+    // The harness never looked at what a movement report turns into for the other player, and
+    // never sent the packet a client sends when its player walks through a load door. The scene
+    // pins both: who is sent an NPC's movement and animation events, what a player who arrives
+    // later is told about the NPC, and who simulates it when a player or the NPC changes cell.
+    {
+        std::printf("[scene 18] movement, animation events and load doors for two players\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xF301u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xF302u;
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kHall{0u, 0x000E0001u};
+        const GameId kCellar{0u, 0x000E0002u};
+        const GameId kGuardBase{0u, 0x000E1001u};
+        constexpr uint32_t kHealthIndex = ActorValuesComponent::kHealthActorValueIndex;
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 12.0f;
+        t0.Day = 5;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+
+        // A player walks through a load door: the packet his client sends.
+        const auto walkInto = [&](Player* apPlayer, const GameId& acCell) {
+            Harness::ClearOutbox();
+            EnterInteriorCellRequest request{};
+            request.CellId = acCell;
+            return DeliverWire(world, request, apPlayer);
+        };
+        Check(walkInto(pHost, kHall) && walkInto(pGuest, kHall) && pHost->GetCellComponent().Cell == kHall &&
+                  pGuest->GetCellComponent().Cell == kHall,
+              "both players enter the hall");
+
+        uint32_t nextCookie = 1800u;
+        const auto assign = [&](Player* apOwner, TiltedPhoques::ConnectionId_t aConn, const GameId& acRefId) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            request.ReferenceId = acRefId;
+            if (acRefId != kPlayerRef)
+                request.FormId = kGuardBase;
+            request.CellId = kHall;
+            request.Position = glm::vec3{100.0f, 100.0f, 0.0f};
+            request.CurrentActorData.BaseId = request.FormId;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 100.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 100.0f;
+            (void)DeliverWire(world, request, apOwner);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const uint32_t hostChar = assign(pHost, kHostConn, kPlayerRef);
+        const uint32_t guestChar = assign(pGuest, kGuestConn, kPlayerRef);
+        const uint32_t guard = assign(pHost, kHostConn, GameId{0u, 0x000E2001u});
+        Check(hostChar != 0xFFFFFFFFu && guestChar != 0xFFFFFFFFu && guard != 0xFFFFFFFFu,
+              "two players and a guard simulated by the host are registered");
+
+        const auto entityOf = [](uint32_t aServerId) { return static_cast<entt::entity>(aServerId); };
+        const auto ownerOf = [&](uint32_t aServerId) { return world.get<OwnerComponent>(entityOf(aServerId)).GetOwner(); };
+        const auto positionOf = [&](uint32_t aServerId) { return glm::vec3(world.get<MovementComponent>(entityOf(aServerId)).Position); };
+        const auto cellOf = [&](uint32_t aServerId) { return world.get<CellIdComponent>(entityOf(aServerId)).Cell; };
+        const auto at = [](const glm::vec3& acLhs, const glm::vec3& acRhs) { return glm::distance(acLhs, acRhs) < 1.0f; };
+
+        // One movement report, the way a client builds it for an actor it simulates.
+        const auto movementOf = [&](uint32_t aServerId, const GameId& acCell, const glm::vec3& acPosition,
+                                    std::initializer_list<const char*> aEvents) {
+            ClientReferencesMoveRequest request{};
+            request.Tick = 5000u;
+            ReferenceUpdate update{};
+            update.UpdatedMovement.CellId = acCell;
+            update.UpdatedMovement.Position = acPosition;
+            update.UpdatedMovement.Direction = 0.25f;
+            for (const char* pEvent : aEvents)
+            {
+                ActionEvent action{};
+                action.EventName = TiltedPhoques::String(pEvent);
+                action.TargetEventName = TiltedPhoques::String(pEvent);
+                update.ActionEvents.push_back(action);
+            }
+            request.Updates[aServerId] = update;
+            return request;
+        };
+        // The update for one actor in what a player was sent, if any.
+        const auto relayedTo = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) -> std::optional<ReferenceUpdate> {
+            std::optional<ReferenceUpdate> found;
+            for (const auto& relay : DecodeOutboxMessagesFor<ServerReferencesMoveRequest>(aConn))
+            {
+                const auto it = relay.Updates.find(aServerId);
+                if (it != relay.Updates.end())
+                    found = it->second;
+            }
+            return found;
+        };
+        const auto spawnedFor = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) -> std::optional<CharacterSpawnRequest> {
+            for (const auto& spawn : DecodeOutboxMessagesFor<CharacterSpawnRequest>(aConn))
+            {
+                if (spawn.ServerId == aServerId)
+                    return spawn;
+            }
+            return std::nullopt;
+        };
+        const auto removedFor = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& removal : DecodeOutboxMessagesFor<NotifyRemoveCharacter>(aConn))
+            {
+                if (removal.ServerId == aServerId)
+                    return true;
+            }
+            return false;
+        };
+        const auto grantedTo = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& grant : DecodeOutboxMessagesFor<NotifyOwnershipTransfer>(aConn))
+            {
+                if (grant.ServerId == aServerId)
+                    return true;
+            }
+            return false;
+        };
+        const auto toldToLetGo = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& notice : DecodeOutboxMessagesFor<NotifyRelinquishControl>(aConn))
+            {
+                if (notice.ServerId == aServerId)
+                    return true;
+            }
+            return false;
+        };
+        const auto replays = [](const CharacterSpawnRequest& acSpawn, const char* apEvent) {
+            for (const auto& action : acSpawn.ActionsToReplay.Actions)
+            {
+                if (action.EventName == apEvent)
+                    return true;
+            }
+            return false;
+        };
+
+        // --- 1. Movement and animation events of an NPC ----------------------------------------
+        Harness::ClearOutbox();
+        ClientReferencesMoveRequest guardWalks = movementOf(guard, kHall, glm::vec3{300.0f, 150.0f, 10.0f}, {"moveStart", "JumpUp"});
+        guardWalks.Updates[guard].UpdatedMovement.Variables.Booleans = {true, false, true};
+        guardWalks.Updates[guard].UpdatedMovement.Variables.Integers = {7u};
+        guardWalks.Updates[guard].UpdatedMovement.Variables.Floats = {0.5f, 2.0f};
+        Check(DeliverWire(world, guardWalks, pHost) && at(positionOf(guard), glm::vec3{300.0f, 150.0f, 10.0f}),
+              "the host's game moves the guard: the server holds the new position");
+        const auto guestSeesWalk = relayedTo(kGuestConn, guard);
+        Check(guestSeesWalk.has_value() && at(glm::vec3(guestSeesWalk->UpdatedMovement.Position), glm::vec3{300.0f, 150.0f, 10.0f}) &&
+                  std::fabs(guestSeesWalk->UpdatedMovement.Direction - 0.25f) < 0.01f,
+              "the guest is sent the guard's position and direction at once");
+        Check(guestSeesWalk.has_value() && guestSeesWalk->ActionEvents.size() == 2 && guestSeesWalk->ActionEvents[0].EventName == "moveStart" &&
+                  guestSeesWalk->ActionEvents[1].EventName == "JumpUp",
+              "with both animation events, in the order they happened");
+        Check(guestSeesWalk.has_value() && guestSeesWalk->UpdatedMovement.Variables.Booleans.size() == 3 &&
+                  guestSeesWalk->UpdatedMovement.Variables.Booleans[0] && !guestSeesWalk->UpdatedMovement.Variables.Booleans[1] &&
+                  guestSeesWalk->UpdatedMovement.Variables.Booleans[2] && guestSeesWalk->UpdatedMovement.Variables.Integers.size() == 1 &&
+                  guestSeesWalk->UpdatedMovement.Variables.Integers[0] == 7u && guestSeesWalk->UpdatedMovement.Variables.Floats.size() == 2 &&
+                  std::fabs(guestSeesWalk->UpdatedMovement.Variables.Floats[1] - 2.0f) < 0.01f,
+              "and the animation variables as they were sent: 3 flags, 1 number, 2 fractions");
+        Check(!relayedTo(kHostConn, guard).has_value(), "the host is not sent his own guard's movement back");
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(guard, kHall, glm::vec3{900.0f, 900.0f, 0.0f}, {"attackStart"}), pGuest) &&
+                  at(positionOf(guard), glm::vec3{300.0f, 150.0f, 10.0f}) && !relayedTo(kHostConn, guard).has_value(),
+              "a movement report from the player who does not simulate the guard is ignored");
+
+        Harness::ClearOutbox();
+        ClientReferencesMoveRequest broken = movementOf(guard, kHall, glm::vec3{300.0f, 150.0f, 10.0f}, {});
+        broken.Updates[guard].UpdatedMovement.Position = glm::vec3{std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f};
+        (void)Deliver(world, broken, pHost);
+        ClientReferencesMoveRequest tooFar = movementOf(guard, kHall, glm::vec3{5.0e6f, 0.0f, 0.0f}, {});
+        (void)Deliver(world, tooFar, pHost);
+        Check(at(positionOf(guard), glm::vec3{300.0f, 150.0f, 10.0f}) && !relayedTo(kGuestConn, guard).has_value(),
+              "a position that is not a number, or lies outside any world, is neither stored nor relayed");
+
+        // --- 2. Player avatars ------------------------------------------------------------------
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(hostChar, kHall, glm::vec3{120.0f, 100.0f, 0.0f}, {"SprintStart"}), pHost) &&
+                  relayedTo(kGuestConn, hostChar).has_value() && relayedTo(kGuestConn, hostChar)->ActionEvents.size() == 1,
+              "the host's own movement and sprint reach the guest");
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(hostChar, kHall, glm::vec3{800.0f, 800.0f, 0.0f}, {}), pGuest) &&
+                  at(positionOf(hostChar), glm::vec3{120.0f, 100.0f, 0.0f}) && !relayedTo(kHostConn, hostChar).has_value(),
+              "a player cannot move another player's character");
+
+        // --- 3. The guest walks through a load door and comes back ------------------------------
+        Check(walkInto(pGuest, kCellar) && removedFor(kGuestConn, guard), "the guest leaves for the cellar: his game is told to remove the guard");
+        Check(!removedFor(kHostConn, guestChar) && !DecodeOutboxMessagesFor<NotifyPlayerCellChanged>(kHostConn).empty(),
+              "the host is told that the guest changed cell; a player's character is never taken away from a party member");
+        // While he is away the guard walks to a chair and sits down.
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(guard, kHall, glm::vec3{400.0f, 200.0f, 0.0f}, {"moveStop", "IdleChairFrontEnter"}), pHost) &&
+                  !relayedTo(kGuestConn, guard).has_value() && ownerOf(guard) == pHost,
+              "the guard's movement is no longer sent to him, and the guard stays with the host");
+
+        Check(walkInto(pGuest, kHall), "the guest comes back");
+        const auto guardForGuest = spawnedFor(kGuestConn, guard);
+        Check(guardForGuest.has_value() && at(glm::vec3(guardForGuest->Position), glm::vec3{400.0f, 200.0f, 0.0f}) && guardForGuest->CellId == kHall,
+              "he is sent the guard where it is now, not where he last saw it");
+        Check(guardForGuest.has_value() && replays(*guardForGuest, "IdleChairEnterInstant") && !replays(*guardForGuest, "IdleChairFrontEnter"),
+              "and that it sits: the sit-down is replayed in its instant form, so the guard is not seen sitting down again");
+        Check(ownerOf(guard) == pHost && !grantedTo(kGuestConn, guard), "coming back does not hand the guard to the guest");
+
+        // The guard stands up while the guest is away again.
+        Check(walkInto(pGuest, kCellar), "the guest leaves once more");
+        (void)DeliverWire(world, movementOf(guard, kHall, glm::vec3{400.0f, 200.0f, 0.0f}, {"IdleStop", "moveStart"}), pHost);
+        Check(walkInto(pGuest, kHall), "and comes back after the guard stood up");
+        const auto standingGuard = spawnedFor(kGuestConn, guard);
+        Check(standingGuard.has_value() && standingGuard->ActionsToReplay.ResetAnimationGraph && !replays(*standingGuard, "IdleChairEnterInstant") &&
+                  replays(*standingGuard, "moveStart"),
+              "he is told to reset the guard's animation and is not shown it sitting");
+
+        // --- 4. The simulating player walks through the door ------------------------------------
+        // His client hands over what it leaves behind: a RequestOwnershipTransfer for each actor.
+        // For an actor whose cell is already unloaded the request carries no place.
+        Check(walkInto(pHost, kCellar) && ownerOf(guard) == pHost, "the host leaves for the cellar; the server waits for his client to let the guard go");
+        RequestOwnershipTransfer leaveGuard{};
+        leaveGuard.ServerId = guard;
+        Check(DeliverWire(world, leaveGuard, pHost) && ownerOf(guard) == pGuest && grantedTo(kGuestConn, guard),
+              "the guard he leaves behind goes to the guest, who stays in the hall");
+        Check(at(positionOf(guard), glm::vec3{400.0f, 200.0f, 0.0f}) && cellOf(guard) == kHall,
+              "a handover without a place leaves the guard where the server last held it");
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(guard, kHall, glm::vec3{50.0f, 50.0f, 0.0f}, {}), pHost) &&
+                  at(positionOf(guard), glm::vec3{400.0f, 200.0f, 0.0f}),
+              "a late movement report from the previous simulator does not move the guard");
+        Check(DeliverWire(world, movementOf(guard, kHall, glm::vec3{450.0f, 220.0f, 0.0f}, {"moveStart"}), pGuest) &&
+                  at(positionOf(guard), glm::vec3{450.0f, 220.0f, 0.0f}) && !relayedTo(kHostConn, guard).has_value(),
+              "the guest's game moves it now; the host, in another cell, is not sent that");
+
+        // The host comes back. A calm NPC placed in the world returns to the party leader's game.
+        Check(walkInto(pHost, kHall), "the host comes back to the hall");
+        const auto guardForHost = spawnedFor(kHostConn, guard);
+        Check(guardForHost.has_value() && at(glm::vec3(guardForHost->Position), glm::vec3{450.0f, 220.0f, 0.0f}),
+              "he is sent the guard where the guest's game left it");
+        Check(ownerOf(guard) == pHost && grantedTo(kHostConn, guard) && toldToLetGo(kGuestConn, guard),
+              "the calm guard returns to the party leader's game, and the guest's game is told to let it go");
+
+        // In a fight the guard stays with whoever simulates it.
+        Check(walkInto(pHost, kCellar), "the host leaves again");
+        Check(DeliverWire(world, leaveGuard, pHost) && ownerOf(guard) == pGuest, "the guard goes to the guest again");
+        DrawWeaponRequest guardDraws{};
+        guardDraws.Id = guard;
+        guardDraws.IsWeaponDrawn = true;
+        Check(DeliverWire(world, guardDraws, pGuest) && world.get<CharacterComponent>(entityOf(guard)).IsWeaponDrawn(),
+              "the guard draws its weapon in the guest's game");
+        Check(walkInto(pHost, kHall) && ownerOf(guard) == pGuest && !grantedTo(kHostConn, guard) && !toldToLetGo(kGuestConn, guard) &&
+                  spawnedFor(kHostConn, guard).has_value(),
+              "the returning leader is shown the guard, but a guard with a drawn weapon stays with the guest");
+
+        // --- 5. The NPC itself goes through the door -------------------------------------------
+        // The guest's game reports the guard in the cellar, then lets it go there (the actor left
+        // the loaded cell): this handover carries the place.
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(guard, kCellar, glm::vec3{10.0f, 20.0f, 0.0f}, {}), pGuest) && cellOf(guard) == kCellar &&
+                  at(positionOf(guard), glm::vec3{10.0f, 20.0f, 0.0f}),
+              "the guard runs through the door: the server holds it in the cellar");
+        Check(removedFor(kHostConn, guard), "the host, who stays in the hall, is told to remove it");
+        RequestOwnershipTransfer guardGone{};
+        guardGone.ServerId = guard;
+        guardGone.CellId = kCellar;
+        guardGone.Position = glm::vec3{12.0f, 24.0f, 0.0f};
+        Check(DeliverWire(world, guardGone, pGuest) && ownerOf(guard) == nullptr && cellOf(guard) == kCellar &&
+                  at(positionOf(guard), glm::vec3{12.0f, 24.0f, 0.0f}),
+              "the guest's game lets it go: nobody is in the cellar, so nobody simulates it, and the server keeps its place");
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(guard, kCellar, glm::vec3{99.0f, 99.0f, 0.0f}, {}), pGuest) &&
+                  at(positionOf(guard), glm::vec3{12.0f, 24.0f, 0.0f}),
+              "after that its former simulator cannot move it");
+        // The host follows it.
+        Check(walkInto(pHost, kCellar), "the host follows the guard into the cellar");
+        const auto guardInCellar = spawnedFor(kHostConn, guard);
+        Check(guardInCellar.has_value() && guardInCellar->CellId == kCellar && at(glm::vec3(guardInCellar->Position), glm::vec3{12.0f, 24.0f, 0.0f}),
+              "and is sent the guard in the cellar, at the place its last simulator reported");
+        Check(ownerOf(guard) == pHost && grantedTo(kHostConn, guard), "the guard nobody simulated is given to him");
+        Check(world.get<CharacterComponent>(entityOf(guard)).IsWeaponDrawn(), "still with its weapon drawn");
+    }
+
+    // =========================================================================
+    // Scene 19: a player's summon belongs to the summoner (work plan 6.2).
+    // =========================================================================
+    //
+    // Conjuration is a build of its own in RFAB, and no scene had a summon in it. A summon is not
+    // a world NPC: it exists in its summoner's game, follows him, and must never change hands. The
+    // scene pins every rule of NPC ownership that has an exception for summons, and what happens to
+    // a summon when its summoner lets it go or leaves.
+    {
+        std::printf("[scene 19] a player's summon belongs to the summoner\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xF401u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xF402u;
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kHall{0u, 0x000F0001u};
+        const GameId kCellar{0u, 0x000F0002u};
+        const GameId kAtronachBase{0u, 0x000F1001u};
+        constexpr uint32_t kTemporary = std::numeric_limits<uint32_t>::max();
+        constexpr uint32_t kHealthIndex = ActorValuesComponent::kHealthActorValueIndex;
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 12.0f;
+        t0.Day = 6;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+
+        const auto walkInto = [&](Player* apPlayer, const GameId& acCell) {
+            Harness::ClearOutbox();
+            EnterInteriorCellRequest request{};
+            request.CellId = acCell;
+            return DeliverWire(world, request, apPlayer);
+        };
+        Check(walkInto(pHost, kHall) && walkInto(pGuest, kHall), "both players enter the hall");
+
+        uint32_t nextCookie = 1900u;
+        uint32_t nextTemporaryRef = 0xFF000A00u;
+        std::optional<AssignCharacterResponse> lastAssign;
+        // Registers the player's own character (acRefId == kPlayerRef) or a conjured atronach.
+        const auto assign = [&](Player* apOwner, TiltedPhoques::ConnectionId_t aConn, bool aSummon) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            if (aSummon)
+            {
+                request.ReferenceId = GameId{kTemporary, nextTemporaryRef++};
+                request.FormId = kAtronachBase;
+                request.IsPlayerSummon = true;
+            }
+            else
+            {
+                request.ReferenceId = kPlayerRef;
+            }
+            request.CellId = kHall;
+            request.Position = glm::vec3{200.0f, 200.0f, 0.0f};
+            request.CurrentActorData.BaseId = request.FormId;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 100.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 100.0f;
+            (void)DeliverWire(world, request, apOwner);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            lastAssign = responses.size() == 1 ? std::optional<AssignCharacterResponse>{responses[0]} : std::nullopt;
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const uint32_t hostChar = assign(pHost, kHostConn, false);
+        const uint32_t guestChar = assign(pGuest, kGuestConn, false);
+        Check(hostChar != 0xFFFFFFFFu && guestChar != 0xFFFFFFFFu, "both players' characters are registered");
+
+        const auto entityOf = [](uint32_t aServerId) { return static_cast<entt::entity>(aServerId); };
+        const auto exists = [&](uint32_t aServerId) { return world.valid(entityOf(aServerId)); };
+        const auto ownerOf = [&](uint32_t aServerId) { return world.get<OwnerComponent>(entityOf(aServerId)).GetOwner(); };
+        const auto healthOf = [&](uint32_t aServerId) {
+            return world.get<ActorValuesComponent>(entityOf(aServerId)).CurrentActorValues.ActorValuesList[kHealthIndex];
+        };
+        const auto near = [](float aLhs, float aRhs) { return std::fabs(aLhs - aRhs) < 0.01f; };
+        const auto spawnedFor = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) -> std::optional<CharacterSpawnRequest> {
+            for (const auto& spawn : DecodeOutboxMessagesFor<CharacterSpawnRequest>(aConn))
+            {
+                if (spawn.ServerId == aServerId)
+                    return spawn;
+            }
+            return std::nullopt;
+        };
+        const auto removedFor = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& removal : DecodeOutboxMessagesFor<NotifyRemoveCharacter>(aConn))
+            {
+                if (removal.ServerId == aServerId)
+                    return true;
+            }
+            return false;
+        };
+        const auto grantedTo = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& grant : DecodeOutboxMessagesFor<NotifyOwnershipTransfer>(aConn))
+            {
+                if (grant.ServerId == aServerId)
+                    return true;
+            }
+            return false;
+        };
+        const auto toldToLetGo = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& notice : DecodeOutboxMessagesFor<NotifyRelinquishControl>(aConn))
+            {
+                if (notice.ServerId == aServerId)
+                    return true;
+            }
+            return false;
+        };
+        uint32_t nextHitId = 19000u;
+        const auto swing = [&](uint32_t aTarget, float aDelta) {
+            RequestHealthChangeBroadcast hit{};
+            hit.Id = aTarget;
+            hit.DeltaHealth = aDelta;
+            hit.HitId = nextHitId++;
+            return hit;
+        };
+
+        // --- 1. The guest conjures an atronach --------------------------------------------------
+        const uint32_t atronach = assign(pGuest, kGuestConn, true);
+        Check(atronach != 0xFFFFFFFFu && lastAssign.has_value() && lastAssign->Owner && lastAssign->PlayerId == pGuest->GetId() &&
+                  world.get<CharacterComponent>(entityOf(atronach)).IsPlayerSummon() && ownerOf(atronach) == pGuest,
+              "the guest's atronach is registered as his summon");
+        const auto atronachForHost = spawnedFor(kHostConn, atronach);
+        Check(atronachForHost.has_value() && atronachForHost->IsPlayerSummon && atronachForHost->PlayerId == pGuest->GetId() &&
+                  atronachForHost->BaseId == kAtronachBase && atronachForHost->FormId == GameId{},
+              "the host is sent it as the guest's summon, so his game binds it to the guest's character and not to his own");
+
+        // The host conjures the same creature on the same spot: two summons, not one shared.
+        const uint32_t hostAtronach = assign(pHost, kHostConn, true);
+        Check(hostAtronach != 0xFFFFFFFFu && hostAtronach != atronach && lastAssign.has_value() && lastAssign->Owner &&
+                  ownerOf(hostAtronach) == pHost && ownerOf(atronach) == pGuest,
+              "the same creature conjured by the host on the same spot is a second summon: summons are never merged");
+
+        // --- 2. It cannot change hands ----------------------------------------------------------
+        Harness::ClearOutbox();
+        RequestOwnershipClaim claim{};
+        claim.ServerId = atronach;
+        claim.NewActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 100.0f;
+        claim.NewActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 100.0f;
+        Check(DeliverWire(world, claim, pHost) && ownerOf(atronach) == pGuest && toldToLetGo(kHostConn, atronach) && !grantedTo(kHostConn, atronach),
+              "the party leader's claim on it is refused");
+
+        // A calm world NPC goes to the party leader when he walks in. A summon does not.
+        Check(walkInto(pHost, kCellar) && walkInto(pHost, kHall) && ownerOf(atronach) == pGuest && !grantedTo(kHostConn, atronach) &&
+                  spawnedFor(kHostConn, atronach).has_value(),
+              "the leader walking back in is shown the atronach, and it stays with the guest");
+
+        // The guest stands in a menu for a minute while the host plays on.
+        constexpr uint64_t kLeaseNow = 9'000'000ull;
+        world.GetCharacterService().NotePlayerSimulationActivity(pGuest, kLeaseNow);
+        world.GetCharacterService().NotePlayerSimulationActivity(pHost, kLeaseNow + 59'000ull);
+        Harness::ClearOutbox();
+        world.GetCharacterService().SweepExpiredWorldNpcLeases(kLeaseNow + 60'000ull);
+        Check(ownerOf(atronach) == pGuest && !grantedTo(kHostConn, atronach) && !toldToLetGo(kGuestConn, atronach),
+              "a summoner who is silent for a minute keeps his summon: there is no lease to lose");
+
+        // --- 3. Movement and damage -------------------------------------------------------------
+        const auto movementOf = [&](uint32_t aServerId, const glm::vec3& acPosition) {
+            ClientReferencesMoveRequest request{};
+            request.Tick = 7000u;
+            ReferenceUpdate update{};
+            update.UpdatedMovement.CellId = kHall;
+            update.UpdatedMovement.Position = acPosition;
+            request.Updates[aServerId] = update;
+            return request;
+        };
+        const auto relayedTo = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& relay : DecodeOutboxMessagesFor<ServerReferencesMoveRequest>(aConn))
+            {
+                if (relay.Updates.find(aServerId) != relay.Updates.end())
+                    return true;
+            }
+            return false;
+        };
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(atronach, glm::vec3{260.0f, 210.0f, 0.0f}), pGuest) && relayedTo(kHostConn, atronach),
+              "the atronach's movement comes from the guest's game and is sent to the host");
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(atronach, glm::vec3{900.0f, 900.0f, 0.0f}), pHost) && !relayedTo(kGuestConn, atronach) &&
+                  glm::distance(glm::vec3(world.get<MovementComponent>(entityOf(atronach)).Position), glm::vec3{260.0f, 210.0f, 0.0f}) < 1.0f,
+              "the host's game cannot move it");
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, swing(atronach, -40.0f), pHost) && near(healthOf(atronach), 100.0f) &&
+                  DecodeOutboxMessagesFor<NotifyHealthChangeBroadcast>(kGuestConn).empty(),
+              "a party member's stray blow does not hurt the summon");
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, swing(atronach, -30.0f), pGuest) && near(healthOf(atronach), 70.0f) &&
+                  DecodeOutboxMessagesFor<NotifyHealthChangeBroadcast>(kHostConn).size() == 1,
+              "damage an enemy does to it in the summoner's game is applied and sent to the host: 100 -> 70");
+
+        // --- 4. The summoner lets it go ---------------------------------------------------------
+        // His client hands over every actor it unloads. A world NPC goes to the player who stays;
+        // a summon is removed, because nobody else's game can run it.
+        // The summon expired, was dismissed, or was unloaded with the summoner's cell: for the server
+        // this request is the only sign of it (defect M26).
+        RequestOwnershipTransfer letGo{};
+        letGo.ServerId = atronach;
+        letGo.OwnershipEpoch = world.get<OwnerComponent>(entityOf(atronach)).GetEpoch();
+
+        Check(static_cast<bool>(bEnableSummonDismissal), "Gameplay:bEnableSummonDismissal is on by default");
+        bEnableSummonDismissal = false;
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, letGo, pGuest) && exists(atronach) && ownerOf(atronach) == pGuest && !removedFor(kHostConn, atronach) &&
+                  toldToLetGo(kGuestConn, atronach),
+              "with the switch off the request is refused, as in 4.1.0: the atronach stays for the host where it last stood");
+        bEnableSummonDismissal = true;
+
+        Harness::ClearOutbox();
+        RequestOwnershipTransfer staleLetGo = letGo;
+        staleLetGo.OwnershipEpoch = letGo.OwnershipEpoch + 5u;
+        Check(DeliverWire(world, staleLetGo, pGuest) && exists(atronach) && !removedFor(kHostConn, atronach),
+              "a request that quotes an epoch the lease never had is refused");
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, letGo, pGuest) && !exists(atronach) && removedFor(kHostConn, atronach) && !grantedTo(kHostConn, atronach) &&
+                  !removedFor(kGuestConn, atronach),
+              "let go by the summoner, the atronach is removed for the host and given to nobody");
+        Check(exists(hostAtronach) && ownerOf(hostAtronach) == pHost, "the host's own atronach is untouched");
+        // A player who walks in later is not shown a summon that is gone.
+        Check(walkInto(pHost, kCellar) && walkInto(pHost, kHall) && !spawnedFor(kHostConn, atronach).has_value(),
+              "walking back into the hall, the host is not shown the atronach that is gone");
+
+        // A request from somebody else to let the host's summon go is refused.
+        Harness::ClearOutbox();
+        RequestOwnershipTransfer notMine{};
+        notMine.ServerId = hostAtronach;
+        Check(DeliverWire(world, notMine, pGuest) && exists(hostAtronach) && ownerOf(hostAtronach) == pHost && toldToLetGo(kGuestConn, hostAtronach),
+              "the guest cannot make the server drop the host's summon");
+
+        // --- 5. The summoner leaves the game ----------------------------------------------------
+        const uint32_t secondAtronach = assign(pGuest, kGuestConn, true);
+        Check(secondAtronach != 0xFFFFFFFFu && spawnedFor(kHostConn, secondAtronach).has_value(), "the guest conjures again and the host is shown the new atronach");
+        Harness::ClearOutbox();
+        Disconnect(server, kGuestConn);
+        Check(!exists(secondAtronach) && removedFor(kHostConn, secondAtronach) && !grantedTo(kHostConn, secondAtronach),
+              "the guest disconnects: his atronach is removed for the host, not handed to him");
+        Check(!exists(guestChar) && removedFor(kHostConn, guestChar), "so is the guest's character");
+        Check(exists(hostAtronach) && ownerOf(hostAtronach) == pHost && exists(hostChar), "the host and his atronach stay");
+    }
+
+    // =========================================================================
+    // Scene 20: a merchant's chest under the rules of a shared chest (work plan 6.4, defect M27).
+    // =========================================================================
+    //
+    // A chest of loot is shared: the first player to register it decides what is in it, and a take
+    // the server's copy cannot cover is taken back from the taker. That is right for loot. A
+    // merchant's chest is filled by each player's own game (RFAB keeps the stock in each player's
+    // save and the game restocks it locally), so the players' copies differ all the time. The scene
+    // shows what the shared rules then do to a trade: the two halves of a trade are separate
+    // packets, and only the half the server cannot cover is undone.
+    //
+    // The server cannot tell a merchant's chest from any other. Since 4.1.1 the client does not
+    // register one (Gameplay:bEnablePersonalMerchantStock); this scene is why.
+    {
+        std::printf("[scene 20] a merchant's chest under the rules of a shared chest\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kFirstConn = 0xF501u;
+        constexpr TiltedPhoques::ConnectionId_t kSecondConn = 0xF502u;
+        const GameId kShop{0u, 0x00101001u};
+        const GameId kMerchantChest{0u, 0x00102001u};
+        const GameId kGold{0u, 0x0000000Fu};
+        const GameId kPotion{0u, 0x0003EADDu};
+        const GameId kSword{0u, 0x000139B9u};
+        const GameId kAxe{0u, 0x000139B3u};
+        const GameId kHelmet{0u, 0x00013913u};
+
+        Player* pFirst = world.GetPlayerManager().Create(kFirstConn);
+        Player* pSecond = world.GetPlayerManager().Create(kSecondConn);
+        TimeModel t0{};
+        t0.Time = 13.0f;
+        t0.Day = 7;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pFirst, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pSecond, {}, {}, DateTime{t0}});
+        pFirst->SetCellComponent(CellIdComponent{kShop});
+        pSecond->SetCellComponent(CellIdComponent{kShop});
+
+        const auto registerPlayerCharacter = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, uint32_t aCookie) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = aCookie;
+            request.ReferenceId = GameId{0u, 0x14u};
+            request.CellId = kShop;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[24] = 100.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 100.0f;
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const auto stack = [](const GameId& acItem, int32_t aCount) {
+            Inventory::Entry entry{};
+            entry.BaseId = acItem;
+            entry.Count = aCount;
+            return entry;
+        };
+        const auto registerChest = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, std::initializer_list<Inventory::Entry> aLocalContents) {
+            Harness::ClearOutbox();
+            AssignObjectsRequest request{};
+            ObjectData chest{};
+            chest.Id = kMerchantChest;
+            chest.CellId = kShop;
+            for (const auto& entry : aLocalContents)
+                chest.CurrentInventory.AddOrRemoveEntry(entry);
+            request.Objects.push_back(chest);
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignObjectsResponse>(aConn);
+            return (responses.size() == 1 && responses[0].Objects.size() == 1) ? responses[0].Objects[0] : ObjectData{};
+        };
+        // One half of a trade as the client reports it: an item enters (+) or leaves (-) the chest.
+        const auto chestChange = [&](Player* apPlayer, uint32_t aChestServerId, const GameId& acItem, int32_t aDelta) {
+            RequestInventoryChanges request{};
+            request.ServerId = aChestServerId;
+            request.Item = stack(acItem, aDelta);
+            request.UpdateClients = true;
+            return DeliverWire(world, request, apPlayer);
+        };
+        // What the server told this player to take out of his own character, for one item.
+        const auto takenBackFrom = [](TiltedPhoques::ConnectionId_t aConn, uint32_t aCharacterServerId, const GameId& acItem) {
+            int32_t total = 0;
+            for (const auto& notify : DecodeOutboxMessagesFor<NotifyInventoryChanges>(aConn))
+                if (notify.ServerId == aCharacterServerId && notify.Item.BaseId == acItem)
+                    total -= notify.Item.Count;
+            return total;
+        };
+
+        const uint32_t firstChar = registerPlayerCharacter(pFirst, kFirstConn, 2000u);
+        const uint32_t secondChar = registerPlayerCharacter(pSecond, kSecondConn, 2001u);
+        Check(firstChar != 0xFFFFFFFFu && secondChar != 0xFFFFFFFFu, "both player characters are registered");
+
+        const ObjectData asFirst = registerChest(pFirst, kFirstConn, {stack(kGold, 500), stack(kPotion, 3)});
+        Check(asFirst.IsSenderFirst && asFirst.ServerId != 0, "the first player's copy of the merchant's chest becomes the server's: 500 gold, 3 potions");
+        const uint32_t chestId = asFirst.ServerId;
+        const auto inChest = [&](const GameId& acItem) {
+            GameId lookup = acItem;
+            return world.get<InventoryComponent>(static_cast<entt::entity>(chestId)).Content.GetEntryCountById(lookup);
+        };
+
+        // --- 1. Trades the server's copy can cover ---------------------------------------------
+        Harness::ClearOutbox();
+        Check(chestChange(pFirst, chestId, kSword, +1) && chestChange(pFirst, chestId, kGold, -100) &&
+                  takenBackFrom(kFirstConn, firstChar, kGold) == 0 && inChest(kGold) == 400 && inChest(kSword) == 1,
+              "the first player sells a sword for 100 gold: the chest holds the sword and 400 gold, nothing is taken back");
+        Harness::ClearOutbox();
+        Check(chestChange(pFirst, chestId, kPotion, -3) && chestChange(pFirst, chestId, kGold, +150) &&
+                  takenBackFrom(kFirstConn, firstChar, kPotion) == 0 && inChest(kPotion) == 0 && inChest(kGold) == 550,
+              "he buys all 3 potions for 150 gold: the chest holds no potions and 550 gold");
+
+        // --- 2. The other player buys from his own copy of the stock -----------------------------
+        // His game rolled its own stock; his barter window shows 2 potions. He buys one for 50.
+        Harness::ClearOutbox();
+        Check(chestChange(pSecond, chestId, kPotion, -1) && chestChange(pSecond, chestId, kGold, +50),
+              "the second player buys a potion his own game shows in the merchant's stock");
+        Check(takenBackFrom(kSecondConn, secondChar, kPotion) == 1, "the potion is taken back from him: the server's copy has none, the first player bought them");
+        Check(takenBackFrom(kSecondConn, secondChar, kGold) == 0 && inChest(kGold) == 600,
+              "the 50 gold he paid stay in the chest: he paid and holds nothing");
+
+        // --- 3. He sells to a merchant whose gold his game counts differently ---------------------
+        // His barter window shows 750 gold. He sells an axe for 700.
+        Harness::ClearOutbox();
+        Check(chestChange(pSecond, chestId, kAxe, +1) && chestChange(pSecond, chestId, kGold, -700) && inChest(kAxe) == 1,
+              "the second player sells an axe for 700 gold; the chest takes the axe");
+        Check(takenBackFrom(kSecondConn, secondChar, kGold) == 100 && inChest(kGold) == 0,
+              "the server's copy held 600 gold: 100 of the 700 are taken back from him");
+
+        // --- 4. The first player's game restocks the merchant -------------------------------------
+        // Two game days later his game refills the chest: 750 gold on his screen, none on the server.
+        Harness::ClearOutbox();
+        Check(chestChange(pFirst, chestId, kHelmet, +1) && chestChange(pFirst, chestId, kGold, -200) && inChest(kHelmet) == 1,
+              "after a restock in his own game the first player sells a helmet for 200 gold; the chest takes the helmet");
+        Check(takenBackFrom(kFirstConn, firstChar, kGold) == 200,
+              "all 200 gold are taken back from him: the gold was emptied by the other player, so he sold the helmet for nothing");
+
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+    }
+
+    // =========================================================================
+    // Scene 21: an encounter both games spawn is one group of enemies (work plan 6.3).
+    // =========================================================================
+    //
+    // RFAB's encounter scripts run in every player's game and place their own creatures: the gates
+    // of the Deadlands tower call PlaceActorAtMe on a timer (RFAB_OblTowerGateSummonScript), the
+    // Dwarven centurion calls it for its spiders (DwarvenCenturionSupportsSummon). Such a creature
+    // has no form id the two games share, so two games would make two of it.
+    //
+    // Two layers prevent that. The client of a player who does not lead the party deletes its own
+    // copy when a party member is within 100 m (DespawnSuppressedNonLeaderWildTempSpawn), so only
+    // the leader's game places the creature. What still reaches the server is merged here: a
+    // creature another player registered in the last 12 s within 20 m is given to the second game
+    // as the same creature. The scene pins this second layer; the first runs only in the game.
+    {
+        std::printf("[scene 21] an encounter both games spawn is one group of enemies\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xF601u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xF602u;
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kArena{0u, 0x00110001u};
+        const GameId kSpider{0u, 0x00111001u};
+        const GameId kWolf{0u, 0x00111002u};
+        const GameId kDremora{0u, 0x00111003u};
+        const GameId kScamp{0u, 0x00111004u};
+        const GameId kHorse{0u, 0x00111005u};
+        constexpr uint32_t kTemporary = std::numeric_limits<uint32_t>::max();
+        constexpr uint32_t kHealthIndex = ActorValuesComponent::kHealthActorValueIndex;
+        // The merge radius is 20 m, about 1400 game units. Each step uses a spot of its own, far
+        // from the others, because the records of the earlier steps are still fresh.
+        constexpr float kStep = 100.0f;      // 1.4 m
+        constexpr float kFar = 4000.0f;      // 57 m
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 12.0f;
+        t0.Day = 8;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+
+        const auto walkInto = [&](Player* apPlayer, const GameId& acCell) {
+            Harness::ClearOutbox();
+            EnterInteriorCellRequest request{};
+            request.CellId = acCell;
+            return DeliverWire(world, request, apPlayer);
+        };
+        Check(walkInto(pHost, kArena) && walkInto(pGuest, kArena), "both players enter the arena");
+
+        struct Placed
+        {
+            uint32_t ServerId{0xFFFFFFFFu};
+            bool Owner{false};
+            bool Answered{false};
+        };
+        uint32_t nextCookie = 2100u;
+        uint32_t nextTemporaryRef = 0xFF000C00u;
+        // What a game does when a script places a creature (or, with kPlayerRef, when the player's
+        // own character registers): one AssignCharacterRequest, one answer.
+        const auto place = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, const GameId& acBase, float aX, float aY,
+                               bool aMount = false) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            if (acBase == kPlayerRef)
+            {
+                request.ReferenceId = kPlayerRef;
+            }
+            else
+            {
+                request.ReferenceId = GameId{kTemporary, nextTemporaryRef++};
+                request.FormId = acBase;
+                request.IsMount = aMount;
+            }
+            request.CellId = kArena;
+            request.Position = glm::vec3{aX, aY, 0.0f};
+            request.CurrentActorData.BaseId = request.FormId;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 100.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 100.0f;
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? Placed{responses[0].ServerId, responses[0].Owner, true} : Placed{};
+        };
+        Check(place(pHost, kHostConn, kPlayerRef, 0.0f, 0.0f).Answered && place(pGuest, kGuestConn, kPlayerRef, 0.0f, 0.0f).Answered,
+              "both players' characters are registered");
+
+        const auto entityOf = [](uint32_t aServerId) { return static_cast<entt::entity>(aServerId); };
+        const auto ownerOf = [&](uint32_t aServerId) { return world.get<OwnerComponent>(entityOf(aServerId)).GetOwner(); };
+        const auto characters = [&]() { return world.view<CharacterComponent>().size(); };
+        const auto spawnedFor = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) -> std::optional<CharacterSpawnRequest> {
+            for (const auto& spawn : DecodeOutboxMessagesFor<CharacterSpawnRequest>(aConn))
+            {
+                if (spawn.ServerId == aServerId)
+                    return spawn;
+            }
+            return std::nullopt;
+        };
+        const auto nothingSpawnedFor = [&](TiltedPhoques::ConnectionId_t aConn) {
+            return DecodeOutboxMessagesFor<CharacterSpawnRequest>(aConn).empty();
+        };
+
+        // --- 1. One creature placed by both games ----------------------------------------------
+        const float spot1 = 10000.0f;
+        const Placed hostSpider = place(pHost, kHostConn, kSpider, spot1, 0.0f);
+        const auto spiderForGuest = spawnedFor(kGuestConn, hostSpider.ServerId);
+        Check(hostSpider.Answered && hostSpider.Owner && ownerOf(hostSpider.ServerId) == pHost && spiderForGuest.has_value() &&
+                  spiderForGuest->BaseId == kSpider && spiderForGuest->FormId == GameId{},
+              "the host's game places a spider: it is the host's, and the guest is sent it as a new creature of that kind");
+
+        const size_t beforeGuestSpider = characters();
+        const Placed guestSpider = place(pGuest, kGuestConn, kSpider, spot1 + kStep, 0.0f);
+        Check(guestSpider.Answered && !guestSpider.Owner && guestSpider.ServerId == hostSpider.ServerId && characters() == beforeGuestSpider,
+              "the guest's game places the same spider 1.4 m away: it is given the host's spider, and the server keeps one");
+        Check(spawnedFor(kGuestConn, hostSpider.ServerId).has_value() && nothingSpawnedFor(kHostConn),
+              "the guest is sent the host's spider once more with that answer; the host is told nothing");
+
+        const Placed guestSecondSpider = place(pGuest, kGuestConn, kSpider, spot1 + kStep, 0.0f);
+        Check(guestSecondSpider.Answered && guestSecondSpider.Owner && guestSecondSpider.ServerId != hostSpider.ServerId &&
+                  spawnedFor(kHostConn, guestSecondSpider.ServerId).has_value(),
+              "a second spider of the guest at that spot is his own: the host placed only one, and the host is sent it");
+
+        // --- 2. A pack: several creatures of one kind at one spot -------------------------------
+        const float spot2 = 20000.0f;
+        const Placed hostWolf1 = place(pHost, kHostConn, kWolf, spot2, 0.0f);
+        const Placed hostWolf2 = place(pHost, kHostConn, kWolf, spot2, 0.0f);
+        Check(hostWolf1.Owner && hostWolf2.Owner && hostWolf1.ServerId != hostWolf2.ServerId,
+              "the host's game places two wolves at one spot: they stay two, a player's own creatures are never merged");
+        const Placed guestWolf1 = place(pGuest, kGuestConn, kWolf, spot2, 0.0f);
+        const Placed guestWolf2 = place(pGuest, kGuestConn, kWolf, spot2, 0.0f);
+        const bool oneEach = (guestWolf1.ServerId == hostWolf1.ServerId && guestWolf2.ServerId == hostWolf2.ServerId) ||
+                             (guestWolf1.ServerId == hostWolf2.ServerId && guestWolf2.ServerId == hostWolf1.ServerId);
+        Check(!guestWolf1.Owner && !guestWolf2.Owner && oneEach,
+              "the guest's two wolves are given the host's two, one each");
+
+        // --- 3. The two games rolled different kinds --------------------------------------------
+        const float spot3 = 30000.0f;
+        const Placed hostDremora = place(pHost, kHostConn, kDremora, spot3, 0.0f);
+        const Placed guestScamp = place(pGuest, kGuestConn, kScamp, spot3, 0.0f);
+        const auto dremoraForGuest = spawnedFor(kGuestConn, hostDremora.ServerId);
+        Check(hostDremora.Owner && !guestScamp.Owner && guestScamp.ServerId == hostDremora.ServerId && dremoraForGuest.has_value() &&
+                  dremoraForGuest->BaseId == kDremora,
+              "the host's gate rolled a dremora, the guest's a scamp: the scamp is given the dremora, and the guest is told its kind");
+
+        const float spot4 = 40000.0f;
+        const Placed nearDremora = place(pHost, kHostConn, kDremora, spot4, 0.0f);
+        const Placed awayScamp = place(pHost, kHostConn, kScamp, spot4 + 5.0f * kStep, 0.0f);
+        const Placed guestScamp2 = place(pGuest, kGuestConn, kScamp, spot4, 0.0f);
+        Check(nearDremora.Owner && awayScamp.Owner && !guestScamp2.Owner && guestScamp2.ServerId == awayScamp.ServerId,
+              "with a dremora at the spot and a scamp 7 m away, the guest's scamp is given the scamp: the same kind comes first");
+
+        // --- 4. What is not merged --------------------------------------------------------------
+        const float spot5 = 50000.0f;
+        const Placed hostFarSpider = place(pHost, kHostConn, kSpider, spot5, 0.0f);
+        const Placed guestFarSpider = place(pGuest, kGuestConn, kSpider, spot5 + kFar, 0.0f);
+        Check(hostFarSpider.Owner && guestFarSpider.Owner && guestFarSpider.ServerId != hostFarSpider.ServerId,
+              "a spider the guest's game places 57 m from the host's is another spider");
+
+        const float spot6 = 60000.0f;
+        const Placed hostHorse = place(pHost, kHostConn, kHorse, spot6, 0.0f);
+        const Placed guestHorse = place(pGuest, kGuestConn, kHorse, spot6, 0.0f, true);
+        Check(hostHorse.Owner && guestHorse.Owner && guestHorse.ServerId != hostHorse.ServerId,
+              "a mount is never merged: the guest's horse next to a creature of the same kind stays his horse");
+
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+    }
+
+    // =========================================================================
+    // Scene 22: a take between a registration and its answer (work plan 6.4, defect M28).
+    // =========================================================================
+    //
+    // A client registers a container by sending its list: the cell scan when the player enters a
+    // cell, an activation of a container the client holds no id for, and a take from such a
+    // container (the take is queued, the list is sent as it is after the take). The answer "you
+    // are first" made 4.1.0's client drop every queued take.
+    //
+    // A take made between a request and its answer meets a client that still holds no id, so it
+    // registers the chest a second time. The scene shows what the server makes of it. Parts 1 and
+    // 4 are 4.1.0's client: two registrations, the queued take dropped by the first answer. Parts
+    // 2, 3 and 5 are the client with Gameplay:bEnableEarlyTakeReplay: one registration, and the
+    // change sent when the answer arrives. The server is the same in all of them; which sequence
+    // the client sends is pinned by the core suite rfab_v411_early_take_replay.cpp, and the
+    // client's code runs only in the game (P21).
+    {
+        std::printf("[scene 22] a take between a registration and its answer\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kFirstConn = 0xF701u;
+        constexpr TiltedPhoques::ConnectionId_t kSecondConn = 0xF702u;
+        const GameId kCamp{0u, 0x00121001u};
+        const GameId kChestOld{0u, 0x00122001u};
+        const GameId kChestNew{0u, 0x00122002u};
+        const GameId kChestPut{0u, 0x00122003u};
+        const GameId kChestTwoOld{0u, 0x00122004u};
+        const GameId kChestTwoNew{0u, 0x00122005u};
+        const GameId kGold{0u, 0x0000000Fu};
+        const GameId kSword{0u, 0x000139B9u};
+        const GameId kAxe{0u, 0x000139B3u};
+        const GameId kHelmet{0u, 0x00013913u};
+
+        Player* pFirst = world.GetPlayerManager().Create(kFirstConn);
+        Player* pSecond = world.GetPlayerManager().Create(kSecondConn);
+        TimeModel t0{};
+        t0.Time = 13.0f;
+        t0.Day = 7;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pFirst, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pSecond, {}, {}, DateTime{t0}});
+        pFirst->SetCellComponent(CellIdComponent{kCamp});
+        pSecond->SetCellComponent(CellIdComponent{kCamp});
+
+        const auto registerPlayerCharacter = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, uint32_t aCookie) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = aCookie;
+            request.ReferenceId = GameId{0u, 0x14u};
+            request.CellId = kCamp;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[24] = 100.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 100.0f;
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const auto stack = [](const GameId& acItem, int32_t aCount) {
+            Inventory::Entry entry{};
+            entry.BaseId = acItem;
+            entry.Count = aCount;
+            return entry;
+        };
+        // A registration as either path of the client sends it: the container and its list.
+        const auto registerChest = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, const GameId& acChest,
+                                       std::initializer_list<Inventory::Entry> aLocalContents) {
+            Harness::ClearOutbox();
+            AssignObjectsRequest request{};
+            ObjectData chest{};
+            chest.Id = acChest;
+            chest.CellId = kCamp;
+            for (const auto& entry : aLocalContents)
+                chest.CurrentInventory.AddOrRemoveEntry(entry);
+            request.Objects.push_back(chest);
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignObjectsResponse>(aConn);
+            return (responses.size() == 1 && responses[0].Objects.size() == 1) ? responses[0].Objects[0] : ObjectData{};
+        };
+        const auto chestChange = [&](Player* apPlayer, uint32_t aChestServerId, const GameId& acItem, int32_t aDelta) {
+            RequestInventoryChanges request{};
+            request.ServerId = aChestServerId;
+            request.Item = stack(acItem, aDelta);
+            request.UpdateClients = true;
+            return DeliverWire(world, request, apPlayer);
+        };
+        const auto takenBackFrom = [](TiltedPhoques::ConnectionId_t aConn, uint32_t aCharacterServerId, const GameId& acItem) {
+            int32_t total = 0;
+            for (const auto& notify : DecodeOutboxMessagesFor<NotifyInventoryChanges>(aConn))
+                if (notify.ServerId == aCharacterServerId && notify.Item.BaseId == acItem)
+                    total -= notify.Item.Count;
+            return total;
+        };
+        const auto toldToChange = [](TiltedPhoques::ConnectionId_t aConn, uint32_t aEntityServerId, const GameId& acItem) {
+            int32_t total = 0;
+            for (const auto& notify : DecodeOutboxMessagesFor<NotifyInventoryChanges>(aConn))
+                if (notify.ServerId == aEntityServerId && notify.Item.BaseId == acItem)
+                    total += notify.Item.Count;
+            return total;
+        };
+        const auto inChest = [&](uint32_t aChestServerId, const GameId& acItem) {
+            GameId lookup = acItem;
+            return world.get<InventoryComponent>(static_cast<entt::entity>(aChestServerId)).Content.GetEntryCountById(lookup);
+        };
+        const auto countOf = [](const Inventory& acInventory, const GameId& acItem) {
+            GameId lookup = acItem;
+            return acInventory.GetEntryCountById(lookup);
+        };
+
+        const uint32_t firstChar = registerPlayerCharacter(pFirst, kFirstConn, 2200u);
+        const uint32_t secondChar = registerPlayerCharacter(pSecond, kSecondConn, 2201u);
+        Check(firstChar != 0xFFFFFFFFu && secondChar != 0xFFFFFFFFu, "both player characters are registered");
+
+        // --- 1. 4.1.0's client -------------------------------------------------------------------
+        // The first player crosses into the cell; the scan sends the chest: a sword and 50 gold.
+        const ObjectData scanOld = registerChest(pFirst, kFirstConn, kChestOld, {stack(kSword, 1), stack(kGold, 50)});
+        Check(scanOld.IsSenderFirst && scanOld.ServerId != 0, "the scan's registration makes the first player's list the server's: a sword and 50 gold");
+        // Before that answer reaches him he takes the sword. His client holds no id for the chest,
+        // so the take registers it again, with the list after the take.
+        const ObjectData onDemandOld = registerChest(pFirst, kFirstConn, kChestOld, {stack(kGold, 50)});
+        Check(!onDemandOld.IsSenderFirst && onDemandOld.ServerId == scanOld.ServerId,
+              "the take's own registration of the same chest is answered 'not first'");
+        Check(countOf(onDemandOld.CurrentInventory, kSword) == 1,
+              "and carries the list as the scan read it: the sword he holds is in it, and his client writes that list over the chest");
+        // The first answer ("you are first") dropped the queued take: 4.1.0 sends nothing more.
+        Check(inChest(scanOld.ServerId, kSword) == 1, "nothing told the server about the take: its copy of the chest still holds the sword");
+
+        const ObjectData secondSeesOld = registerChest(pSecond, kSecondConn, kChestOld, {stack(kGold, 35)});
+        Check(!secondSeesOld.IsSenderFirst && countOf(secondSeesOld.CurrentInventory, kSword) == 1,
+              "the second player enters the cell: the chest he is shown holds the sword");
+        Harness::ClearOutbox();
+        Check(chestChange(pSecond, scanOld.ServerId, kSword, -1) && takenBackFrom(kSecondConn, secondChar, kSword) == 0 &&
+                  inChest(scanOld.ServerId, kSword) == 0,
+              "he takes it and keeps it: one sword in the chest has become two, one in each pack");
+
+        // --- 2. The client with bEnableEarlyTakeReplay --------------------------------------------
+        const ObjectData scanNew = registerChest(pFirst, kFirstConn, kChestNew, {stack(kAxe, 1), stack(kGold, 50)});
+        Check(scanNew.IsSenderFirst && scanNew.ServerId != 0 && scanNew.ServerId != scanOld.ServerId,
+              "another chest, the same scan: an axe and 50 gold");
+        // He takes the axe before the answer. The client knows the scan's request is unanswered:
+        // it sends no second registration, and when the answer says "you are first" it sends the
+        // take, because the scan read the list before the take.
+        Harness::ClearOutbox();
+        Check(chestChange(pFirst, scanNew.ServerId, kAxe, -1) && inChest(scanNew.ServerId, kAxe) == 0,
+              "the take is sent at the answer: the server's copy of the chest gives up the axe");
+        Check(takenBackFrom(kFirstConn, firstChar, kAxe) == 0, "nothing is taken back from him: the server's list held the axe");
+        Check(toldToChange(kSecondConn, scanNew.ServerId, kAxe) == -1, "the second player, in the same cell, is told the axe left the chest");
+
+        const ObjectData secondSeesNew = registerChest(pSecond, kSecondConn, kChestNew, {stack(kAxe, 1), stack(kGold, 35)});
+        Check(!secondSeesNew.IsSenderFirst && countOf(secondSeesNew.CurrentInventory, kAxe) == 0 &&
+                  countOf(secondSeesNew.CurrentInventory, kGold) == 50,
+              "the chest the second player is shown holds 50 gold and no axe, whatever his own game had rolled");
+        Harness::ClearOutbox();
+        Check(chestChange(pSecond, scanNew.ServerId, kAxe, -1) && takenBackFrom(kSecondConn, secondChar, kAxe) == 1,
+              "an axe he takes from his own stale copy is taken back from him: the axe went to the first player, once");
+
+        // --- 3. A put in the same moment ----------------------------------------------------------
+        const ObjectData scanPut = registerChest(pFirst, kFirstConn, kChestPut, {stack(kGold, 50)});
+        Check(scanPut.IsSenderFirst && inChest(scanPut.ServerId, kHelmet) == 0, "a third chest: 50 gold");
+        // He puts a helmet in before the answer. 4.1.0 dropped that change too: the helmet stayed
+        // in his own copy only, and vanished when the server's list was next written over it.
+        Harness::ClearOutbox();
+        Check(chestChange(pFirst, scanPut.ServerId, kHelmet, +1) && inChest(scanPut.ServerId, kHelmet) == 1,
+              "the put is sent at the answer: the server's copy of the chest holds the helmet");
+        const ObjectData secondSeesPut = registerChest(pSecond, kSecondConn, kChestPut, {stack(kGold, 35)});
+        Check(!secondSeesPut.IsSenderFirst && countOf(secondSeesPut.CurrentInventory, kHelmet) == 1,
+              "the second player is shown the helmet in the chest");
+
+        // --- 4. Two takes in a row from a chest nobody had registered: 4.1.0's client -------------
+        // The chest stands across a cell border: a sword, an axe, 50 gold. The first player takes
+        // the sword through QuickLootIE's window; the take registers the chest with the list after it.
+        const ObjectData takeOneOld = registerChest(pFirst, kFirstConn, kChestTwoOld, {stack(kAxe, 1), stack(kGold, 50)});
+        Check(takeOneOld.IsSenderFirst && takeOneOld.ServerId != 0, "the first take registers the chest: an axe and 50 gold are left");
+        // He takes the axe before that answer reaches him: still no id, so a registration again.
+        const ObjectData takeTwoOld = registerChest(pFirst, kFirstConn, kChestTwoOld, {stack(kGold, 50)});
+        Check(!takeTwoOld.IsSenderFirst && countOf(takeTwoOld.CurrentInventory, kAxe) == 1 && inChest(takeOneOld.ServerId, kAxe) == 1,
+              "the second take's registration is answered 'not first' with the axe in the list: the axe he holds is back in the chest for everybody");
+
+        // --- 5. The same two takes from the client with bEnableEarlyTakeReplay ---------------------
+        const ObjectData takeOneNew = registerChest(pFirst, kFirstConn, kChestTwoNew, {stack(kAxe, 1), stack(kGold, 50)});
+        Check(takeOneNew.IsSenderFirst && takeOneNew.ServerId != 0, "another such chest, the first take registers it");
+        // The second take finds the first registration unanswered: no registration, the take is sent at the answer.
+        Harness::ClearOutbox();
+        Check(chestChange(pFirst, takeOneNew.ServerId, kAxe, -1) && inChest(takeOneNew.ServerId, kAxe) == 0 &&
+                  takenBackFrom(kFirstConn, firstChar, kAxe) == 0,
+              "the second take is sent at the answer: the chest gives up the axe, nothing is taken back");
+        const ObjectData secondSeesTwo = registerChest(pSecond, kSecondConn, kChestTwoNew, {stack(kSword, 1), stack(kAxe, 1), stack(kGold, 35)});
+        Check(!secondSeesTwo.IsSenderFirst && countOf(secondSeesTwo.CurrentInventory, kAxe) == 0 &&
+                  countOf(secondSeesTwo.CurrentInventory, kSword) == 0 && countOf(secondSeesTwo.CurrentInventory, kGold) == 50,
+              "the second player is shown 50 gold: neither the sword nor the axe");
+
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
     }
 
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures,

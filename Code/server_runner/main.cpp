@@ -13,7 +13,11 @@
 #include <base/simpleini/SimpleIni.h>
 #include <base/threading/ThreadUtils.h>
 
+#include "CrashRecord.h"
 #include "DediRunner.h"
+#include <common/Compat/SafeFs.h>
+
+#include <cstring>
 
 #ifdef _WIN32
 #include <base/dialogues/win/TaskDialog.h>
@@ -138,7 +142,7 @@ static bool ShowEULADialog()
 static bool IsEULAAccepted()
 {
     std::error_code ec;
-    const auto cfgDir = fs::current_path() / kConfigPathName;
+    const auto cfgDir = Compat::SafeFs::CurrentPathOr(fs::path(".")) / kConfigPathName;
     fs::create_directories(cfgDir, ec);
     const auto path = cfgDir / kEULAName;
 
@@ -158,6 +162,8 @@ static bool IsEULAAccepted()
 }
 
 GS_IMPORT bool CheckBuildTag(const char* apBuildTag);
+// A deliberate fault inside the server library, for ServerCrash::RunSelfTest (Code/server/main.cpp).
+GS_IMPORT void RfabServerCrashSelfTestFault();
 
 void ConfigureConsoleMode()
 {
@@ -170,6 +176,11 @@ void ConfigureConsoleMode()
 
 int main(int argc, char** argv)
 {
+    // First of all: from here on a server that dies leaves a record in logs/STServer_Crash.log.
+    ServerCrash::Install();
+    if (argc >= 2 && std::strcmp(argv[1], ServerCrash::kSelfTestSwitch) == 0)
+        return ServerCrash::RunSelfTest(argc >= 3 ? argv[2] : "", &RfabServerCrashSelfTestFault);
+
     ConfigureConsoleMode();
 
     // the binaries are not from the same commit.

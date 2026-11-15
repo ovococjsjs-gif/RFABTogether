@@ -1,4 +1,5 @@
 #include "ActorMagicCaster.h"
+#include <CrashBreadcrumbs.h>
 
 #include <Events/SpellCastEvent.h>
 #include <Events/InterruptCastEvent.h>
@@ -18,6 +19,9 @@ static TInterruptCast* RealInterruptCast = nullptr;
 
 void TP_MAKE_THISCALL(HookSpellCast, ActorMagicCaster, bool abSuccess, int32_t auiTargetCount, MagicItem* apSpell)
 {
+    // On a failed cast neither the game nor this hook reads apSpell, so the crumb does not
+    // either: it names the spell only on the path that hands the pointer on to the game.
+    RFAB_HOOK_CRUMB("HookSpellCast", (abSuccess && apSpell) ? apSpell->formID : 0);
     spdlog::debug("HookSpellCast, abSuccess: {}, auiTargetCount: {}, apSpell: {:X}", abSuccess, auiTargetCount, (uint64_t)apSpell);
 
     // Note: these if guards is how the game does it too
@@ -61,6 +65,7 @@ void TP_MAKE_THISCALL(HookSpellCast, ActorMagicCaster, bool abSuccess, int32_t a
 
 void TP_MAKE_THISCALL(HookInterruptCast, ActorMagicCaster, bool abRefund)
 {
+    RFAB_HOOK_CRUMB("HookInterruptCast");
     if (World::IsCreated() && World::IsConnectedCached() && apThis && apThis->pCasterActor && apThis->pCasterActor->formID != 0 && apThis->pCasterActor->GetNiNode())
     {
         if (const ActorExtension* pExtended = apThis->pCasterActor->GetExtension(); pExtended && pExtended->IsLocal())

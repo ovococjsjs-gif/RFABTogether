@@ -27,6 +27,11 @@
 //   * session scope  - every task carries the poster's Session::Token. A task posted inside session N
 //                      is dropped if session N is over when it would run. Work posted while no session
 //                      exists (connect, settings, offline save control) always runs.
+//   * world scope    - a task may be posted as Scope::kWorld (v4.1.1): it is then also dropped when a
+//                      save was loaded, or was being loaded, between the post and the run. That is every
+//                      gameplay event a hook produces: it names actors and objects by form id, and a
+//                      form id means something only in the world it was read in. See
+//                      Session::IsWorldWorkStillValid for the rule.
 //   * accounting     - posted / executed / stale / overflow / failed / posted-during-world-load, so a
 //                      playtest log shows when the queue misbehaves instead of guessing.
 //
@@ -55,6 +60,12 @@ enum class Lane : uint8_t
 
 inline constexpr size_t kLaneCount = static_cast<size_t>(Lane::kCount);
 
+enum class Scope : uint8_t
+{
+    kSession = 0,  // valid for as long as the session it was posted in lives
+    kWorld = 1,    // also invalid once a save was loaded (or was loading) after it was posted
+};
+
 [[nodiscard]] constexpr std::string_view ToString(Lane aLane) noexcept
 {
     switch (aLane)
@@ -71,6 +82,7 @@ struct LaneStats
     uint64_t Posted{0};
     uint64_t Executed{0};
     uint64_t DroppedStale{0};           // posted inside a session that ended before the task could run
+    uint64_t DroppedStaleWorld{0};      // world-scoped, and a save was loaded (or loading) since it was posted
     uint64_t DroppedOverflow{0};        // the lane was full (or out of memory) when it was posted
     uint64_t Failed{0};                 // the task threw; the queue kept going
     uint64_t PostedDuringWorldLoad{0};  // diagnostics: engine-generated work while a save was loading
@@ -104,7 +116,9 @@ public:
 
     // aPostedIn: the poster's Lifecycle::GetTokenAnyThread(). Returns false when the task was dropped
     // (lane full, out of memory, empty task); the drop is counted either way.
-    bool Post(Lane aLane, Token aPostedIn, bool aDuringWorldLoad, Task aTask) noexcept
+    // World-scoped work must take both values from Lifecycle::GetPostStampAnyThread(), which reads
+    // them in the one order that is safe against a load beginning at that moment.
+    bool Post(Lane aLane, Token aPostedIn, bool aDuringWorldLoad, Task aTask, Scope aScope = Scope::kSession) noexcept
     {
         if (!aTask || aLane >= Lane::kCount)
             return false;
@@ -122,7 +136,7 @@ public:
                 lane.DroppedOverflow.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
-            lane.Pending.push_back(Entry{aPostedIn, std::move(aTask)});
+            lane.Pending.push_back(Entry{aPostedIn, std::move(aTask), aScope, aDuringWorldLoad});
             const uint64_t pending = lane.Pending.size();
             lane.PendingCount.store(pending, std::memory_order_relaxed);
             if (pending > lane.HighWater.load(std::memory_order_relaxed))
@@ -142,7 +156,18 @@ public:
     // next drain. aIsCurrentSession(Token) -> bool is asked at execution time for every task posted
     // inside a session (Token::Session != 0). A nested Drain of the same lane (a task that pumps the
     // main loop) returns 0 instead of running the batch twice. Returns the number of tasks executed.
+    //
+    // This overload has no world rule: world-scoped work is treated like session work. The client's
+    // simulation lane uses the overload below.
     template <class TIsCurrentSession> size_t Drain(Lane aLane, TIsCurrentSession&& aIsCurrentSession) noexcept
+    {
+        return Drain(aLane, aIsCurrentSession, [](const PostStamp&) noexcept { return true; });
+    }
+
+    // aIsWorldWorkValid(const PostStamp&) -> bool is asked, after the session check passed, for every
+    // world-scoped task posted inside a session (Lifecycle::IsWorldWorkStillValid).
+    template <class TIsCurrentSession, class TIsWorldWorkValid>
+    size_t Drain(Lane aLane, TIsCurrentSession&& aIsCurrentSession, TIsWorldWorkValid&& aIsWorldWorkValid) noexcept
     {
         if (aLane >= Lane::kCount)
             return 0;
@@ -164,6 +189,12 @@ public:
             if (entry.PostedIn.Session != 0 && !aIsCurrentSession(entry.PostedIn))
             {
                 lane.DroppedStale.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (entry.PostedIn.Session != 0 && entry.PostedScope == Scope::kWorld &&
+                !aIsWorldWorkValid(PostStamp{entry.PostedIn, entry.DuringWorldLoad}))
+            {
+                lane.DroppedStaleWorld.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
 
@@ -211,6 +242,7 @@ public:
         stats.Posted = lane.Posted.load(std::memory_order_relaxed);
         stats.Executed = lane.Executed.load(std::memory_order_relaxed);
         stats.DroppedStale = lane.DroppedStale.load(std::memory_order_relaxed);
+        stats.DroppedStaleWorld = lane.DroppedStaleWorld.load(std::memory_order_relaxed);
         stats.DroppedOverflow = lane.DroppedOverflow.load(std::memory_order_relaxed);
         stats.Failed = lane.Failed.load(std::memory_order_relaxed);
         stats.PostedDuringWorldLoad = lane.PostedDuringWorldLoad.load(std::memory_order_relaxed);
@@ -229,6 +261,8 @@ private:
     {
         Token PostedIn;
         Task Work;
+        Scope PostedScope{Scope::kSession};
+        bool DuringWorldLoad{false};
     };
 
     struct LaneState
@@ -242,6 +276,7 @@ private:
         std::atomic<uint64_t> Posted{0};
         std::atomic<uint64_t> Executed{0};
         std::atomic<uint64_t> DroppedStale{0};
+        std::atomic<uint64_t> DroppedStaleWorld{0};
         std::atomic<uint64_t> DroppedOverflow{0};
         std::atomic<uint64_t> Failed{0};
         std::atomic<uint64_t> PostedDuringWorldLoad{0};

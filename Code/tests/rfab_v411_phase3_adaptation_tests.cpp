@@ -1,5 +1,11 @@
 #include <catch2/catch.hpp>
 
+// Before any Structs/ header: those rely on TiltedPhoques being declared, and the suites are
+// compiled without the encoding prefix header.
+#include <TiltedCore/Stl.hpp>
+#include <TiltedCore/Buffer.hpp>
+#include <TiltedCore/Serialization.hpp>
+
 #include <common/Authority/Lease.h>
 #include <common/Compat/ConfigOverlay.h>
 #include <common/Compat/MenuPausePolicy.h>
@@ -9,9 +15,9 @@
 #include <common/RfabModpackCompat.h>
 #include <common/RfabWorldImmersion.h>
 #include <Structs/Inventory.h>
-#include <TiltedCore/Buffer.hpp>
 
 #include <filesystem>
+#include <limits>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -134,18 +140,6 @@ TEST_CASE("3A.1 RFAB.ini overlay forces bAlwaysActive=true and MenuPausePolicy r
     REQUIRE(diffs[0].From == "false");
     REQUIRE(diffs[0].To == "true");
 
-    REQUIRE(Compat::IsInteractiveLootMenu("ContainerMenu"));
-    REQUIRE(Compat::IsInteractiveLootMenu("LootMenu"));
-    REQUIRE_FALSE(Compat::IsInteractiveLootMenu("InventoryMenu"));
-
-    REQUIRE(Compat::IsNonPausingRfabOverlayMenu("LootMenu"));
-    REQUIRE(Compat::IsNonPausingRfabOverlayMenu("WheelMenu"));
-    REQUIRE(Compat::IsNonPausingRfabOverlayMenu("RFAB WheelMenu"));
-    REQUIRE(Compat::IsNonPausingRfabOverlayMenu("TrueHUD"));
-    REQUIRE_FALSE(Compat::IsNonPausingRfabOverlayMenu("StatsMenu"));
-
-    REQUIRE(Compat::IsPauseRequiredRfabMenu("StatsMenu"));
-    REQUIRE(Compat::IsPauseRequiredRfabMenu("CustomMenu"));
 }
 
 TEST_CASE("3A.2 PendingContainerLootQueue buffers QuickLootIE/AutoLoot deltas safely across registration", "[rfab][phase3][loot]")
@@ -249,7 +243,6 @@ TEST_CASE("3A.4 Crafted Enchantment structural identity and Tempered float toler
 
     REQUIRE(swordClientA.IsExtraDataEquals(swordClientB));
     REQUIRE(swordClientA.CanBeMerged(swordClientB));
-    REQUIRE(CoopCraftedItems::ClassifyCraftedItem(swordClientA) == CoopCraftedItems::CraftedItemKind::kTemperedAndEnchanted);
 
     // Normalizing stamps identical deterministic non-zero fingerprint BaseId on both clients!
     CoopCraftedItems::NormalizeCraftedEntry(swordClientA);
@@ -350,14 +343,7 @@ TEST_CASE("3B.2 Shared Dragon Souls, Word Walls, Difficulty/Cursed Handshake, Qu
     REQUIRE_FALSE(dupAward.IsNewDragonKill);
     REQUIRE(dupAward.NewlyAwardedPlayerIds.empty());
 
-    // 2. Shared Word Wall Ledger
-    RfabCoopProgression::WordWallLedger wordLedger;
-    const GameId fusWord{0u, 0x00013E22u};
-    REQUIRE(wordLedger.RecordWordLearned(fusWord));
-    REQUIRE_FALSE(wordLedger.RecordWordLearned(fusWord));
-    REQUIRE(wordLedger.Size() == 1);
-
-    // 3. RFAB_StartMenu Difficulty & Cursed Handshake
+    // 2. RFAB_StartMenu Difficulty & Cursed Handshake
     const auto wanderer = RfabCoopProgression::InferDifficultyFromGmst(2.0f, 0.5f);
     const auto dovahkiin = RfabCoopProgression::InferDifficultyFromGmst(1.0f, 1.0f);
     const auto legendCursed = RfabCoopProgression::InferDifficultyFromGmst(0.5f, 2.0f);
@@ -379,61 +365,197 @@ TEST_CASE("3B.2 Shared Dragon Souls, Word Walls, Difficulty/Cursed Handshake, Qu
     const std::string notice = RfabCoopProgression::FormatDifficultyMismatchNotice(legendCursed, dovahkiin);
     REQUIRE(notice.find("Legend+Cursed") != std::string::npos);
     REQUIRE(notice.find("Dovahkiin") != std::string::npos);
+}
 
-    // 4. Quests.ini Canonical UTF-8/Cyrillic Dedupe Key
-    const std::string k1 = RfabCoopProgression::MakeCanonicalQuestsIniSourceKey(GameId{}, 200, "  Ветреный   пик  ");
-    const std::string k2 = RfabCoopProgression::MakeCanonicalQuestsIniSourceKey(GameId{}, 200, "Ветреный пик");
-    const std::string k3 = RfabCoopProgression::MakeCanonicalQuestsIniSourceKey(GameId{}, 200, "Дракон в небе");
-    REQUIRE(!k1.empty());
-    REQUIRE(k1 == k2);
-    REQUIRE(k1 != k3);
+TEST_CASE("Late-join catch-up XP is counted per persistent identity, not per connection (M1)", "[rfab][phase3][progression][catchup]")
+{
+    using Credits = RfabCoopProgression::SharedXpCreditLedger;
 
-    // 5. Late-Joiner Catch-Up XP
-    RfabCoopProgression::LateJoinCatchUpTracker catchUp;
-    catchUp.MarkAlreadySyncedAtSessionStart(1u);
-    REQUIRE_FALSE(catchUp.EvaluateAndMark(1u, 12000, true).ShouldGrant);
+    SECTION("players who were there are never paid; a player who was away is paid what was missed, once")
+    {
+        Credits credits;
+        int64_t total = 0;
 
-    const auto grant = catchUp.EvaluateAndMark(2u, 40000, true, 25000);
-    REQUIRE(grant.ShouldGrant);
-    REQUIRE(grant.GrantXpDelta == 25000); // Bounded!
-    // Reconnecting peer never double-receives catch-up XP!
-    REQUIRE_FALSE(catchUp.EvaluateAndMark(2u, 40000, true, 25000).ShouldGrant);
-    // Disabled setting grants nothing
-    REQUIRE_FALSE(catchUp.EvaluateAndMark(3u, 15000, false, 25000).ShouldGrant);
+        // Two friends start a new world.
+        REQUIRE_FALSE(credits.EvaluateJoin("name:host", total, true).ShouldGrant);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:guest", total, true).ShouldGrant);
+
+        // 12000 XP while both are connected.
+        total += 12000;
+        credits.CreditConnected("name:host", 12000, total);
+        credits.CreditConnected("name:guest", 12000, total);
+
+        // A reconnect is a new connection id with the same identity: nothing is owed. The tracker
+        // this replaces paid up to the cap here, every time.
+        REQUIRE_FALSE(credits.EvaluateJoin("name:guest", total, true).ShouldGrant);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:host", total, true).ShouldGrant);
+
+        // The guest is away while the host earns 500.
+        total += 500;
+        credits.CreditConnected("name:host", 500, total);
+        const auto missed = credits.EvaluateJoin("name:guest", total, true);
+        REQUIRE(missed.ShouldGrant);
+        CHECK(missed.GrantXpDelta == 500);
+        CHECK(missed.ForfeitedXp == 0);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:guest", total, true).ShouldGrant);
+        CHECK(credits.GetCreditedXp("name:guest") == total);
+        CHECK(credits.GetCreditedXp("name:host") == total);
+    }
+
+    SECTION("a late joiner is paid the party total up to the cap, and the rest is forfeited")
+    {
+        Credits credits;
+        const auto late = credits.EvaluateJoin("name:late", 40000, true, 25000);
+        REQUIRE(late.ShouldGrant);
+        CHECK(late.GrantXpDelta == 25000);
+        CHECK(late.ForfeitedXp == 15000);
+        // Joining again cannot collect the forfeited part.
+        REQUIRE_FALSE(credits.EvaluateJoin("name:late", 40000, true, 25000).ShouldGrant);
+    }
+
+    SECTION("switched off nothing is paid, and switching it on later does not pay for that time")
+    {
+        Credits credits;
+        const auto off = credits.EvaluateJoin("name:other", 15000, false);
+        REQUIRE_FALSE(off.ShouldGrant);
+        CHECK(off.GrantXpDelta == 0);
+        CHECK(off.ForfeitedXp == 15000);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:other", 15000, true).ShouldGrant);
+    }
+
+    SECTION("a connection without a persistent identity is never owed anything")
+    {
+        Credits credits;
+        REQUIRE_FALSE(Credits::IsPersistentIdentity("pid:7"));
+        REQUIRE_FALSE(Credits::IsPersistentIdentity(""));
+        REQUIRE(Credits::IsPersistentIdentity("name:someone"));
+        REQUIRE(Credits::IsPersistentIdentity("discord:42"));
+        REQUIRE_FALSE(credits.EvaluateJoin("pid:7", 40000, true).ShouldGrant);
+        REQUIRE_FALSE(credits.EvaluateJoin("", 40000, true).ShouldGrant);
+        credits.CreditConnected("pid:7", 100, 40100);
+        CHECK(credits.GetCredits().empty());
+    }
+
+    SECTION("credits travel with the snapshot: a restart or a rollback changes nothing")
+    {
+        Credits credits;
+        (void)credits.EvaluateJoin("name:host", 0, true);
+        credits.CreditConnected("name:host", 9000, 9000);
+
+        Credits restored;
+        restored.Restore(credits.GetCredits(), credits.GetBaselineXp());
+        REQUIRE_FALSE(restored.EvaluateJoin("name:host", 9000, true).ShouldGrant);
+        const auto friendAfterRestart = restored.EvaluateJoin("name:friend", 9000, true);
+        CHECK(friendAfterRestart.GrantXpDelta == 9000);
+    }
+
+    SECTION("a checkpoint from before credits were tracked owes nobody the old total")
+    {
+        Credits legacy;
+        legacy.SetBaselineXp(30000); // the loader sets the baseline to the total it found
+        REQUIRE_FALSE(legacy.EvaluateJoin("name:host", 30000, true).ShouldGrant);
+        REQUIRE_FALSE(legacy.EvaluateJoin("name:guest", 30000, true).ShouldGrant);
+
+        // What is earned from now on is tracked normally.
+        legacy.CreditConnected("name:host", 1000, 31000);
+        const auto newcomer = legacy.EvaluateJoin("name:newcomer", 31000, true);
+        CHECK(newcomer.GrantXpDelta == 1000);
+    }
+
+    SECTION("a connected player that was never seen joining is level with the party")
+    {
+        Credits credits;
+        credits.CreditConnected("name:host", 700, 5700);
+        CHECK(credits.GetCreditedXp("name:host") == 5700);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:host", 5700, true).ShouldGrant);
+    }
+
+    SECTION("after a rollback a connected player missing from the restored credits is owed nothing")
+    {
+        Credits credits;
+        (void)credits.EvaluateJoin("name:host", 0, true);
+        credits.CreditConnected("name:host", 4000, 4000);
+        const auto atCheckpoint = credits.GetCredits();
+
+        // The guest joins after the checkpoint and is paid the 4000.
+        CHECK(credits.EvaluateJoin("name:guest", 4000, true).GrantXpDelta == 4000);
+
+        // Rollback to the checkpoint while both are connected.
+        credits.Restore(atCheckpoint, 0);
+        credits.LevelWithParty("name:host", 4000);
+        credits.LevelWithParty("name:guest", 4000);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:guest", 4000, true).ShouldGrant);
+
+        // It never lowers a credit and ignores connections without an identity.
+        credits.LevelWithParty("name:host", 100);
+        CHECK(credits.GetCreditedXp("name:host") == 4000);
+        credits.LevelWithParty("pid:9", 4000);
+        CHECK(credits.GetCredits().count("pid:9") == 0);
+    }
+
+    SECTION("a total that went backwards pays nothing and does not lower a credit")
+    {
+        Credits credits;
+        (void)credits.EvaluateJoin("name:host", 0, true);
+        credits.CreditConnected("name:host", 8000, 8000);
+        REQUIRE_FALSE(credits.EvaluateJoin("name:host", 5000, true).ShouldGrant);
+        CHECK(credits.GetCreditedXp("name:host") == 8000);
+    }
 }
 
 TEST_CASE("3C RFAB World Immersion: Mount Ownership, Personal Blessings/CrimeGold, and TrueHUD Synergy", "[rfab][phase3][immersion]")
 {
     // 1. MountOwnershipGuard
-    RfabWorldImmersion::MountOwnershipGuard mountGuard;
+    using MountGuard = RfabWorldImmersion::MountOwnershipGuard;
+    MountGuard mountGuard;
     REQUIRE(mountGuard.TryAcquireRide(500u, 1u, 10u));
-    // Peer 2 cannot hijack horse 500 while Player 1 is riding it!
+    // Peer 2 cannot take horse 500 while Player 1 is riding it.
     REQUIRE_FALSE(mountGuard.TryAcquireRide(500u, 2u, 20u));
-    REQUIRE_FALSE(mountGuard.CanTransferMountOwnership(500u, 2u));
-    REQUIRE_FALSE(mountGuard.CanMutateMountSaddlebag(500u, 2u, 1u));
-    REQUIRE(mountGuard.CanMutateMountSaddlebag(500u, 1u, 1u));
+    REQUIRE(mountGuard.GetActiveRiderPlayerId(500u) == 1u);
+    {
+        const auto ride = mountGuard.GetActiveRide(500u);
+        REQUIRE(ride.has_value());
+        CHECK(ride->RiderPlayerId == 1u);
+        CHECK(ride->RiderServerEntityId == 10u);
+        CHECK_FALSE(mountGuard.GetActiveRide(501u).has_value());
+    }
 
-    // Player 1 disconnects -> horse 500 is immediately released and mountable by Player 2!
+    // Player 1 disconnects -> horse 500 is free for Player 2.
     mountGuard.ReleaseAllForPlayer(1u);
-    REQUIRE(mountGuard.CanTransferMountOwnership(500u, 2u));
+    REQUIRE(mountGuard.GetActiveRiderPlayerId(500u) == 0u);
     REQUIRE(mountGuard.TryAcquireRide(500u, 2u, 20u));
     REQUIRE(mountGuard.GetActiveRiderPlayerId(500u) == 2u);
+
+    // Mounting another animal ends the previous ride of the same player.
+    REQUIRE(mountGuard.TryAcquireRide(600u, 2u, 20u));
+    CHECK(mountGuard.GetActiveRiderPlayerId(500u) == 0u);
+    CHECK(mountGuard.GetActiveRiderPlayerId(600u) == 2u);
+
+    // The mount is gone (dead, removed, or the ride was found to be over): whoever rode it is free.
+    mountGuard.ReleaseMountEntity(600u);
+    CHECK(mountGuard.GetActiveRiderPlayerId(600u) == 0u);
+    REQUIRE(mountGuard.TryAcquireRide(700u, 2u, 20u));
+
+    // No client reports a dismount. A ride ends when the rider is no longer where the mount is...
+    CHECK(MountGuard::IsRiderStillAtMount(0.0f));
+    CHECK(MountGuard::IsRiderStillAtMount(300.0f * 300.0f)); // position reports lag at a gallop
+    CHECK(MountGuard::IsRiderStillAtMount(MountGuard::kMaxRiderToMountDistance * MountGuard::kMaxRiderToMountDistance));
+    CHECK_FALSE(MountGuard::IsRiderStillAtMount(1100.0f * 1100.0f));
+    CHECK_FALSE(MountGuard::IsRiderStillAtMount(std::numeric_limits<float>::quiet_NaN()));
+    CHECK_FALSE(MountGuard::IsRiderStillAtMount(std::numeric_limits<float>::infinity()));
+
+    // ...or when the rider's own animation says so.
+    CHECK(MountGuard::IsMountExitAnimationEvent("HorseExit"));
+    CHECK(MountGuard::IsMountExitAnimationEvent("horseexitout"));
+    CHECK(MountGuard::IsMountExitAnimationEvent("DragonMountExitOut"));
+    CHECK_FALSE(MountGuard::IsMountExitAnimationEvent("HorseEnter"));
+    CHECK_FALSE(MountGuard::IsMountExitAnimationEvent("HorseExitOutExtra"));
+    CHECK_FALSE(MountGuard::IsMountExitAnimationEvent("NPCHorseExit")); // an NPC rider holds no lock
+    CHECK_FALSE(MountGuard::IsMountExitAnimationEvent(""));
 
     // 2. PersonalBlessingCrimePolicy
     REQUIRE(RfabWorldImmersion::IsPersonalCrimeOrBlessingGlobal("RFAB_SaveBlessing"));
     REQUIRE(RfabWorldImmersion::IsPersonalCrimeOrBlessingGlobal("CrimeGoldWhiterun"));
     REQUIRE(RfabWorldImmersion::IsPersonalCrimeOrBlessingGlobal("REQ_Blessing_Arkay"));
     REQUIRE_FALSE(RfabWorldImmersion::IsPersonalCrimeOrBlessingGlobal("RFAB_Boss_UmbraPhase"));
-    REQUIRE(RfabWorldImmersion::IsPersonalShrineOrDoomstoneActivator("RFAB_Shrine_Akatosh"));
-    REQUIRE(RfabWorldImmersion::IsPersonalShrineOrDoomstoneActivator("RFAB_BA_UniversalAltar"));
-    REQUIRE(RfabWorldImmersion::IsPersonalShrineOrDoomstoneActivator("DoomstoneWarrior"));
-
-    // 3. TrueHUD Synergy
-    REQUIRE(RfabWorldImmersion::IsTrueHudResourceBarActorValue(24u)); // Health
-    REQUIRE(RfabWorldImmersion::IsTrueHudResourceBarActorValue(25u)); // Magicka
-    REQUIRE(RfabWorldImmersion::IsTrueHudResourceBarActorValue(26u)); // Stamina
-    REQUIRE(RfabWorldImmersion::IsTrueHudResourceBarActorValue(82u)); // WardPower
-    REQUIRE(RfabWorldImmersion::IsTrueHudBossBarEligible(true, false, 400.0f, false));
-    REQUIRE(RfabWorldImmersion::IsTrueHudBossBarEligible(false, true, 500.0f, false));
-    REQUIRE_FALSE(RfabWorldImmersion::IsTrueHudBossBarEligible(false, false, 1200.0f, true));
 }

@@ -68,6 +68,10 @@ struct CharacterService
     [[nodiscard]] const CoopWorldView::ServerInterestRegistry& GetInterestRegistry() const noexcept { return m_interestRegistry; }
     [[nodiscard]] const RfabWorldImmersion::MountOwnershipGuard& GetMountGuard() const noexcept { return m_mountGuard; }
     [[nodiscard]] RfabWorldImmersion::MountOwnershipGuard& GetMountGuard() noexcept { return m_mountGuard; }
+    // True while a player other than `apChallenger` is riding this mount and the ride guard is
+    // enabled. A ride that has visibly ended (rider gone, mount dead, the two apart) is released
+    // on the way, so the answer never depends on a dismount nobody reported.
+    [[nodiscard]] bool IsMountHeldByOtherRider(uint32_t aMountServerId, const Player* apChallenger) const noexcept;
     void NotePlayerSimulationActivity(Player* apPlayer, uint64_t aNowMs) const noexcept;
     void SweepExpiredWorldNpcLeases(uint64_t aNowMs) const noexcept;
 
@@ -85,6 +89,7 @@ protected:
     void OnReferencesMoveRequest(const PacketEvent<ClientReferencesMoveRequest>& acMessage) const noexcept;
     void OnFactionsChanges(const PacketEvent<RequestFactionsChanges>& acMessage) const noexcept;
     void OnMountRequest(const PacketEvent<MountRequest>& acMessage) const noexcept;
+    void ReleaseMountRideIfOver(uint32_t aMountServerId) const noexcept;
     void OnNewPackageRequest(const PacketEvent<NewPackageRequest>& acMessage) const noexcept;
     void OnRequestRespawn(const PacketEvent<RequestRespawn>& acMessage) const noexcept;
     void OnSyncExperienceRequest(const PacketEvent<SyncExperienceRequest>& acMessage) const noexcept;

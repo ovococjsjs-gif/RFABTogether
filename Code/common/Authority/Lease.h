@@ -121,6 +121,92 @@ inline constexpr uint64_t kDefaultDeclineTtlMs = 15000ull;
     return policy;
 }
 
+// -------------------------------------------------------------------------------------
+//  Which policy governs an entity, and when the server looks at leases again.
+// -------------------------------------------------------------------------------------
+//
+//  The policy used to be chosen by a helper with a defaulted "is boss locked" argument. The
+//  claim that granted a lease passed it; the renewal that extends the lease on every packet
+//  from the owner did not. So a boss was granted for 15 s and, two seconds later, renewed
+//  for 8 s: the longer window existed only until the owner's next packet. Everything that
+//  decides how long a lease lasts now goes through SelectLeasePolicy with the same facts.
+struct EntityTraits
+{
+    bool IsPlayerAvatar{false};
+    bool IsPlayerSummon{false};
+    bool IsMount{false};
+    bool IsDragonInCombat{false};      // a dragon with its weapon drawn
+    bool IsBossEncounterLocked{false}; // the fight is locked to the peer that simulates it
+};
+
+[[nodiscard]] constexpr Policy SelectLeasePolicy(const EntityTraits& acTraits) noexcept
+{
+    // Avatars, summons and mounts never change hands by timeout: no expiry at all.
+    if (acTraits.IsPlayerAvatar || acTraits.IsPlayerSummon || acTraits.IsMount)
+        return Policy{};
+    if (acTraits.IsBossEncounterLocked || acTraits.IsDragonInCombat)
+        return BossEncounterLeasePolicy();
+    return WorldNpcLeasePolicy();
+}
+
+// How often the server does its periodic ownership work, and how recent a peer's simulation
+// traffic has to be for the peer to count as "playing right now". These were bare 500ull /
+// 1000ull literals next to the loops that used them.
+struct SweepPolicy
+{
+    uint64_t ExpiredLeaseSweepIntervalMs{500};
+    uint64_t DormantWakeSweepIntervalMs{1000};
+    uint64_t ActivePeerWindowMs{kActivePeerSimulationWindowMs};
+};
+
+// A periodic sweep runs the first time, then once per interval. A clock that stands still or
+// goes backwards runs the sweep instead of postponing it until the clock catches up.
+[[nodiscard]] constexpr bool IsSweepDue(uint64_t aLastSweepMs, uint64_t aNowMs, uint64_t aIntervalMs) noexcept
+{
+    return aLastSweepMs == 0 || aNowMs <= aLastSweepMs || (aNowMs - aLastSweepMs) >= aIntervalMs;
+}
+
+// Simulation traffic of a peer, as the server last saw it.
+struct PeerActivity
+{
+    bool Known{false};      // the peer has sent simulation traffic at least once
+    uint64_t LastAtMs{0};
+
+    [[nodiscard]] constexpr bool IsWithin(uint64_t aNowMs, uint64_t aWindowMs) const noexcept
+    {
+        return Known && aNowMs >= LastAtMs && (aNowMs - LastAtMs) <= aWindowMs;
+    }
+};
+
+// May this peer take over an entity whose owner went silent? Only a peer that is itself
+// simulating right now: handing a stalled NPC to a second stalled client changes nothing.
+[[nodiscard]] constexpr bool IsPeerActivelySimulating(const PeerActivity& acPeer, uint64_t aNowMs,
+                                                      const SweepPolicy& acSweep = {}) noexcept
+{
+    return acPeer.IsWithin(aNowMs, acSweep.ActivePeerWindowMs);
+}
+
+enum class LapsedLeaseAction : uint8_t
+{
+    kNothing = 0,          // no owner, or the lease has not lapsed
+    kRefreshForActiveOwner,// lapsed on paper, but the owner sent traffic within the lease window
+    kOfferToActivePeers,   // the owner is silent: an active peer in range may take the entity
+};
+
+// What the periodic sweep does with one lease. `acPolicy` must be the policy of the entity
+// (SelectLeasePolicy): the owner's grace is the lease window itself, not a separate constant.
+[[nodiscard]] inline LapsedLeaseAction EvaluateLapsedLease(const Lease& acLease, const PeerActivity& acOwner,
+                                                           uint64_t aNowMs, const Policy& acPolicy) noexcept
+{
+    if (!acLease.HasOwner() || !acLease.IsExpired(aNowMs))
+        return LapsedLeaseAction::kNothing;
+
+    if (acOwner.Known && aNowMs >= acOwner.LastAtMs && (aNowMs - acOwner.LastAtMs) < acPolicy.LeaseDurationMs)
+        return LapsedLeaseAction::kRefreshForActiveOwner;
+
+    return LapsedLeaseAction::kOfferToActivePeers;
+}
+
 // Pure, zero-pointer, time-bounded decline set replacing raw `Player*` blacklists in ECS.
 // When a peer declines a grant while its cell/3D is still streaming, it is skipped during
 // reassignment for `aTtlMs`, then automatically becomes eligible again without needing
@@ -221,6 +307,17 @@ struct Decision
 // client asking to hand it back (by accident or on purpose) used to leave it ownerless.
 [[nodiscard]] Decision Release(const Lease& acCurrent, const Subject& acSubject, uint32_t aSenderId,
                                uint64_t aSenderEpoch, uint64_t aNowMs) noexcept;
+
+// A summon never changes hands, so Release refuses it. Its summoner letting it go says something
+// else: the summon is gone from the only game that can run it (it expired, was dismissed, or was
+// unloaded with its summoner's cell), and the server is to remove it for everybody. Only the peer
+// named by the lease may say so, and not with an epoch that is not the lease's.
+[[nodiscard]] constexpr bool MaySummonerDismiss(const Lease& acCurrent, uint32_t aSenderId, uint64_t aSenderEpoch) noexcept
+{
+    if (aSenderId == kNoOwner || acCurrent.OwnerId != aSenderId)
+        return false;
+    return aSenderEpoch == kUnknownEpoch || aSenderEpoch == acCurrent.Epoch;
+}
 
 // The server takes the entity away: disconnect, out of range, or a lapsed lease.
 [[nodiscard]] Decision Revoke(const Lease& acCurrent, uint64_t aNowMs) noexcept;

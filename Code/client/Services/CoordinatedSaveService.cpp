@@ -9,6 +9,7 @@
 #include <common/CoopOwnership.h>
 #include <common/CoopWorldStabilizer.h>
 #include <common/RfabModpackCompat.h>
+#include <common/Save/LoadRequest.h>
 #include <Events/UpdateEvent.h>
 #include <Forms/TESObjectCELL.h>
 #include <Forms/TESWorldSpace.h>
@@ -479,10 +480,19 @@ bool CoordinatedSaveService::HandleEngineLoadAttempt(const char* acpFileName) no
     const bool isJournalMenuOpen = pUi && pUi->GetMenuOpen(menus.JournalMenu);
 #ifdef _WIN32
     const bool isF9QuickloadKey = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    const bool isShiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 #else
     const bool isF9QuickloadKey = false;
+    const bool isShiftDown = false;
 #endif
-    const bool isQuickloadAttempt = rawName.empty() || isF9QuickloadKey || !isJournalMenuOpen;
+    // What kind of load this is - and, for the leader, what to ask the server for - is decided in
+    // common/Save/LoadRequest.h, where the Linux suite checks every combination.
+    Save::LoadAttempt attempt{};
+    attempt.HasSlotName = !rawName.empty();
+    attempt.QuickloadKeyDown = isF9QuickloadKey;
+    attempt.ShiftDown = isShiftDown;
+    attempt.LoadMenuOpen = isJournalMenuOpen;
+    const bool isQuickloadAttempt = Save::IsQuickload(attempt);
 
     // Post-disconnect / offline quickload guard:
     // If the player presses F9 right after disconnecting (or before reconnecting), vanilla Skyrim's
@@ -519,20 +529,27 @@ bool CoordinatedSaveService::HandleEngineLoadAttempt(const char* acpFileName) no
             // CRITICAL: Only load a specific `RFAB_MP_Save_XXXX` slot when the leader explicitly clicked
             // it inside `ESC -> Load` (`isJournalMenuOpen && !isF9QuickloadKey`), and NEVER treat
             // `RFAB_MP_PreJoin_Backup` as `LoadSpecificSlot`! Pressing `F9` ALWAYS requests the server's
-            // newest committed party checkpoint (`LoadLatestCheckpoint`).
-            if (!isQuickloadAttempt &&
-                normName != normPreJoin &&
-                RfabCompat::Detail::StartsWithIgnoreCase(cleanStem, "RFAB_MP_"))
+            // newest committed party checkpoint (`LoadLatestCheckpoint`); `Shift+F9` the one before it.
+            attempt.SlotIsCoopSave = RfabCompat::Detail::StartsWithIgnoreCase(cleanStem, "RFAB_MP_");
+            attempt.SlotIsPreJoinBackup = normName == normPreJoin;
+
+            const char* pNotice = "RFAB Online: Общая загрузка чекпоинта для всех игроков...";
+            switch (Save::ClassifyLeaderLoad(attempt))
             {
+            case Save::LoadRequestKind::kPreviousCheckpoint:
+                req.Action = RequestCoordinatedSaveLoad::ActionType::LoadPreviousCheckpoint;
+                pNotice = "RFAB Online: Общая загрузка ПРЕДЫДУЩЕГО чекпоинта для всех игроков...";
+                break;
+            case Save::LoadRequestKind::kSpecificSlot:
                 req.Action = RequestCoordinatedSaveLoad::ActionType::LoadSpecificSlot;
                 req.SlotName = String(cleanStem.c_str());
-            }
-            else
-            {
+                break;
+            case Save::LoadRequestKind::kLatestCheckpoint:
                 req.Action = RequestCoordinatedSaveLoad::ActionType::LoadLatestCheckpoint;
+                break;
             }
             m_transport.Send(req);
-            Utils::ShowHudMessage(String("RFAB Online: Общая загрузка чекпоинта для всех игроков..."));
+            Utils::ShowHudMessage(String(pNotice));
         }
     }
     else if (m_lastInterceptNoticeCooldownSec <= 0.0)

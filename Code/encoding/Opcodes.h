@@ -65,6 +65,7 @@ enum ClientOpcode : unsigned char
     kRequestResync,
     kRequestWorldItemDrop,
     kRequestWorldItemPickup,
+    kClientEntityDigest,
     kClientOpcodeMax
 };
 

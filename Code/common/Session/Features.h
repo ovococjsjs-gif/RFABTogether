@@ -42,9 +42,16 @@ enum class Feature : uint32_t
     kRfabCombatRules = 1u << 6,    // ally protection, smart standing-target pick, boss/arena sync
     kSelfHealingResync = 1u << 7,  // client gap detection + server resend (architecture step 1)
     kServerOwnedWorldItems = 1u << 8,  // dropped items get a server id, claims are arbitrated (step 4)
+    kPeacefulNpcsUnscaled = 1u << 9,   // enemy health scaling skips creatures that never start a fight
+    kDesyncDetector = 1u << 10,        // clients report what they believe about each character (EntityDigest.h)
+    kWorldScopedHookEvents = 1u << 11, // hook events die with the world they were posted in (MainThreadQueue.h)
+    kQuestXpSingleAward = 1u << 12,    // quest XP is paid once in every arrival order (CoopExperienceLedger.h)
+    kPersonalMerchantStock = 1u << 13, // merchants' chests and remotely opened containers are not shared
+    kNeighbourCellContainers = 1u << 14, // outdoors, containers within reach of the player's cell are registered ahead
+    kEarlyTakeReplay = 1u << 15, // a take made before the server answered the cell scan is sent again, not dropped
 };
 
-inline constexpr uint32_t kAllKnownFeatureBits = 0x1FFu;
+inline constexpr uint32_t kAllKnownFeatureBits = 0xFFFFu;
 
 struct FeatureInfo
 {
@@ -52,7 +59,7 @@ struct FeatureInfo
     std::string_view Name;  // stable, used in logs and in the server console listing
 };
 
-inline constexpr std::array<FeatureInfo, 9> kFeatureTable{{
+inline constexpr std::array<FeatureInfo, 16> kFeatureTable{{
     {Feature::kDownedSystem, "DownedSystem"},
     {Feature::kCoordinatedSaves, "CoordinatedSaves"},
     {Feature::kTacticalHud, "TacticalHud"},
@@ -62,6 +69,13 @@ inline constexpr std::array<FeatureInfo, 9> kFeatureTable{{
     {Feature::kRfabCombatRules, "RfabCombatRules"},
     {Feature::kSelfHealingResync, "SelfHealingResync"},
     {Feature::kServerOwnedWorldItems, "ServerOwnedWorldItems"},
+    {Feature::kPeacefulNpcsUnscaled, "PeacefulNpcsUnscaled"},
+    {Feature::kDesyncDetector, "DesyncDetector"},
+    {Feature::kWorldScopedHookEvents, "WorldScopedHookEvents"},
+    {Feature::kQuestXpSingleAward, "QuestXpSingleAward"},
+    {Feature::kPersonalMerchantStock, "PersonalMerchantStock"},
+    {Feature::kNeighbourCellContainers, "NeighbourCellContainers"},
+    {Feature::kEarlyTakeReplay, "EarlyTakeReplay"},
 }};
 
 [[nodiscard]] constexpr uint32_t Bit(Feature aFeature) noexcept

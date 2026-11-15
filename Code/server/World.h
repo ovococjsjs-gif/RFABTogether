@@ -22,7 +22,26 @@ namespace ESLoader
 struct RecordCollection;
 }
 
-struct World : entt::registry
+namespace WorldParts
+{
+// Owns the event dispatcher of World - as a base class, and the FIRST one, on purpose.
+//
+// Every service lives in the registry's context (the entt::registry base of World) and holds scoped
+// connections into this dispatcher; a connection disconnects itself, in the dispatcher, when its
+// service is destroyed. Base classes are destroyed in reverse order of declaration, so the registry
+// and every service in it are gone before the dispatcher is.
+//
+// Until 4.1.1 the dispatcher was a member of World. Members die before base classes: at shutdown
+// the dispatcher was freed first and then every service disconnected from freed memory, writing
+// into it. The sanitized server harness reported it the first time it ran (work plan 1.7).
+struct DispatcherOwner
+{
+protected:
+    entt::dispatcher m_dispatcher;
+};
+} // namespace WorldParts
+
+struct World : WorldParts::DispatcherOwner, entt::registry
 {
     World();
     ~World() noexcept;
@@ -82,7 +101,6 @@ struct World : entt::registry
 
 private:
     entt::entity m_reservedZeroEntity{entt::null};
-    entt::dispatcher m_dispatcher;
 
     TiltedPhoques::SharedPtr<AdminService> m_spAdminService;
     TiltedPhoques::UniquePtr<ScriptService> m_pScriptService;

@@ -654,9 +654,17 @@ TEST_CASE("Live 2-Player RFAB Playtest Regressions: Dual-Pool XP Parity, Joint-K
         }
         REQUIRE_FALSE(RfabCompat::Detail::IsValidEssFileOnDisk(saveTmpDir / "BadSave.ess"));
         REQUIRE(RfabCompat::Detail::IsValidEssFileOnDisk(saveTmpDir / "GoodSave.ess"));
-        REQUIRE(RfabCompat::Detail::QuarantineCorruptEssFilesInDirectory(saveTmpDir) == 1);
-        REQUIRE_FALSE(std::filesystem::exists(saveTmpDir / "BadSave.ess"));
-        REQUIRE(std::filesystem::exists(saveTmpDir / "Quarantined_Corrupt_v100" / "BadSave.ess"));
+        // v4.1.1 (work plan 4.4): a damaged save that the coop did not write is the player's own
+        // file. It is reported and stays where it is; only RFAB_MP_* slots are ever moved.
+        std::filesystem::copy_file(saveTmpDir / "BadSave.ess", saveTmpDir / "RFAB_MP_BadSlot.ess");
+        const auto quarantineReport = RfabCompat::Detail::QuarantineDamagedCoopSavesInDirectory(saveTmpDir);
+        REQUIRE(quarantineReport.Moved == 1);
+        REQUIRE(quarantineReport.ForeignDamaged == 1);
+        REQUIRE(quarantineReport.ForeignNamesUtf8 == std::vector<std::string>{"BadSave.ess"});
+        REQUIRE(std::filesystem::exists(saveTmpDir / "BadSave.ess"));
+        REQUIRE_FALSE(std::filesystem::exists(saveTmpDir / "Quarantined_Corrupt_v100" / "BadSave.ess"));
+        REQUIRE_FALSE(std::filesystem::exists(saveTmpDir / "RFAB_MP_BadSlot.ess"));
+        REQUIRE(std::filesystem::exists(saveTmpDir / "Quarantined_Corrupt_v100" / "RFAB_MP_BadSlot.ess"));
         REQUIRE(std::filesystem::exists(saveTmpDir / "GoodSave.ess"));
         std::filesystem::remove_all(saveTmpDir);
 

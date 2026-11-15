@@ -129,6 +129,9 @@ public:
     bool SaveCheckpointsToDisk(const std::filesystem::path& acPath) const noexcept;
     bool LoadCheckpointsFromDisk(const std::filesystem::path& acPath) noexcept;
     [[nodiscard]] static std::filesystem::path GetDefaultCheckpointStorePath();
+    // The key a player keeps across reconnects and server restarts (Discord id, else the name).
+    // "pid:<n>" when neither exists: such a key is only valid for the current connection.
+    [[nodiscard]] static std::string GetPlayerIdentityKey(const Player* apPlayer);
 
     [[nodiscard]] SaveSnapshotCoordinator& GetCoordinator() noexcept { return m_coordinator; }
     [[nodiscard]] const SaveSnapshotCoordinator& GetCoordinator() const noexcept { return m_coordinator; }

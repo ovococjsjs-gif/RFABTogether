@@ -58,6 +58,29 @@ uint32_t InventoryService::ResolveLootContainerKey(entt::entity aEntity, uint32_
     return aFallbackServerId;
 }
 
+Inventory InventoryService::MergeClaimedBodyInventory(entt::entity aBody, uint32_t aBodyServerId, const Inventory& acHeld,
+                                                     const Inventory& acClaimed) const noexcept
+{
+    Inventory merged = acHeld;
+    const uint32_t lootContainerKey = ResolveLootContainerKey(aBody, aBodyServerId);
+
+    for (const Inventory::Entry& entry : acClaimed.Entries)
+    {
+        if (!entry.BaseId || entry.Count <= 0)
+            continue;
+
+        // Against the list the server held before the claim, not the one being built: two entries
+        // of the same item (plain and enchanted) are both taken or both left.
+        GameId lookupId = entry.BaseId;
+        const int32_t heldCount = acHeld.GetEntryCountById(lookupId);
+        const bool isDepleted = m_lootLedger.IsDepleted(lootContainerKey, entry.BaseId);
+        if (CoopLootLedger::ShouldAcceptClaimedBodyItem(heldCount, isDepleted))
+            merged.AddOrRemoveEntry(entry);
+    }
+
+    return merged;
+}
+
 void InventoryService::ForgetContainerForEntity(entt::entity aEntity, uint32_t aFallbackServerId) noexcept
 {
     if (aFallbackServerId != 0)
@@ -106,20 +129,17 @@ bool InventoryService::ApplyInventoryDelta(Player* apSender, uint32_t aServerId,
     }
     else if (pChar && pOwner && (!apSender || pOwner->GetOwner() != apSender))
     {
-        // RFAB mount saddlebag guard: block bystanders from mutating a mount's saddlebag while
-        // another player owns or is actively riding that horse (prevents saddlebag dupes/theft).
-        if (pChar->IsMount())
+        // A saddlebag is closed to others only while a different player is riding the horse (and
+        // only with the ride guard on). Who SIMULATES the horse says nothing about whose it is: a
+        // player's own horse is routinely simulated by whoever stood closer, and the earlier rule
+        // ("the simulating player or nobody") refused that player's own saddlebag.
+        if (pChar->IsMount() && m_world.GetCharacterService().IsMountHeldByOtherRider(aServerId, apSender))
         {
-            const uint32_t senderId = apSender ? apSender->GetId() : 0u;
-            const uint32_t ownerId = pOwner->GetOwner() ? pOwner->GetOwner()->GetId() : 0u;
-            if (!m_world.GetCharacterService().GetMountGuard().CanMutateMountSaddlebag(aServerId, senderId, ownerId))
-            {
-                spdlog::warn(
-                    "[RFAB Mounts] Rejected bystander saddlebag mutation on mount {:X} from player {}",
-                    aServerId,
-                    senderId);
-                return false;
-            }
+            spdlog::warn(
+                "[RFAB Mounts] Rejected saddlebag change on mount {:X} from player {}: another player is riding it",
+                aServerId,
+                apSender ? apSender->GetId() : 0u);
+            return false;
         }
 
         // A different peer may interact with an owned NPC (pickpocket or loot it) only while the
