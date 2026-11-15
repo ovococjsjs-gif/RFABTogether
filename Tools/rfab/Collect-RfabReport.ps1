@@ -195,23 +195,50 @@ function Invoke-Collect([string]$Root, [string]$TargetDir, [int]$LogCapMB, [bool
 
     Invoke-Step "client logs" {
         if (-not (Test-Path -LiteralPath $clientDir)) { Add-Note "client folder not found: $clientDir"; return }
-        $logDir = Join-Path $clientDir "logs"
-        if (Test-Path -LiteralPath $logDir) {
-            foreach ($log in @(Get-ChildItem -LiteralPath $logDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*.log*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 12)) {
-                [void](Add-ReportFile $log.FullName (Join-Parts "client" @("logs", $log.Name)) $logCap)
+        $clientSearchDirs = @(
+            $clientDir,
+            (Join-Parts $mo2Base @("overwrite", "SkyrimTogetherReborn")),
+            (Join-Parts $Root @("Data", "SkyrimTogetherReborn"))
+        )
+        $foundClientLogs = New-Object System.Collections.Generic.List[object]
+        foreach ($candDir in $clientSearchDirs) {
+            $candLogs = Join-Path $candDir "logs"
+            if (Test-Path -LiteralPath $candLogs) {
+                foreach ($log in @(Get-ChildItem -LiteralPath $candLogs -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*.log*" })) {
+                    [void]$foundClientLogs.Add($log)
+                }
             }
-        } else { Add-Note "no client log folder: $logDir (the client has never started from this install)" }
+        }
+        if ($foundClientLogs.Count -gt 0) {
+            $seenNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($log in @($foundClientLogs | Sort-Object LastWriteTime -Descending | Select-Object -First 12)) {
+                $dstName = $log.Name
+                if (-not $seenNames.Add($dstName)) { $dstName = ("overwrite_" + $log.Name) }
+                [void](Add-ReportFile $log.FullName (Join-Parts "client" @("logs", $dstName)) $logCap)
+            }
+        } else { Add-Note ("no client log folder: {0} (the client has never started from this install)" -f (Join-Path $clientDir "logs")) }
         foreach ($file in @(Get-ChildItem -LiteralPath $clientDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "RFAB_Online_*" })) {
             [void](Add-ReportFile $file.FullName (Join-Path "client" $file.Name) $logCap)
         }
-        $overlayDir = Join-Path $clientDir "rfab_coop_config"
-        if (Test-Path -LiteralPath $overlayDir) {
-            foreach ($file in @(Get-ChildItem -LiteralPath $overlayDir -File -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 2MB } | Select-Object -First 40)) {
-                [void](Add-ReportFile $file.FullName (Join-Parts "client" @("rfab_coop_config", $file.Name)) $logCap)
+        foreach ($candDir in $clientSearchDirs) {
+            $overlayDir = Join-Path $candDir "rfab_coop_config"
+            if (Test-Path -LiteralPath $overlayDir) {
+                foreach ($file in @(Get-ChildItem -LiteralPath $overlayDir -File -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 2MB } | Select-Object -First 40)) {
+                    [void](Add-ReportFile $file.FullName (Join-Parts "client" @("rfab_coop_config", $file.Name)) $logCap)
+                }
+                break
             }
         }
         if ($WithDumps) {
-            foreach ($dump in @(Get-ChildItem -LiteralPath $clientDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "crash_*.dmp" } | Sort-Object LastWriteTime -Descending | Select-Object -First 2)) {
+            $foundDumps = New-Object System.Collections.Generic.List[object]
+            foreach ($candDir in $clientSearchDirs) {
+                if (Test-Path -LiteralPath $candDir) {
+                    foreach ($dump in @(Get-ChildItem -LiteralPath $candDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "crash_*.dmp" })) {
+                        [void]$foundDumps.Add($dump)
+                    }
+                }
+            }
+            foreach ($dump in @($foundDumps | Sort-Object LastWriteTime -Descending | Select-Object -First 2)) {
                 [void](Add-ReportFile $dump.FullName (Join-Path "client" $dump.Name) 0)
             }
         }

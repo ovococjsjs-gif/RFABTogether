@@ -17,6 +17,12 @@ ImguiService::ImguiService()
 
 ImguiService::~ImguiService() noexcept
 {
+    if (m_initialized)
+    {
+        ImGui_ImplDX11_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        m_initialized = false;
+    }
 }
 
 void ImguiService::Create(RenderSystemD3D11* apRenderSystem, HWND aHwnd)
@@ -27,11 +33,14 @@ void ImguiService::Create(RenderSystemD3D11* apRenderSystem, HWND aHwnd)
     if (!ImGui_ImplWin32_Init(aHwnd))
         spdlog::error("Failed to initialize Imgui-Win32");
 
-    ImGui_ImplDX11_Init(apRenderSystem->GetDevice(), apRenderSystem->GetDeviceContext());
+    m_initialized = ImGui_ImplDX11_Init(apRenderSystem->GetDevice(), apRenderSystem->GetDeviceContext());
 }
 
 void ImguiService::Render() const
 {
+    if (!m_initialized)
+        return;
+
     ImGui_ImplDX11_NewFrame();
 
     ImGui_ImplWin32_NewFrame();
@@ -45,7 +54,10 @@ void ImguiService::Render() const
 
 void ImguiService::Reset() const
 {
-    // TODO: idk how imgui handles this
+    if (!m_initialized)
+        return;
+
+    ImGui_ImplDX11_InvalidateDeviceObjects();
 }
 
 LRESULT ImguiService::WndProcHandler(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)

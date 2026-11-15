@@ -592,8 +592,15 @@ def symbolize_report(folder: Path, extra_maps: list[LinkerMap], game: GameIdMap,
     # Do the symbols belong to the binary that was installed when the report was made?
     report_txt = next(iter(sorted(folder.rglob("REPORT.txt"))), None)
     if report_txt is not None:
-        installed = {m.group("path").strip().replace(chr(92), "/").rsplit("/", 1)[-1].lower(): m.group("stamp").lower()
-                     for m in _REPORT_BINARY.finditer(report_txt.read_text(encoding="utf-8", errors="replace"))}
+        # REPORT.txt lists both `client\SkyrimSE.exe` (our launcher) and `game\SkyrimSE.exe` (Bethesda's
+        # runtime, timestamp 5dcae282). Keep the `client\` / `server\` entry when stems collide so the
+        # launcher's own symbol table is compared against `client\SkyrimSE.exe`, not `game\SkyrimSE.exe`.
+        installed: dict[str, str] = {}
+        for m in _REPORT_BINARY.finditer(report_txt.read_text(encoding="utf-8", errors="replace")):
+            rel = m.group("path").strip().replace(chr(92), "/").lower()
+            base = rel.rsplit("/", 1)[-1]
+            if base not in installed or rel.startswith(("client/", "server/")):
+                installed[base] = m.group("stamp").lower()
         for linker_map in maps:
             stem = linker_map.module.lower().rsplit(".", 1)[0]
             for binary, stamp in installed.items():
@@ -837,6 +844,19 @@ def self_test() -> int:
         folder_report = "\n".join(symbolize_report(root, [], game, 10))
         expect("2 crash record(s)" in folder_report and "RfabServerCrashSelfTestFault" in folder_report and "std::terminate: 1 record(s)" in folder_report,
                "folder: the server's crash log is read and named with the server's symbols")
+
+        # REPORT.txt lists both client\SkyrimSE.exe (launcher) and game\SkyrimSE.exe (Bethesda 1.5.97);
+        # game\SkyrimSE.exe must never overwrite client\SkyrimSE.exe's PE timestamp.
+        (root / "client").mkdir(parents=True, exist_ok=True)
+        (root / "client" / "RFAB_Online_Symbols.gz").write_bytes(export_compact(linker_map))
+        (root / "REPORT.txt").write_text(
+            f"client\\SkyrimSE.exe | size=1 | version=1.5.97.0 | modified=2026-11-15 | pe_timestamp={linker_map.timestamp} | sha256=00\n"
+            "game\\SkyrimSE.exe | size=1 | version=1.5.97.0 | modified=2026-11-15 | pe_timestamp=5dcae282 | sha256=11\n",
+            encoding="utf-8",
+        )
+        both_exes_report = "\n".join(symbolize_report(root, [], game, 10))
+        expect("WARNING skyrimse.exe" not in both_exes_report and "the symbols belong to the installed binary" in both_exes_report,
+               "folder: client\\SkyrimSE.exe timestamp is not overwritten by game\\SkyrimSE.exe")
 
     if failures:
         print("symbolize_crash self-test FAILED:")

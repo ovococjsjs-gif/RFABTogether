@@ -54,17 +54,17 @@
    прогон ветки `main` (после слияния финальная сборка собирается там).
 2. Внизу страницы, раздел **Artifacts**, скачай `RFAB_Online-build-<sha>`.
 3. Внутри:
-   * `RFAB_Online_v4.1.1_Full_Installer.zip` — полная установка, с неё и начинай;
-   * `RFAB_Online_v4.1.1_Quick_Update.zip` — только бинарники, если полная версия
+   * `RFAB_Online_v4.1.2_Full_Installer.zip` — полная установка, с неё и начинай;
+   * `RFAB_Online_v4.1.2_Quick_Update.zip` — только бинарники, если полная версия
      уже стоит и ты обновляешься между прогонами;
-   * `RFAB_Online_v4.1.1_PDB_Symbols.zip` — символы; нужны, только если словишь
+   * `RFAB_Online_v4.1.2_PDB_Symbols.zip` — символы; нужны, только если словишь
      вылет (приложи их к отчёту вместе с логом);
    * `SHA256SUMS.txt` — чтобы убедиться, что архив доехал целым.
 
 Проверка целостности (PowerShell, в папке с архивами):
 
 ```powershell
-Get-FileHash .\RFAB_Online_v4.1.1_Full_Installer.zip -Algorithm SHA256
+Get-FileHash .\RFAB_Online_v4.1.2_Full_Installer.zip -Algorithm SHA256
 ```
 
 Сравни со строкой в `SHA256SUMS.txt`. Если не совпало — качай заново, не ставь.

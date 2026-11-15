@@ -761,6 +761,10 @@ Inventory TESObjectREFR::GetInventory(std::function<bool(TESForm&)> aFilter) con
     auto& modSystem = World::Get().GetModSystem();
     Inventory inventory{};
 
+    // Query ExtraContainerChanges FIRST (SE 15802 initializes ExtraContainerChanges when needed,
+    // resolving TESLevItem templates in TESContainer into concrete weapon/ammo/item entries).
+    auto* pContainerChanges = GetContainerChanges();
+
     if (TESContainer* pBaseContainer = GetContainer())
     {
         for (int i = 0; i < pBaseContainer->count; i++)
@@ -771,6 +775,11 @@ Inventory TESObjectREFR::GetInventory(std::function<bool(TESForm&)> aFilter) con
                 spdlog::warn("Entry or form for inventory item is null.");
                 continue;
             }
+
+            // TESLevItem (LVLI) is a leveled-list generator, never a concrete inventory item;
+            // concrete items resolved from it live in pContainerChanges->entries.
+            if (pGameEntry->form->formType == FormType::LeveledItem)
+                continue;
 
             if (!aFilter(*pGameEntry->form))
                 continue;
@@ -785,11 +794,14 @@ Inventory TESObjectREFR::GetInventory(std::function<bool(TESForm&)> aFilter) con
 
     Inventory extraInventory{};
 
-    if (auto* pContainerChanges = GetContainerChanges(); pContainerChanges && pContainerChanges->entries)
+    if (pContainerChanges && pContainerChanges->entries)
     {
         for (auto pGameEntry : *pContainerChanges->entries)
         {
             if (!pGameEntry || !pGameEntry->form)
+                continue;
+
+            if (pGameEntry->form->formType == FormType::LeveledItem)
                 continue;
 
             if (!aFilter(*pGameEntry->form))
@@ -1037,9 +1049,9 @@ void TESObjectREFR::AddOrRemoveItem(const Inventory::Entry& arEntry, bool aIsSet
 
     uint32_t objectId = modSystem.GetGameId(arEntry.BaseId);
     TESBoundObject* pObject = Cast<TESBoundObject>(TESForm::GetById(objectId));
-    if (!pObject)
+    if (!pObject || pObject->formType == FormType::LeveledItem)
     {
-        spdlog::warn("{}: Object to add not found, {:X}:{:X}.", __FUNCTION__, arEntry.BaseId.ModId, arEntry.BaseId.BaseId);
+        spdlog::warn("{}: Object to add not found or is a leveled template, {:X}:{:X}.", __FUNCTION__, arEntry.BaseId.ModId, arEntry.BaseId.BaseId);
         return;
     }
 

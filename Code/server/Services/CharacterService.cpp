@@ -1,5 +1,6 @@
 #include <Services/CharacterService.h>
 #include <Components.h>
+#include <common/CoopInventoryDiff.h>
 #include <common/CoopPacketSafety.h>
 #include <GameServer.h>
 #include <World.h>
@@ -801,6 +802,7 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
 
             auto& inventoryComponent = m_world.get<InventoryComponent>(existingPlayerEntity);
             inventoryComponent.Content = message.CurrentActorData.InitialInventory;
+            inventoryComponent.HasSeededInventory = true;
 
             auto& actorValuesComponent = m_world.get<ActorValuesComponent>(existingPlayerEntity);
             actorValuesComponent.AssignAuthoritative(
@@ -864,48 +866,56 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
             auto& cellIdComponent = m_world.get<CellIdComponent>(existingEntity);
             auto& existingOwnerComp = m_world.get<OwnerComponent>(existingEntity);
 
-            // Hydrated dormant NPCs from rfab_checkpoints.bin may have empty baseline inventory/AV maps;
-            // seed any missing baseline fields from the first arriving client while preserving persisted
-            // dead state and persisted health!
+            // Hydrated dormant NPCs from rfab_checkpoints.bin have HasSeededInventory == false and partial AV maps;
+            // seed missing baseline fields from the first arriving client (whether ownerless, pre-assigned by
+            // WakeDormantCharactersInActiveRanges, or observed by a peer) while preserving persisted dead state and HP!
             const GameId sanitizedBaseId =
                 (message.FormId.ModId == std::numeric_limits<uint32_t>::max()) ? GameId{} : message.FormId;
 
-            if (existingOwnerComp.GetOwner() == nullptr || existingOwnerComp.GetOwner() == acMessage.pPlayer)
+            bool seededDormantBaseline = false;
+            if ((!characterComponent.BaseId ||
+                 characterComponent.BaseId.Id == GameId{} ||
+                 characterComponent.BaseId.Id.ModId == std::numeric_limits<uint32_t>::max()) &&
+                sanitizedBaseId != GameId{})
             {
-                if ((!characterComponent.BaseId ||
-                     characterComponent.BaseId.Id == GameId{} ||
-                     characterComponent.BaseId.Id.ModId == std::numeric_limits<uint32_t>::max()) &&
-                    sanitizedBaseId != GameId{})
-                {
-                    characterComponent.BaseId = FormIdComponent(sanitizedBaseId);
-                }
-                if (characterComponent.FactionsContent.NpcFactions.empty() &&
-                    characterComponent.FactionsContent.ExtraFactions.empty() &&
-                    (!message.FactionsContent.NpcFactions.empty() || !message.FactionsContent.ExtraFactions.empty()))
-                    characterComponent.FactionsContent = message.FactionsContent;
-                if (inventoryComponent.Content.Entries.empty() && !message.CurrentActorData.InitialInventory.Entries.empty())
-                    inventoryComponent.Content = message.CurrentActorData.InitialInventory;
-                if (actorValuesComponent.CurrentActorValues.ActorValuesList.size() <= 1 &&
-                    !message.CurrentActorData.InitialActorValues.ActorValuesList.empty())
-                {
-                    const auto savedHpIt = actorValuesComponent.CurrentActorValues.ActorValuesList.find(24);
-                    const auto savedMaxHpIt = actorValuesComponent.CurrentActorValues.ActorMaxValuesList.find(24);
-                    const bool hadSavedHp = (savedHpIt != actorValuesComponent.CurrentActorValues.ActorValuesList.end());
-                    const float savedHp = hadSavedHp ? savedHpIt->second : 0.0f;
-                    const bool hadSavedMaxHp = (savedMaxHpIt != actorValuesComponent.CurrentActorValues.ActorMaxValuesList.end());
-                    const float savedMaxHp = hadSavedMaxHp ? savedMaxHpIt->second : 0.0f;
+                characterComponent.BaseId = FormIdComponent(sanitizedBaseId);
+                seededDormantBaseline = true;
+            }
+            if (characterComponent.FactionsContent.NpcFactions.empty() &&
+                characterComponent.FactionsContent.ExtraFactions.empty() &&
+                (!message.FactionsContent.NpcFactions.empty() || !message.FactionsContent.ExtraFactions.empty()))
+            {
+                characterComponent.FactionsContent = message.FactionsContent;
+            }
+            if (!inventoryComponent.HasSeededInventory &&
+                (!CoopInventoryDiff::IsActorInventoryEmpty(message.CurrentActorData.InitialInventory) ||
+                 message.CurrentActorData.IsDead))
+            {
+                inventoryComponent.Content = message.CurrentActorData.InitialInventory;
+                inventoryComponent.HasSeededInventory = true;
+                seededDormantBaseline = true;
+            }
+            if (actorValuesComponent.CurrentActorValues.ActorValuesList.size() <= 1 &&
+                !message.CurrentActorData.InitialActorValues.ActorValuesList.empty())
+            {
+                const auto savedHpIt = actorValuesComponent.CurrentActorValues.ActorValuesList.find(24);
+                const auto savedMaxHpIt = actorValuesComponent.CurrentActorValues.ActorMaxValuesList.find(24);
+                const bool hadSavedHp = (savedHpIt != actorValuesComponent.CurrentActorValues.ActorValuesList.end());
+                const float savedHp = hadSavedHp ? savedHpIt->second : 0.0f;
+                const bool hadSavedMaxHp = (savedMaxHpIt != actorValuesComponent.CurrentActorValues.ActorMaxValuesList.end());
+                const float savedMaxHp = hadSavedMaxHp ? savedMaxHpIt->second : 0.0f;
 
-                    actorValuesComponent.CurrentActorValues = message.CurrentActorData.InitialActorValues;
-                    const float claimedMaxHp = (hadSavedMaxHp && savedMaxHp > 0.0f) ? savedMaxHp : 0.0f;
-                    if (claimedMaxHp > 0.0f)
-                        actorValuesComponent.CurrentActorValues.ActorMaxValuesList[24] = claimedMaxHp;
-                    // Ownership just moved: the baseline belongs to the new owner, and the
-                    // previous owner's in-flight readings must not be able to overwrite it.
-                    if (characterComponent.IsDead())
-                        actorValuesComponent.SetHealth(0.0f, claimedMaxHp);
-                    else if (hadSavedHp)
-                        actorValuesComponent.SetHealth(savedHp, claimedMaxHp);
-                }
+                actorValuesComponent.CurrentActorValues = message.CurrentActorData.InitialActorValues;
+                const float claimedMaxHp = (hadSavedMaxHp && savedMaxHp > 0.0f) ? savedMaxHp : 0.0f;
+                if (claimedMaxHp > 0.0f)
+                    actorValuesComponent.CurrentActorValues.ActorMaxValuesList[24] = claimedMaxHp;
+                // Ownership just moved: the baseline belongs to the new owner, and the
+                // previous owner's in-flight readings must not be able to overwrite it.
+                if (characterComponent.IsDead())
+                    actorValuesComponent.SetHealth(0.0f, claimedMaxHp);
+                else if (hadSavedHp)
+                    actorValuesComponent.SetHealth(savedHp, claimedMaxHp);
+                seededDormantBaseline = true;
             }
 
             auto& partyService = m_world.GetPartyService();
@@ -913,6 +923,7 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
             bool isOwner = false;
             Player* pOwningPlayer = existingOwnerComp.GetOwner();
 
+            bool broadcastedViaTransfer = false;
             if (pOwningPlayer != nullptr && pOwningPlayer == acMessage.pPlayer)
             {
                 // WakeDormantCharactersInActiveRanges or ReconcileAllEntitiesForObserver pre-assigned this player
@@ -985,9 +996,19 @@ void CharacterService::OnAssignCharacterRequest(const PacketEvent<AssignCharacte
                             characterComponent.BaseId = FormIdComponent(message.FormId);
                         const ActorData authoritativeActorData = BuildActorData(existingEntity);
                         TransferOwnership(acMessage.pPlayer, World::ToInteger(existingEntity), authoritativeActorData);
+                        broadcastedViaTransfer = true;
                         isOwner = true;
                     }
                 }
+            }
+
+            if (seededDormantBaseline && !broadcastedViaTransfer)
+            {
+                NotifySpawnData seededNotify{};
+                seededNotify.Id = World::ToInteger(existingEntity);
+                seededNotify.NewActorData = BuildActorData(existingEntity);
+                seededNotify.HealthRevision = actorValuesComponent.HealthRevision;
+                GameServer::Get()->SendToPlayersInRange(seededNotify, existingEntity, acMessage.pPlayer);
             }
 
             AssignCharacterResponse response{};
@@ -1792,6 +1813,7 @@ void CharacterService::CreateCharacter(const PacketEvent<AssignCharacterRequest>
 
     auto& inventoryComponent = m_world.emplace<InventoryComponent>(cEntity);
     inventoryComponent.Content = message.CurrentActorData.InitialInventory;
+    inventoryComponent.HasSeededInventory = true;
 
     auto& actorValuesComponent = m_world.emplace<ActorValuesComponent>(cEntity);
     actorValuesComponent.AssignAuthoritative(
@@ -1978,13 +2000,20 @@ void CharacterService::ApplyActorData(const entt::entity acEntity, const ActorDa
         pActorValuesComponent->AssignAuthoritative(acActorData.InitialActorValues, acActorData.IsDead);
     }
 
+    auto* pCharacterComponent = m_world.try_get<CharacterComponent>(acEntity);
+    const bool isPlayer = pCharacterComponent && pCharacterComponent->IsPlayer();
+    const bool effectiveDead = acActorData.IsDead || (pCharacterComponent && pCharacterComponent->IsDead());
+
     auto* pInventoryComponent = m_world.try_get<InventoryComponent>(acEntity);
     if (pInventoryComponent)
     {
-        pInventoryComponent->Content = acActorData.InitialInventory;
+        if (CoopInventoryDiff::ShouldApplyWholesaleActorInventory(acActorData.InitialInventory, isPlayer, effectiveDead))
+        {
+            pInventoryComponent->Content = acActorData.InitialInventory;
+            pInventoryComponent->HasSeededInventory = true;
+        }
     }
 
-    auto* pCharacterComponent = m_world.try_get<CharacterComponent>(acEntity);
     if (pCharacterComponent)
     {
         pCharacterComponent->SetDead(acActorData.IsDead);
@@ -2006,6 +2035,8 @@ void CharacterService::BroadcastActorData(Player* apPlayer, const entt::entity a
     NotifySpawnData notifySpawnData;
     notifySpawnData.Id = World::ToInteger(acEntity);
     notifySpawnData.NewActorData = acActorData;
+    if (const auto* pInventory = m_world.try_get<InventoryComponent>(acEntity))
+        notifySpawnData.NewActorData.InitialInventory = pInventory->Content;
     if (const auto* pAv = m_world.try_get<ActorValuesComponent>(acEntity))
         notifySpawnData.HealthRevision = pAv->HealthRevision;
 

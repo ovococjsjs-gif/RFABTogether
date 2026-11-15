@@ -15,12 +15,12 @@
 
 *Проходите Requiem for a Balance вдвоём–вчетвером: общий мир и задания, личные сложность и прогресс,<br>ранение вместо мгновенной смерти и свой сервер.*
 
-[**Скачать сборку**](https://github.com/ovococjsjs-gif/RFABTogether/releases) · [**Установка**](#-скачать-и-установить) · [**Что нового**](#-что-нового-в-411) · [**Управление**](#-управление) · [**Плейтест**](docs/PLAYTEST.md) · [**Журнал изменений**](CHANGELOG.md)
+[**Скачать сборку**](https://github.com/ovococjsjs-gif/RFABTogether/releases) · [**Установка**](#-скачать-и-установить) · [**Что нового**](#-что-нового-в-412) · [**Управление**](#-управление) · [**Плейтест**](docs/PLAYTEST.md) · [**Журнал изменений**](CHANGELOG.md)
 
 </div>
 
 > [!IMPORTANT]
-> **Сборка `4.1.1` собрана для первого плейтеста и в игре ещё не проверена.** Её исправления найдены чтением кода и на серверном стенде. Маршрут проверки на один вечер — [`docs/PLAYTEST.md`](docs/PLAYTEST.md), раздел 0.
+> **Сборка `4.1.2` включает исправления по итогам первого совместного плейтеста** (вооружение и боевое поведение врагов после чекпоинтов, устранение вылетов D3D11 / `Exclusive Fullscreen` вне сессии, логи под MO2 USVFS). Маршрут проверки на один вечер — [`docs/PLAYTEST.md`](docs/PLAYTEST.md), раздел 0.
 
 ---
 
@@ -50,15 +50,15 @@
 
 ---
 
-## 🆕 Что нового в 4.1.1
+## 🆕 Что нового в 4.1.2
 
 | Область | Что сделано |
 |---|---|
-| **Диагностика** | Сборщик отчёта одним файлом, расшифровка адресов вылета до имён функций, детектор рассинхрона на сервере |
-| **Вылеты и перезагрузки** | События игры не переживают общую перезагрузку; запуск не падает на именах файлов и папок, которые не помещаются в кодовую страницу Windows; `Shift+F9` возвращает к предыдущей точке; сервер сообщает, почему он закрылся |
-| **Рассинхроны** | Босс не переходит к другому игроку из-за короткой паузы владельца; вскрытый замок не запирается снова; взятый с тела предмет не появляется на нём снова |
-| **Механики RFAB** | Опыт за задание приходит один раз; призванное существо исчезает и у напарника; торговля и хранилища личные; вещь, взятая раньше ответа сервера, не двоится |
-| **Проверки** | На каждый коммит: более 300 тестов ядра на Linux и Windows, серверный стенд под санитайзерами, статические проверки, сборка и проверка установщика |
+| **Бой и оружие врагов** | Враги, разбуженные из чекпоинтов `rfab_checkpoints.bin`, сохраняют мечи, луки, стрелы и заклинания; кэш `m_weaponDrawUpdates` больше не убирает оружие у локальных врагов; шаблоны `TESLevItem` разворачиваются до сетевого снимка |
+| **Вылеты вне сессии** | Автоматический `Borderless` для `SSEDisplayTweaks.ini` и `SkyrimCustom.ini` без правки файлов на диске; хук `IDXGISwapChain::ResizeBuffers` и сброс объектов D3D11 ImGui/CEF при Alt-Tab и смене окна |
+| **Диагностика и MO2** | Запись `tp_client.log` и `rfab_coop_config` в реальную папку мода в обход USVFS (`GetFinalPathNameByHandleW`), немедленный сброс логов на диск, сборщик `COLLECT_RFAB_REPORT.bat` и детектор рассинхрона |
+| **Рассинхроны и RFAB** | События хуков привязаны к поколению мира, `Shift+F9` на прошлую точку, продление аренды боссов, память замков, авторитет лута с тел, одиночная награда опыта за задания, удаление саммонов и личные торговцы |
+| **Проверки** | 318 тестов ядра на Linux и Windows, 23 интеграционные сцены `GameServer`, санитайзеры ASan/UBSan, статические проверки и smoke-проверка установщика |
 
 Полный список — в [`CHANGELOG.md`](CHANGELOG.md), разбор каждого дефекта — в [`docs/DEFECT_REGISTRY.md`](docs/DEFECT_REGISTRY.md).
 
@@ -79,16 +79,16 @@
 
 | Файл | Назначение |
 |---|---|
-| `RFAB_Online_v4.1.1_Full_Installer.zip` | Полная установка или чистое обновление: клиент для MO2, интерфейс, выделенный сервер |
-| `RFAB_Online_v4.1.1_Quick_Update.zip` | Быстрое обновление поверх уже установленной версии |
-| `RFAB_Online_v4.1.1_PDB_Symbols.zip` | Отладочные символы; нужны только для разбора вылета |
+| `RFAB_Online_v4.1.2_Full_Installer.zip` | Полная установка или чистое обновление: клиент для MO2, интерфейс, выделенный сервер |
+| `RFAB_Online_v4.1.2_Quick_Update.zip` | Быстрое обновление поверх уже установленной версии |
+| `RFAB_Online_v4.1.2_PDB_Symbols.zip` | Отладочные символы; нужны только для разбора вылета |
 | `SHA256SUMS.txt` | Контрольные суммы архивов |
 
 Сборки отдельных коммитов между релизами прикладываются к прогонам CI: как их взять, описано в [`docs/PLAYTEST.md`](docs/PLAYTEST.md), раздел 1.
 
 ### 1. Установка (одинаково для хоста и гостей)
 
-1. Распакуйте `RFAB_Online_v4.1.1_Full_Installer.zip` в любую временную папку.
+1. Распакуйте `RFAB_Online_v4.1.2_Full_Installer.zip` в любую временную папку.
 2. Закройте игру и Mod Organizer 2, запустите **`INSTALL_RFAB_ONLINE.bat`** и укажите папку сборки RFAB.
 3. Установщик удалит файлы прошлых версий, сохранит ваш `STServer.ini`, поставит клиент в MO2 и выделенный сервер в `<Папка_RFAB>\RFAB_Online_Server` с ярлыком **`START_RFAB_SERVER.bat`**.
 
@@ -208,7 +208,7 @@
 
 RFAB Together is a co-op multiplayer mod for Skyrim Special Edition `1.5.97`, tailored to the Requiem for a Balance (RFAB) modpack. It is built on Skyrim Together Reborn (Tilted Online).
 
-Version `4.1.1` is a playtest build: its fixes were found by code reading and on an in-process server test bench, and they have not been verified in the game yet. Builds are published on the Releases page. The documentation is in Russian.
+Version `4.1.2` fixes enemy weapon/spell loss on checkpoint wake-up, local NPC weapon-sheathing interference, offline D3D11/Exclusive Fullscreen crashes, and MO2 USVFS log routing reported in the first playtest. Builds are published on the Releases page. The documentation is in Russian.
 
 </details>
 

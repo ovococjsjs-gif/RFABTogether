@@ -57,7 +57,26 @@ void Hook_Renderer_Init(Renderer* self, BSGraphics::RendererInitOSData* aOSData,
     RealWndProc = aOSData->pWndProc;
     aOSData->pWndProc = Hook_WndProc;
 
-    Renderer_Init(self, aOSData, aFBData, aOut);
+    // DXGI Exclusive Fullscreen (bFull Screen=1 / SwapEffect=discard) conflicts with the D3D11/CEF
+    // overlay on mode transitions, Alt-Tab, and multi-adapter/virtual-display setups; force borderless
+    // windowed presentation so both offline menus/gameplay and online sessions stay crash-free.
+    BSGraphics::ApplicationWindowProperties safeProps{};
+    const BSGraphics::ApplicationWindowProperties* pEffectiveProps = aFBData;
+    if (aFBData && aFBData->bFullScreen)
+    {
+        safeProps = *aFBData;
+        safeProps.bFullScreen = false;
+        safeProps.bBorderlessWindow = true;
+        pEffectiveProps = &safeProps;
+        if (self)
+        {
+            self->Data.bFullScreen = 0;
+            self->Data.bAppFullScreen = false;
+            self->Data.bBorderlessWindow = true;
+        }
+    }
+
+    Renderer_Init(self, aOSData, pEffectiveProps, aOut);
 
     g_sRs = &World::Get().ctx().at<RenderSystemD3D11>();
     // This how the game does it too

@@ -4955,6 +4955,183 @@ int main(int argc, char** argv)
         std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
     }
 
+    // =========================================================================================
+    // Scene 23: checkpoint-hydrated dormant enemies keep their weapons & spells upon wake-up
+    // =========================================================================================
+    {
+        std::printf("[scene 23] checkpoint-hydrated dormant enemies keep their weapons and spells\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xF801u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xF802u;
+        const GameId kFort{0u, 0x00131001u};
+        const GameId kBanditRef{0u, 0x00132001u};
+        const GameId kBanditBase{0u, 0x00039CF4u};
+        const GameId kMageRef{0u, 0x00132002u};
+        const GameId kMageBase{0u, 0x00039CF5u};
+        const GameId kIronSword{0u, 0x00012EB7u};
+        const GameId kHuntingBow{0u, 0x00013985u};
+        const GameId kIronArrow{0u, 0x0001397Du};
+        const GameId kIceSpike{0u, 0x0002B96Cu};
+
+        // Hydrate two persistent dungeon enemies as SaveSnapshotService does from rfab_checkpoints.bin
+        // (position + health only, no stored inventory).
+        const entt::entity banditEntity = world.GetCharacterService().EnsureDormantPersistentCharacter(
+            kBanditRef, kBanditBase, kFort, GameId{}, GridCellCoords{},
+            glm::vec3{120.f, 240.f, 10.f}, glm::vec3{0.f, 0.f, 1.5f},
+            /*aIsDead=*/false, /*aCurrentHealth=*/180.f, /*aMaxHealth=*/250.f);
+        const entt::entity mageEntity = world.GetCharacterService().EnsureDormantPersistentCharacter(
+            kMageRef, kMageBase, kFort, GameId{}, GridCellCoords{},
+            glm::vec3{160.f, 260.f, 10.f}, glm::vec3{0.f, 0.f, 1.5f},
+            /*aIsDead=*/false, /*aCurrentHealth=*/140.f, /*aMaxHealth=*/140.f);
+
+        Check(banditEntity != entt::null && mageEntity != entt::null &&
+                  !world.get<InventoryComponent>(banditEntity).HasSeededInventory &&
+                  !world.get<InventoryComponent>(mageEntity).HasSeededInventory,
+              "both persistent enemies start dormant with unseeded checkpoint inventories");
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 14.0f;
+        t0.Day = 8;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+
+        // Both players enter the fort interior cell.
+        EnterInteriorCellRequest enterCell{};
+        enterCell.CellId = kFort;
+        Harness::ClearOutbox();
+        (void)DeliverWire(world, enterCell, pHost);
+        const auto hostTransfers = DecodeOutboxMessagesFor<NotifyOwnershipTransfer>(kHostConn);
+        const uint32_t banditServerId = World::ToInteger(banditEntity);
+        const uint32_t mageServerId = World::ToInteger(mageEntity);
+        uint64_t banditEpoch = 0;
+        for (const auto& tr : hostTransfers)
+            if (tr.ServerId == banditServerId)
+                banditEpoch = tr.OwnershipEpoch;
+        Check(banditEpoch != 0, "entering the fort wakes the dormant bandit and grants ownership to the host");
+
+        Harness::ClearOutbox();
+        (void)DeliverWire(world, enterCell, pGuest);
+
+        // 1. Host's client kept its live bandit weapons (ShouldApplyWholesaleActorInventory rejected the
+        //    unseeded empty spawn) and sends RequestOwnershipClaim with sword + bow + arrows.
+        Inventory armedBanditInv{};
+        {
+            Inventory::Entry sword{};
+            sword.BaseId = kIronSword;
+            sword.Count = 1;
+            sword.ExtraWorn = true;
+            armedBanditInv.Entries.push_back(sword);
+
+            Inventory::Entry bow{};
+            bow.BaseId = kHuntingBow;
+            bow.Count = 1;
+            armedBanditInv.Entries.push_back(bow);
+
+            Inventory::Entry arrows{};
+            arrows.BaseId = kIronArrow;
+            arrows.Count = 24;
+            armedBanditInv.Entries.push_back(arrows);
+        }
+
+        RequestOwnershipClaim claimBandit{};
+        claimBandit.ServerId = banditServerId;
+        claimBandit.NewActorData.BaseId = kBanditBase;
+        claimBandit.NewActorData.InitialInventory = armedBanditInv;
+        claimBandit.NewActorData.InitialActorValues.ActorValuesList[24] = 250.0f;
+        claimBandit.NewActorData.InitialActorValues.ActorMaxValuesList[24] = 250.0f;
+        claimBandit.NewActorData.IsDead = false;
+        claimBandit.NewActorData.IsWeaponDrawn = true;
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, claimBandit, pHost), "the host claims the woken bandit with its full RFAB weapon loadout");
+
+        const auto& serverBanditInv = world.get<InventoryComponent>(banditEntity);
+        GameId swordLookup = kIronSword;
+        GameId bowLookup = kHuntingBow;
+        GameId arrowLookup = kIronArrow;
+        Check(serverBanditInv.HasSeededInventory &&
+                  serverBanditInv.Content.GetEntryCountById(swordLookup) == 1 &&
+                  serverBanditInv.Content.GetEntryCountById(bowLookup) == 1 &&
+                  serverBanditInv.Content.GetEntryCountById(arrowLookup) == 24,
+              "the server stores the bandit's sword, bow, and 24 arrows as seeded inventory");
+
+        float reconciledBanditHp = 0.0f;
+        Check(world.get<ActorValuesComponent>(banditEntity).TryGetHealth(reconciledBanditHp) &&
+                  std::fabs(reconciledBanditHp - 180.0f) < 0.05f,
+              "checkpoint battle damage (180/250 HP) is preserved when the bandit's weapons are seeded");
+
+        const auto guestBanditSync = DecodeOutboxMessagesFor<NotifySpawnData>(kGuestConn);
+        bool guestGotWeapons = false;
+        for (const auto& sync : guestBanditSync)
+        {
+            if (sync.Id == banditServerId)
+            {
+                Inventory copy = sync.NewActorData.InitialInventory;
+                guestGotWeapons = (copy.GetEntryCountById(swordLookup) == 1 &&
+                                   copy.GetEntryCountById(bowLookup) == 1 &&
+                                   copy.GetEntryCountById(arrowLookup) == 24);
+            }
+        }
+        Check(guestGotWeapons, "the guest in the same cell receives the bandit's full weapon loadout");
+
+        // 2. A transient empty snapshot on a living NPC must never strip the server's seeded weapons.
+        RequestOwnershipClaim bogusEmptyClaim{};
+        bogusEmptyClaim.ServerId = banditServerId;
+        bogusEmptyClaim.NewActorData.BaseId = kBanditBase;
+        bogusEmptyClaim.NewActorData.InitialActorValues.ActorValuesList[24] = 180.0f;
+        bogusEmptyClaim.NewActorData.InitialActorValues.ActorMaxValuesList[24] = 250.0f;
+        bogusEmptyClaim.NewActorData.IsDead = false;
+        Harness::ClearOutbox();
+        (void)DeliverWire(world, bogusEmptyClaim, pHost);
+        Check(world.get<InventoryComponent>(banditEntity).Content.GetEntryCountById(swordLookup) == 1,
+              "an empty snapshot for a living enemy does not wipe the bandit's weapons on the server");
+
+        // 3. AssignCharacterRequest on the dormant spellcaster (0 physical items, equipped Destruction spell)
+        //    seeds CurrentMagicEquipment and broadcasts it to the guest.
+        AssignCharacterRequest assignMage{};
+        assignMage.Cookie = 2301u;
+        assignMage.ReferenceId = kMageRef;
+        assignMage.FormId = kMageBase;
+        assignMage.CellId = kFort;
+        assignMage.CurrentActorData.InitialInventory.CurrentMagicEquipment.RightHandSpell = kIceSpike;
+        assignMage.CurrentActorData.InitialActorValues.ActorValuesList[24] = 140.0f;
+        assignMage.CurrentActorData.InitialActorValues.ActorValuesList[25] = 320.0f;
+        assignMage.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 140.0f;
+        assignMage.CurrentActorData.IsDead = false;
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, assignMage, pHost), "the host registers the woken mage carrying an equipped Destruction spell");
+
+        const auto mageResponses = DecodeOutboxMessagesFor<AssignCharacterResponse>(kHostConn);
+        Check(mageResponses.size() == 1 &&
+                  mageResponses[0].ServerId == mageServerId &&
+                  mageResponses[0].CurrentInventory.CurrentMagicEquipment.RightHandSpell == kIceSpike &&
+                  world.get<InventoryComponent>(mageEntity).HasSeededInventory,
+              "AssignCharacterResponse echoes the mage's equipped Ice Spike spell instead of an empty inventory");
+
+        const auto guestMageSync = DecodeOutboxMessagesFor<NotifySpawnData>(kGuestConn);
+        bool guestGotMageSpell = false;
+        for (const auto& sync : guestMageSync)
+        {
+            if (sync.Id == mageServerId &&
+                sync.NewActorData.InitialInventory.CurrentMagicEquipment.RightHandSpell == kIceSpike)
+            {
+                guestGotMageSpell = true;
+            }
+        }
+        Check(guestGotMageSpell, "the guest receives NotifySpawnData with the mage's equipped spell");
+
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+    }
+
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures,
                 g_failures == 1 ? "" : "s");
     return g_failures == 0 ? 0 : 1;

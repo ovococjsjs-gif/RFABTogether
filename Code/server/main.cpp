@@ -103,9 +103,9 @@ GS_EXPORT UniquePtr<IGameServerInstance> CreateGameServer(Console::ConsoleRegist
 
 GS_EXPORT void SetDefaultLogger(std::shared_ptr<spdlog::logger> aLogger)
 {
-    // #ifdef _WIN32
+    if (aLogger)
+        aLogger->flush_on(spdlog::level::info);
     spdlog::set_default_logger(std::move(aLogger));
-    // #endif
 }
 
 GS_EXPORT void RegisterLogger(std::shared_ptr<spdlog::logger> aLogger)
