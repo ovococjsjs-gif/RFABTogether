@@ -82,6 +82,11 @@ Console::Setting bEnableDesyncAutoRepair{"Gameplay:bEnableDesyncAutoRepair",
 // Off restores 4.1.0, where such an event ran after the reload.
 Console::Setting bEnableWorldScopedHookEvents{"Gameplay:bEnableWorldScopedHookEvents",
                                               "Clients drop gameplay events that were produced before or during a coordinated reload", true};
+// On: a quest's RFAB XP reaches each player once also when the partner's copy of the award
+// arrives before the player's own quest script pays (common/CoopExperienceLedger.h, order C).
+// Off restores 4.1.0, where that order paid the player twice.
+Console::Setting bEnableQuestXpSingleAward{"Gameplay:bEnableQuestXpSingleAward",
+                                           "A quest's RFAB XP is paid once per player, whichever copy of the award arrives first", true};
 extern Console::Setting<bool> bEnableItemDrops;
 extern Console::Setting<bool> bEnableXpSync;
 extern Console::Setting<bool> bEnableRfabXpSync;
@@ -243,6 +248,7 @@ uint32_t GetDisabledCoopFeatureMask() noexcept
     mask = Session::WithFeature(mask, Feature::kPeacefulNpcsUnscaled, bEnablePeacefulNpcsUnscaled);
     mask = Session::WithFeature(mask, Feature::kDesyncDetector, bEnableDesyncDetector);
     mask = Session::WithFeature(mask, Feature::kWorldScopedHookEvents, bEnableWorldScopedHookEvents);
+    mask = Session::WithFeature(mask, Feature::kQuestXpSingleAward, bEnableQuestXpSingleAward);
     return mask;
 }
 

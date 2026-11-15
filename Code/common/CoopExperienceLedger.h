@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 namespace CoopExperienceLedger
@@ -9,6 +10,26 @@ namespace CoopExperienceLedger
 inline constexpr uint32_t kMaxRfabXpDelta = 1'000'000u;
 inline constexpr uint64_t kQuestXpWindowDurationMs = 4000ULL;
 inline constexpr uint64_t kPrematureRemoteXpLookbackMs = 3000ULL;
+// How many of the partner's awards, applied while a quest window was open, are remembered.
+inline constexpr size_t kMaxRemoteAwardsRememberedInQuestWindow = 4;
+
+/**
+ * Do two awards describe the same quest reward? Both players start from the same number in the
+ * modpack's Quests.ini; what differs is each player's personal multiplier and the rounding to 5 XP
+ * on the way (the sender divides and snaps, the receiver multiplies and floors). Two percent of the
+ * larger award, and never less than 5 XP, covers that rounding. An award that differs by more is a
+ * different award: a kill that happened to fall into the same seconds is not taken for the quest.
+ */
+[[nodiscard]] constexpr bool IsSameQuestAward(int32_t aLocalGain, int32_t aRemoteAward) noexcept
+{
+    if (aLocalGain <= 0 || aRemoteAward <= 0)
+        return false;
+
+    const int32_t larger = aLocalGain > aRemoteAward ? aLocalGain : aRemoteAward;
+    const int32_t smaller = aLocalGain > aRemoteAward ? aRemoteAward : aLocalGain;
+    const int32_t tolerance = larger / 50 > 5 ? larger / 50 : 5;
+    return (larger - smaller) <= tolerance;
+}
 
 /**
  * Normalizes a local RFAB XP gain by dividing out the sender's personal RFAB_XP_Multiplier
@@ -56,9 +77,16 @@ inline constexpr uint64_t kPrematureRemoteXpLookbackMs = 3000ULL;
 /**
  * Deterministic client-side ledger for bidirectional RFAB XP synchronization:
  * - Suppresses wallet baseline churn while CustomSkills / RFAB_Menu ("CustomMenu") is open.
- * - Deduplicates quest stage XP across BOTH packet arrival orders:
- *   (A) Local synced quest stage runs first -> absorbs matching incoming NotifySyncRfabExperience.
- *   (B) NotifySyncRfabExperience arrives first -> refunds premature credit when synced quest stage fires locally.
+ * - Deduplicates quest stage XP across the packet arrival orders. The modpack pays quest XP from
+ *   the quest's stage fragment, so it is paid on every client that applies the stage, and the wallet
+ *   sharing would pay it a second time. With S = the synced stage is applied here, L = the local
+ *   script's award is seen by the wallet poll, R = the partner's copy of the award arrives:
+ *   (A) S, L, R -> R is absorbed by the local award already seen.
+ *   (B) R, S, L -> R was applied early; it is taken back when L arrives.
+ *   (C) S, R, L -> R is applied (nothing local to absorb it yet) and remembered; when L arrives with
+ *       the same amount, R is taken back. 4.1.0 did not have this order and paid both. It is as
+ *       likely as (A): R and L leave the two clients within the same fraction of a second.
+ *       Controlled by SetNetRemoteAwardsInsideQuestWindow, off by default in this class.
  */
 class ClientRfabXpTracker
 {
@@ -79,6 +107,15 @@ public:
         m_lastAppliedRemoteXpTimeMs = 0;
         m_hasLastAppliedRemoteXp = false;
         m_creditToRefundOnLocalQuestXp = 0;
+        m_remoteAwardCountInWindow = 0;
+    }
+
+    // Order (C) of the class comment. Off, the tracker behaves exactly as in 4.1.0.
+    void SetNetRemoteAwardsInsideQuestWindow(bool aEnabled) noexcept
+    {
+        m_netRemoteAwardsInsideQuestWindow = aEnabled;
+        if (!aEnabled)
+            m_remoteAwardCountInWindow = 0;
     }
 
     void OnRemoteQuestStageApplied(uint64_t aNowMs) noexcept
@@ -127,6 +164,19 @@ public:
         }
 
         m_lastWallet += aAppliedDelta;
+
+        if (m_netRemoteAwardsInsideQuestWindow && aAppliedDelta > 0 && IsInQuestWindow(aNowMs))
+        {
+            // Order (C): the stage is already applied here and the partner's award came before
+            // the local script paid. It is remembered for the local award, and for nothing else:
+            // a second update of the same quest (a stage and then "stopped" is the usual pair)
+            // must not count it once more through the look-back of order (B).
+            RememberRemoteAwardInWindow(aAppliedDelta, aNowMs);
+            m_lastAppliedRemoteXpAmount = 0;
+            m_hasLastAppliedRemoteXp = false;
+            return;
+        }
+
         m_lastAppliedRemoteXpAmount = aAppliedDelta;
         m_lastAppliedRemoteXpTimeMs = aNowMs;
         m_hasLastAppliedRemoteXp = true;
@@ -159,6 +209,7 @@ public:
         {
             m_localQuestXpGainedInWindow = 0;
             m_creditToRefundOnLocalQuestXp = 0;
+            m_remoteAwardCountInWindow = 0;
         }
 
         if (!m_initialized)
@@ -190,6 +241,18 @@ public:
             }
 
             if (delta > 0)
+            {
+                if (const int32_t remoteAward = TakeRemoteAwardMatching(delta, aNowMs); remoteAward > 0)
+                {
+                    // Order (C): the partner's copy of this award was applied first. Taking that
+                    // copy back leaves exactly what the local quest script paid. The local award is
+                    // settled by it and absorbs no later packet.
+                    out.RefundToApply += remoteAward;
+                    delta = 0;
+                }
+            }
+
+            if (delta > 0)
                 m_localQuestXpGainedInWindow += delta;
 
             return out;
@@ -218,11 +281,50 @@ public:
     [[nodiscard]] int32_t GetLastWallet() const noexcept { return m_lastWallet; }
     [[nodiscard]] int32_t GetLocalQuestXpGainedInWindow() const noexcept { return m_localQuestXpGainedInWindow; }
     [[nodiscard]] int32_t GetCreditToRefundOnLocalQuestXp() const noexcept { return m_creditToRefundOnLocalQuestXp; }
+    [[nodiscard]] size_t GetRemoteAwardsRememberedInWindow() const noexcept { return m_remoteAwardCountInWindow; }
 
 private:
+    struct RemoteAward
+    {
+        int32_t Amount{0};
+        uint64_t AppliedAtMs{0};
+    };
+
     [[nodiscard]] bool IsInQuestWindow(uint64_t aNowMs) const noexcept
     {
         return m_hasRemoteQuestXpWindow && aNowMs <= m_remoteQuestXpWindowUntilMs;
+    }
+
+    void RememberRemoteAwardInWindow(int32_t aAmount, uint64_t aNowMs) noexcept
+    {
+        if (m_remoteAwardCountInWindow == kMaxRemoteAwardsRememberedInQuestWindow)
+        {
+            // Full: the oldest award is the least likely to still meet its local twin.
+            for (size_t i = 1; i < m_remoteAwardCountInWindow; ++i)
+                m_remoteAwardsInWindow[i - 1] = m_remoteAwardsInWindow[i];
+            --m_remoteAwardCountInWindow;
+        }
+        m_remoteAwardsInWindow[m_remoteAwardCountInWindow++] = RemoteAward{aAmount, aNowMs};
+    }
+
+    // Removes and returns the remembered award that is the same quest reward as `aLocalGain`,
+    // or 0. An award older than one window is not a candidate even if later stage updates kept
+    // the window open.
+    [[nodiscard]] int32_t TakeRemoteAwardMatching(int32_t aLocalGain, uint64_t aNowMs) noexcept
+    {
+        for (size_t i = 0; i < m_remoteAwardCountInWindow; ++i)
+        {
+            const RemoteAward award = m_remoteAwardsInWindow[i];
+            const bool recent = aNowMs >= award.AppliedAtMs && (aNowMs - award.AppliedAtMs) <= kQuestXpWindowDurationMs;
+            if (!recent || !IsSameQuestAward(aLocalGain, award.Amount))
+                continue;
+
+            for (size_t j = i + 1; j < m_remoteAwardCountInWindow; ++j)
+                m_remoteAwardsInWindow[j - 1] = m_remoteAwardsInWindow[j];
+            --m_remoteAwardCountInWindow;
+            return award.Amount;
+        }
+        return 0;
     }
 
     int32_t m_lastWallet{0};
@@ -234,5 +336,8 @@ private:
     uint64_t m_lastAppliedRemoteXpTimeMs{0};
     bool m_hasLastAppliedRemoteXp{false};
     int32_t m_creditToRefundOnLocalQuestXp{0};
+    bool m_netRemoteAwardsInsideQuestWindow{false};
+    RemoteAward m_remoteAwardsInWindow[kMaxRemoteAwardsRememberedInQuestWindow]{};
+    size_t m_remoteAwardCountInWindow{0};
 };
 } // namespace CoopExperienceLedger

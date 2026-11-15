@@ -45,9 +45,10 @@ enum class Feature : uint32_t
     kPeacefulNpcsUnscaled = 1u << 9,   // enemy health scaling skips creatures that never start a fight
     kDesyncDetector = 1u << 10,        // clients report what they believe about each character (EntityDigest.h)
     kWorldScopedHookEvents = 1u << 11, // hook events die with the world they were posted in (MainThreadQueue.h)
+    kQuestXpSingleAward = 1u << 12,    // quest XP is paid once in every arrival order (CoopExperienceLedger.h)
 };
 
-inline constexpr uint32_t kAllKnownFeatureBits = 0xFFFu;
+inline constexpr uint32_t kAllKnownFeatureBits = 0x1FFFu;
 
 struct FeatureInfo
 {
@@ -55,7 +56,7 @@ struct FeatureInfo
     std::string_view Name;  // stable, used in logs and in the server console listing
 };
 
-inline constexpr std::array<FeatureInfo, 12> kFeatureTable{{
+inline constexpr std::array<FeatureInfo, 13> kFeatureTable{{
     {Feature::kDownedSystem, "DownedSystem"},
     {Feature::kCoordinatedSaves, "CoordinatedSaves"},
     {Feature::kTacticalHud, "TacticalHud"},
@@ -68,6 +69,7 @@ inline constexpr std::array<FeatureInfo, 12> kFeatureTable{{
     {Feature::kPeacefulNpcsUnscaled, "PeacefulNpcsUnscaled"},
     {Feature::kDesyncDetector, "DesyncDetector"},
     {Feature::kWorldScopedHookEvents, "WorldScopedHookEvents"},
+    {Feature::kQuestXpSingleAward, "QuestXpSingleAward"},
 }};
 
 [[nodiscard]] constexpr uint32_t Bit(Feature aFeature) noexcept

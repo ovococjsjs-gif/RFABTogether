@@ -176,6 +176,10 @@ void CharacterService::RunRfabExperienceUpdates() noexcept
     if (pRfabXp == nullptr)
         return;
 
+    // Gameplay:bEnableQuestXpSingleAward on the server. Off: the tracker pays a quest award twice
+    // when the partner's copy arrives before the local quest script pays, as 4.1.0 did.
+    m_rfabXpTracker.SetNetRemoteAwardsInsideQuestWindow(World::IsFeatureEnabled(Session::Feature::kQuestXpSingleAward));
+
     const int32_t currentExperience = ReadRfabXpWallet(pRfabXp);
     bool isCustomSkillMenuOpen = false;
     if (auto* pUi = UI::Get(); pUi && pUi->GetMenuOpen(BSFixedString("CustomMenu")))

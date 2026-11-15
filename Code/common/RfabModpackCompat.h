@@ -2235,6 +2235,11 @@ struct CoopAllyActionPolicy
         "req_",
         "rfab_mcm",
         "rfab_xp",
+        // RFAB_Origin_Main: the start menu sets a stage of it for the chosen origin
+        // (RFAB_Origin.Choose), and the stage's script pays that origin's personal bonus
+        // (Quest_Origin_Main: enchantments known from the start). One player's origin is not
+        // another player's.
+        "rfab_origin",
         "rfab_init",
         "rfab_setup",
         "rfab_menu",
