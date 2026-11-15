@@ -38,6 +38,15 @@ void RunnerService::QueueForThisWorld(std::function<void()> aFunctor) noexcept
     WarnOverflow();
 }
 
+bool RunnerService::RejectIfSimulationLaneFull() noexcept
+{
+    if (!m_queue.TryRejectIfFull(Session::Lane::kSimulation, m_lifecycle.IsWorldLoadingAnyThread()))
+        return false;
+
+    WarnOverflow();
+    return true;
+}
+
 void RunnerService::WarnOverflow() noexcept
 {
     // Overflow means the simulation lane has not been drained for a long time; say so a few times.

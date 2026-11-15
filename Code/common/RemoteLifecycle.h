@@ -139,14 +139,22 @@ enum class GrantAction : uint8_t
     bool aEntityExists,
     bool aActorIsRemoteHere,
     bool aActorIsLocalHere,
-    bool aIsQueuedForMaterialization) noexcept
+    bool aIsQueuedForMaterialization,
+    bool aIsWaitingFor3DNotReady = false) noexcept
 {
     if (!aEntityExists)
         return aIsQueuedForMaterialization ? GrantAction::Defer : GrantAction::AskServer;
 
-    // A remote actor we do not simulate: take it.
+    // A remote actor we do not simulate: take it once its 3D has materialized.
+    // If 3D is still streaming while its RemoteEntityModel is queued, defer so RunRemoteUpdates
+    // applies WaitingFor3D (InventoryContent, ActorValues, Factions) BEFORE TakeOwnership sends
+    // BuildActorData(pActor) back to the server (preventing dynamic/streaming NPC weapon loss).
     if (aActorIsRemoteHere && !aActorIsLocalHere)
+    {
+        if (aIsWaitingFor3DNotReady && aIsQueuedForMaterialization)
+            return GrantAction::Defer;
         return GrantAction::TakeOver;
+    }
 
     // Already ours: renew, never evict ourselves.
     if (aActorIsLocalHere)

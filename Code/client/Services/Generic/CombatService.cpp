@@ -364,8 +364,7 @@ void CombatService::RunTargetUpdates(const float acDelta) const noexcept
 
     TiltedPhoques::Vector<uint32_t> peerFormIds;
     m_world.GetRfabAdapterService().CollectPartyPeerActorFormIds(peerFormIds);
-    if (peerFormIds.empty())
-        return;
+    peerFormIds.push_back(pLocalPlayer->formID);
 
     auto localActors = m_world.view<FormIdComponent, LocalComponent>();
     for (const entt::entity npcEntity : localActors)

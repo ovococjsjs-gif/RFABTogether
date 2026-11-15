@@ -1,4 +1,5 @@
 #include <Services/PartyService.h>
+#include <Services/CharacterService.h>
 #include <Services/RfabAdapterService.h>
 #include <Services/TransportService.h>
 #include <Services/WeatherService.h>
@@ -139,8 +140,12 @@ void PartyService::OnPartyInfo(const NotifyPartyInfo& acPartyInfo) noexcept
         if (TESGlobal* pWorldEncountersEnabled = Cast<TESGlobal>(TESForm::GetById(0xB8EC1)))
             pWorldEncountersEnabled->f = acPartyInfo.IsLeader ? 1.f : 0.f;
 
-        if (wasLeader != acPartyInfo.IsLeader && m_world.ctx().contains<WeatherService>())
-            m_world.ctx().at<WeatherService>().OnPartyLeadershipChanged(acPartyInfo.IsLeader);
+        if (wasLeader != acPartyInfo.IsLeader)
+        {
+            if (m_world.ctx().contains<WeatherService>())
+                m_world.ctx().at<WeatherService>().OnPartyLeadershipChanged(acPartyInfo.IsLeader);
+            m_world.GetCharacterService().OnPartyLeadershipChanged(acPartyInfo.IsLeader);
+        }
 
         auto pArguments = CefListValue::Create();
 

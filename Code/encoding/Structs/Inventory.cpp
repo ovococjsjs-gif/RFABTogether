@@ -89,7 +89,7 @@ void Inventory::Entry::Deserialize(TiltedPhoques::Buffer::Reader& aReader) noexc
 
 bool Inventory::operator==(const Inventory& acRhs) const noexcept
 {
-    return Entries == acRhs.Entries;
+    return Entries == acRhs.Entries && CurrentMagicEquipment == acRhs.CurrentMagicEquipment;
 }
 
 bool Inventory::operator!=(const Inventory& acRhs) const noexcept
@@ -216,28 +216,62 @@ void Inventory::AddOrRemoveEntry(const Entry& acEntry) noexcept
 
 void Inventory::UpdateEquipment(const Inventory& acNewInventory) noexcept
 {
-    while (true)
+    for (auto& existing : Entries)
     {
-        auto wornEntry = std::find_if(Entries.begin(), Entries.end(), [](auto& aEntry) { return aEntry.IsWorn(); });
-        if (wornEntry == Entries.end())
-            break;
-
-        wornEntry->ExtraWorn = wornEntry->ExtraWornLeft = false;
+        existing.ExtraWorn = false;
+        existing.ExtraWornLeft = false;
     }
 
     for (const auto& newEntry : acNewInventory.Entries)
     {
-        if (!newEntry.IsWorn())
+        if (!newEntry.IsWorn() || newEntry.BaseId == GameId{})
             continue;
 
-        auto entry = std::find_if(Entries.begin(), Entries.end(), [&newEntry](auto& aEntry) { return aEntry.BaseId == newEntry.BaseId; });
+        // 1. Prefer an entry with the same BaseId that has not yet been marked worn in this pass
+        //    (handles two separate Count=1 entries for dual-wielded identical 1H weapons).
+        auto entry = std::find_if(
+            Entries.begin(),
+            Entries.end(),
+            [&newEntry](const Entry& aEntry) {
+                return aEntry.BaseId == newEntry.BaseId && aEntry.Count > 0 && !aEntry.IsWorn();
+            });
 
-        // This shouldn't happen
+        // 2. Otherwise match a stacked entry (Count >= 2) or idempotent duplicate for the other hand.
         if (entry == Entries.end())
-            continue;
+        {
+            entry = std::find_if(
+                Entries.begin(),
+                Entries.end(),
+                [&newEntry](const Entry& aEntry) {
+                    if (aEntry.BaseId != newEntry.BaseId || aEntry.Count <= 0)
+                        return false;
+                    if (aEntry.Count >= 2)
+                        return (newEntry.ExtraWorn && !aEntry.ExtraWorn) ||
+                               (newEntry.ExtraWornLeft && !aEntry.ExtraWornLeft);
+                    return (newEntry.ExtraWorn == aEntry.ExtraWorn) &&
+                           (newEntry.ExtraWornLeft == aEntry.ExtraWornLeft);
+                });
+        }
 
-        entry->ExtraWorn = newEntry.ExtraWorn;
-        entry->ExtraWornLeft = newEntry.ExtraWornLeft;
+        // 3. Skyrim's InitOutfitItems / InitLeveledItems populates NPC weapons, bows, arrows, and
+        //    armor directly into ExtraContainerChanges without calling Actor::AddInventoryItem (SE 36525).
+        //    Never drop a newly equipped weapon/armor item when Entries did not have it yet — upsert it
+        //    so subsequent ownership transfers, leader switches, and reconnects keep the NPC armed!
+        if (entry == Entries.end())
+        {
+            Entry inserted = newEntry;
+            if (inserted.Count <= 0)
+                inserted.Count = 1;
+            Entries.push_back(std::move(inserted));
+            continue;
+        }
+
+        if (newEntry.ExtraWorn)
+            entry->ExtraWorn = true;
+        if (newEntry.ExtraWornLeft)
+            entry->ExtraWornLeft = true;
+        if (newEntry.Count > entry->Count)
+            entry->Count = newEntry.Count;
     }
 
     CurrentMagicEquipment = acNewInventory.CurrentMagicEquipment;

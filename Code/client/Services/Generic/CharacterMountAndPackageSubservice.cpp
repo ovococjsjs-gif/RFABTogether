@@ -360,13 +360,44 @@ void CharacterService::OnNotifyActorTeleport(const NotifyActorTeleport& acMessag
 
 void CharacterService::OnPartyJoinedEvent(const PartyJoinedEvent& acEvent) noexcept
 {
-    if (acEvent.IsLeader)
-    {
-        auto view = m_world.view<FormIdComponent>(entt::exclude<ObjectComponent>);
-        Vector<entt::entity> entities(view.begin(), view.end());
+    if (!m_transport.IsOnline())
+        return;
 
-        for (auto entity : entities)
-            ProcessNewEntity(entity);
+    auto view = m_world.view<FormIdComponent>(entt::exclude<ObjectComponent>);
+    Vector<entt::entity> entities(view.begin(), view.end());
+
+    for (const entt::entity entity : entities)
+    {
+        if (!m_world.valid(entity) || !m_world.all_of<FormIdComponent>(entity))
+            continue;
+
+        if (!acEvent.IsLeader)
+        {
+            const uint32_t formId = m_world.get<FormIdComponent>(entity).Id;
+            if (Actor* pActor = Cast<Actor>(TESForm::GetById(formId)))
+            {
+                if (DespawnSuppressedNonLeaderWildTempSpawn(pActor, entity))
+                    continue;
+            }
+        }
+
+        ProcessNewEntity(entity);
+    }
+}
+
+void CharacterService::OnPartyLeadershipChanged(const bool aIsLeader) noexcept
+{
+    if (!aIsLeader || !m_transport.IsOnline())
+        return;
+
+    auto view = m_world.view<FormIdComponent>(entt::exclude<ObjectComponent>);
+    Vector<entt::entity> entities(view.begin(), view.end());
+
+    for (const entt::entity entity : entities)
+    {
+        if (!m_world.valid(entity) || !m_world.all_of<FormIdComponent>(entity))
+            continue;
+        ProcessNewEntity(entity);
     }
 }
 

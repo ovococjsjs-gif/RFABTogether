@@ -120,6 +120,7 @@ struct CharacterService final : Session::IParticipant
     void OnNotifyActorTeleport(const NotifyActorTeleport& acMessage) noexcept;
     void OnNotifyRelinquishControl(const NotifyRelinquishControl& acMessage) noexcept;
     void OnPartyJoinedEvent(const PartyJoinedEvent& acEvent) noexcept;
+    void OnPartyLeadershipChanged(bool aIsLeader) noexcept;
 
     void ProcessNewEntity(entt::entity aEntity) const noexcept;
     void ApplyAuthoritativeRfabXpDelta(int32_t aDelta) noexcept;

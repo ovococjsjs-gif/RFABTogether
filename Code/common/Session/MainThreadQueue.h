@@ -256,6 +256,37 @@ public:
         return aLane < Lane::kCount ? m_lanes[static_cast<size_t>(aLane)].Capacity : 0;
     }
 
+    // Lock-free fast capacity check before allocating a heap-backed std::function<void()> in hot hooks.
+    [[nodiscard]] bool CanPost(Lane aLane) const noexcept
+    {
+        if (aLane >= Lane::kCount)
+            return false;
+        const LaneState& lane = m_lanes[static_cast<size_t>(aLane)];
+        return lane.PendingCount.load(std::memory_order_relaxed) < lane.Capacity;
+    }
+
+    // If the lane is already at capacity (checked under lock so races with Drain() never falsely drop),
+    // records Posted / PostedDuringWorldLoad / DroppedOverflow and returns true so the caller skips
+    // constructing std::function<void()> on the heap.
+    [[nodiscard]] bool TryRejectIfFull(Lane aLane, bool aDuringWorldLoad) noexcept
+    {
+        if (aLane >= Lane::kCount)
+            return true;
+        LaneState& lane = m_lanes[static_cast<size_t>(aLane)];
+        if (lane.PendingCount.load(std::memory_order_relaxed) < lane.Capacity)
+            return false;
+
+        std::lock_guard<std::mutex> lock(lane.Mutex);
+        if (lane.Pending.size() < lane.Capacity)
+            return false;
+
+        lane.Posted.fetch_add(1, std::memory_order_relaxed);
+        if (aDuringWorldLoad)
+            lane.PostedDuringWorldLoad.fetch_add(1, std::memory_order_relaxed);
+        lane.DroppedOverflow.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
 private:
     struct Entry
     {
