@@ -87,6 +87,12 @@ Console::Setting bEnableWorldScopedHookEvents{"Gameplay:bEnableWorldScopedHookEv
 // Off restores 4.1.0, where that order paid the player twice.
 Console::Setting bEnableQuestXpSingleAward{"Gameplay:bEnableQuestXpSingleAward",
                                            "A quest's RFAB XP is paid once per player, whichever copy of the award arrives first", true};
+// On: a merchant's chest, and a container a script opens from another place (RFAB's secure
+// chest), stay each player's own; the client does not register them (RfabCompat::IsPersonalContainer).
+// Off restores 4.1.0: they are shared like a chest of loot, and the server takes back from a trade
+// whatever its copy of the chest does not hold.
+Console::Setting bEnablePersonalMerchantStock{"Gameplay:bEnablePersonalMerchantStock",
+                                              "Merchants' stock and gold, and storage chests opened from another place, are each player's own and not shared", true};
 extern Console::Setting<bool> bEnableItemDrops;
 extern Console::Setting<bool> bEnableXpSync;
 extern Console::Setting<bool> bEnableRfabXpSync;
@@ -249,6 +255,7 @@ uint32_t GetDisabledCoopFeatureMask() noexcept
     mask = Session::WithFeature(mask, Feature::kDesyncDetector, bEnableDesyncDetector);
     mask = Session::WithFeature(mask, Feature::kWorldScopedHookEvents, bEnableWorldScopedHookEvents);
     mask = Session::WithFeature(mask, Feature::kQuestXpSingleAward, bEnableQuestXpSingleAward);
+    mask = Session::WithFeature(mask, Feature::kPersonalMerchantStock, bEnablePersonalMerchantStock);
     return mask;
 }
 

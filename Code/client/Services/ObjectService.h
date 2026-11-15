@@ -27,6 +27,8 @@ class ObjectService final : public BSTEventSink<TESActivateEvent>, public Sessio
 public:
     ObjectService(World&, entt::dispatcher&, TransportService&);
     [[nodiscard]] static bool IsFactionCrimeContainer(uint32_t aFormId) noexcept;
+    // The chest a vendor faction's merchants trade from (VENC). Compares pointers only.
+    [[nodiscard]] static bool IsFactionMerchantContainer(const TESObjectREFR* apContainer) noexcept;
     void RefreshCurrentCellObjectsAfterRollback() noexcept;
     // On-demand registration for containers looted via QuickLootIE (`LootMenu`) or RFAB AutoLoot
     // before `Activate` or initial cell scan registered them with the server.

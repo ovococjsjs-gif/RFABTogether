@@ -99,8 +99,52 @@ bool ObjectService::IsFactionCrimeContainer(const uint32_t aFormId) noexcept
     return false;
 }
 
+bool ObjectService::IsFactionMerchantContainer(const TESObjectREFR* apContainer) noexcept
+{
+    if (!apContainer)
+        return false;
+
+    auto* pModManager = ModManager::Get();
+    if (!pModManager)
+        return false;
+
+    for (uint32_t i = 0; i < pModManager->factions.length; ++i)
+    {
+        const TESFaction* pFaction = pModManager->factions[i];
+        // The pointer is compared and never followed: a faction without a merchant chest holds
+        // null here, and no value of this field can make the check touch other memory.
+        if (pFaction && pFaction->vendorData.merchantContainer == apContainer)
+            return true;
+    }
+
+    return false;
+}
+
 namespace
 {
+// Is the container where the local player can reach it: in his interior cell, or in the worldspace
+// he walks in? Compares the cells themselves and does not ask whether they have finished loading,
+// so the answer is the same at the moment the player enters a cell as a minute later.
+bool IsContainerWherePlayerIs(const TESObjectREFR* apContainer) noexcept
+{
+    const PlayerCharacter* pPlayer = PlayerCharacter::Get();
+    if (!apContainer || !pPlayer)
+        return true;
+
+    const TESObjectCELL* pPlayerCell = pPlayer->GetParentCellEx();
+    if (!pPlayerCell)
+        return true; // between cells: nothing is registered then anyway
+
+    const TESObjectCELL* pContainerCell = apContainer->GetParentCellEx();
+    if (!pContainerCell)
+        return false;
+    if (pContainerCell == pPlayerCell)
+        return true;
+
+    const TESWorldSpace* pPlayerWorld = pPlayer->GetWorldSpace();
+    return pPlayerWorld != nullptr && apContainer->GetWorldSpace() == pPlayerWorld;
+}
+
 bool ShouldSyncObject(const TESObjectREFR* apObject) noexcept
 {
     if (!apObject)
@@ -122,6 +166,21 @@ bool ShouldSyncObject(const TESObjectREFR* apObject) noexcept
         ObjectService::IsFactionCrimeContainer(apObject->formID))
     {
         return false;
+    }
+
+    // Gameplay:bEnablePersonalMerchantStock on the server (defect M27). A merchant's chest and a
+    // container that is not where the player is (a script opened it from somewhere else: RFAB's
+    // secure chest) hold what this player's own game put there. Shared, the first player to touch
+    // one would replace the other player's stock or stored items with his own, and the server
+    // would take back from a trade whatever its copy of the chest did not hold.
+    if (apObject->baseForm && apObject->baseForm->formType == FormType::Container &&
+        World::IsFeatureEnabled(Session::Feature::kPersonalMerchantStock))
+    {
+        RfabCompat::ContainerSyncFacts facts{};
+        facts.IsMerchantContainer = ObjectService::IsFactionMerchantContainer(apObject);
+        facts.IsWherePlayerIs = IsContainerWherePlayerIs(apObject);
+        if (RfabCompat::IsPersonalContainer(facts, true))
+            return false;
     }
 
     return true;
@@ -256,7 +315,8 @@ void ObjectService::OnCellChange(const CellChangeEvent& acEvent) noexcept
     {
         if (!ShouldSyncObject(pObject))
         {
-            spdlog::warn("Excluding sync for {:X}", pObject->formID);
+            // Not a warning: merchants' chests are excluded in every shop, on every visit.
+            spdlog::debug("Excluding sync for {:X}", pObject->formID);
             continue;
         }
 

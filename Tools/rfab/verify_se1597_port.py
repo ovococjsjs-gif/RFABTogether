@@ -77,6 +77,9 @@ EXPECTED_STRUCT_ASSERTS = {
     "Code/client/Games/Skyrim/Combat/CombatController.h": "sizeof(CombatController) == 0xD8",
     "Code/client/Games/Skyrim/Projectiles/Projectile.h": "offsetof(Projectile, fPower) == 0x188",
     "Code/client/Games/TES.h": "offsetof(ModManager, formLists) == 0x898",
+    # The merchant chest of a vendor faction (defect M27). CommonLibSSE: vendorData at 0x0A8,
+    # FACTION_VENDOR_DATA::merchantContainer at +0x28.
+    "Code/client/Games/Skyrim/Forms/TESFaction.h": "offsetof(TESFaction, vendorData.merchantContainer) == 0xD0",
 }
 
 

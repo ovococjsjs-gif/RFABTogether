@@ -114,7 +114,8 @@ PORTABLE_TESTS := \
   $(REPO_ROOT)/Code/tests/rfab_v411_lease_timing.cpp \
   $(REPO_ROOT)/Code/tests/rfab_v411_unlock_memory.cpp \
   $(REPO_ROOT)/Code/tests/rfab_v411_body_loot.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_quest_xp_order.cpp
+  $(REPO_ROOT)/Code/tests/rfab_v411_quest_xp_order.cpp \
+  $(REPO_ROOT)/Code/tests/rfab_v411_personal_containers.cpp
 
 CORE_SRCS     := $(filter-out %MimallocAllocator.cpp,$(wildcard $(TILTEDCORE)/Code/core/src/*.cpp)) \
                  $(TILTEDCORE)/Code/core/src/MimallocAllocator.cpp

@@ -4447,6 +4447,146 @@ int main(int argc, char** argv)
         Check(exists(hostAtronach) && ownerOf(hostAtronach) == pHost && exists(hostChar), "the host and his atronach stay");
     }
 
+    // =========================================================================
+    // Scene 20: a merchant's chest under the rules of a shared chest (work plan 6.4, defect M27).
+    // =========================================================================
+    //
+    // A chest of loot is shared: the first player to register it decides what is in it, and a take
+    // the server's copy cannot cover is taken back from the taker. That is right for loot. A
+    // merchant's chest is filled by each player's own game (RFAB keeps the stock in each player's
+    // save and the game restocks it locally), so the players' copies differ all the time. The scene
+    // shows what the shared rules then do to a trade: the two halves of a trade are separate
+    // packets, and only the half the server cannot cover is undone.
+    //
+    // The server cannot tell a merchant's chest from any other. Since 4.1.1 the client does not
+    // register one (Gameplay:bEnablePersonalMerchantStock); this scene is why.
+    {
+        std::printf("[scene 20] a merchant's chest under the rules of a shared chest\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kFirstConn = 0xF501u;
+        constexpr TiltedPhoques::ConnectionId_t kSecondConn = 0xF502u;
+        const GameId kShop{0u, 0x00101001u};
+        const GameId kMerchantChest{0u, 0x00102001u};
+        const GameId kGold{0u, 0x0000000Fu};
+        const GameId kPotion{0u, 0x0003EADDu};
+        const GameId kSword{0u, 0x000139B9u};
+        const GameId kAxe{0u, 0x000139B3u};
+        const GameId kHelmet{0u, 0x00013913u};
+
+        Player* pFirst = world.GetPlayerManager().Create(kFirstConn);
+        Player* pSecond = world.GetPlayerManager().Create(kSecondConn);
+        TimeModel t0{};
+        t0.Time = 13.0f;
+        t0.Day = 7;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pFirst, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pSecond, {}, {}, DateTime{t0}});
+        pFirst->SetCellComponent(CellIdComponent{kShop});
+        pSecond->SetCellComponent(CellIdComponent{kShop});
+
+        const auto registerPlayerCharacter = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, uint32_t aCookie) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = aCookie;
+            request.ReferenceId = GameId{0u, 0x14u};
+            request.CellId = kShop;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[24] = 100.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 100.0f;
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const auto stack = [](const GameId& acItem, int32_t aCount) {
+            Inventory::Entry entry{};
+            entry.BaseId = acItem;
+            entry.Count = aCount;
+            return entry;
+        };
+        const auto registerChest = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, std::initializer_list<Inventory::Entry> aLocalContents) {
+            Harness::ClearOutbox();
+            AssignObjectsRequest request{};
+            ObjectData chest{};
+            chest.Id = kMerchantChest;
+            chest.CellId = kShop;
+            for (const auto& entry : aLocalContents)
+                chest.CurrentInventory.AddOrRemoveEntry(entry);
+            request.Objects.push_back(chest);
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignObjectsResponse>(aConn);
+            return (responses.size() == 1 && responses[0].Objects.size() == 1) ? responses[0].Objects[0] : ObjectData{};
+        };
+        // One half of a trade as the client reports it: an item enters (+) or leaves (-) the chest.
+        const auto chestChange = [&](Player* apPlayer, uint32_t aChestServerId, const GameId& acItem, int32_t aDelta) {
+            RequestInventoryChanges request{};
+            request.ServerId = aChestServerId;
+            request.Item = stack(acItem, aDelta);
+            request.UpdateClients = true;
+            return DeliverWire(world, request, apPlayer);
+        };
+        // What the server told this player to take out of his own character, for one item.
+        const auto takenBackFrom = [](TiltedPhoques::ConnectionId_t aConn, uint32_t aCharacterServerId, const GameId& acItem) {
+            int32_t total = 0;
+            for (const auto& notify : DecodeOutboxMessagesFor<NotifyInventoryChanges>(aConn))
+                if (notify.ServerId == aCharacterServerId && notify.Item.BaseId == acItem)
+                    total -= notify.Item.Count;
+            return total;
+        };
+
+        const uint32_t firstChar = registerPlayerCharacter(pFirst, kFirstConn, 2000u);
+        const uint32_t secondChar = registerPlayerCharacter(pSecond, kSecondConn, 2001u);
+        Check(firstChar != 0xFFFFFFFFu && secondChar != 0xFFFFFFFFu, "both player characters are registered");
+
+        const ObjectData asFirst = registerChest(pFirst, kFirstConn, {stack(kGold, 500), stack(kPotion, 3)});
+        Check(asFirst.IsSenderFirst && asFirst.ServerId != 0, "the first player's copy of the merchant's chest becomes the server's: 500 gold, 3 potions");
+        const uint32_t chestId = asFirst.ServerId;
+        const auto inChest = [&](const GameId& acItem) {
+            GameId lookup = acItem;
+            return world.get<InventoryComponent>(static_cast<entt::entity>(chestId)).Content.GetEntryCountById(lookup);
+        };
+
+        // --- 1. Trades the server's copy can cover ---------------------------------------------
+        Harness::ClearOutbox();
+        Check(chestChange(pFirst, chestId, kSword, +1) && chestChange(pFirst, chestId, kGold, -100) &&
+                  takenBackFrom(kFirstConn, firstChar, kGold) == 0 && inChest(kGold) == 400 && inChest(kSword) == 1,
+              "the first player sells a sword for 100 gold: the chest holds the sword and 400 gold, nothing is taken back");
+        Harness::ClearOutbox();
+        Check(chestChange(pFirst, chestId, kPotion, -3) && chestChange(pFirst, chestId, kGold, +150) &&
+                  takenBackFrom(kFirstConn, firstChar, kPotion) == 0 && inChest(kPotion) == 0 && inChest(kGold) == 550,
+              "he buys all 3 potions for 150 gold: the chest holds no potions and 550 gold");
+
+        // --- 2. The other player buys from his own copy of the stock -----------------------------
+        // His game rolled its own stock; his barter window shows 2 potions. He buys one for 50.
+        Harness::ClearOutbox();
+        Check(chestChange(pSecond, chestId, kPotion, -1) && chestChange(pSecond, chestId, kGold, +50),
+              "the second player buys a potion his own game shows in the merchant's stock");
+        Check(takenBackFrom(kSecondConn, secondChar, kPotion) == 1, "the potion is taken back from him: the server's copy has none, the first player bought them");
+        Check(takenBackFrom(kSecondConn, secondChar, kGold) == 0 && inChest(kGold) == 600,
+              "the 50 gold he paid stay in the chest: he paid and holds nothing");
+
+        // --- 3. He sells to a merchant whose gold his game counts differently ---------------------
+        // His barter window shows 750 gold. He sells an axe for 700.
+        Harness::ClearOutbox();
+        Check(chestChange(pSecond, chestId, kAxe, +1) && chestChange(pSecond, chestId, kGold, -700) && inChest(kAxe) == 1,
+              "the second player sells an axe for 700 gold; the chest takes the axe");
+        Check(takenBackFrom(kSecondConn, secondChar, kGold) == 100 && inChest(kGold) == 0,
+              "the server's copy held 600 gold: 100 of the 700 are taken back from him");
+
+        // --- 4. The first player's game restocks the merchant -------------------------------------
+        // Two game days later his game refills the chest: 750 gold on his screen, none on the server.
+        Harness::ClearOutbox();
+        Check(chestChange(pFirst, chestId, kHelmet, +1) && chestChange(pFirst, chestId, kGold, -200) && inChest(kHelmet) == 1,
+              "after a restock in his own game the first player sells a helmet for 200 gold; the chest takes the helmet");
+        Check(takenBackFrom(kFirstConn, firstChar, kGold) == 200,
+              "all 200 gold are taken back from him: the gold was emptied by the other player, so he sold the helmet for nothing");
+
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+    }
+
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures,
                 g_failures == 1 ? "" : "s");
     return g_failures == 0 ? 0 : 1;

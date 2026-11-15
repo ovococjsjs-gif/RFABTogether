@@ -2194,6 +2194,35 @@ struct CoopAllyActionPolicy
     return NormalizeDoorOpenState(aRemotePreState) == NormalizeDoorOpenState(aLocalCurrentState);
 }
 
+// Which containers are one player's own and are never registered on the server (work plan 6.4,
+// defect M27).
+//
+// A registered container is shared: the first player to register it decides what is in it, every
+// other player's copy is replaced by that list, and a take the server's copy cannot cover is taken
+// back from the taker. That is right for loot. It is wrong for a container each player's own game
+// fills:
+//  - a merchant's chest. RFAB keeps a merchant's remaining stock in each player's save
+//    (RFAB_VendorContainer) and the game restocks the chest locally, so the players' copies
+//    differ all the time. A trade is two separate packets (the item, the gold), and the server
+//    undid only the half its copy could not cover: a bought item was taken back while the gold
+//    stayed paid, and gold from a sale was taken back while the sold item stayed sold.
+//  - a container that is not where the player is (not in his interior cell, not in the worldspace
+//    he walks in). He cannot reach it; a script opened it from somewhere else
+//    (RFAB_SecureChestScript opens one storage chest from many places). Shared, the second player
+//    to open it would find the first player's stored items in place of his own.
+struct ContainerSyncFacts
+{
+    bool IsMerchantContainer{false}; // the chest a vendor faction's merchants trade from
+    bool IsWherePlayerIs{true};      // false: in another cell or worldspace than the player
+};
+
+[[nodiscard]] constexpr bool IsPersonalContainer(const ContainerSyncFacts& acFacts, bool aPersonalMerchantStock) noexcept
+{
+    if (!aPersonalMerchantStock)
+        return false; // 4.1.0: every container a player touches is shared
+    return acFacts.IsMerchantContainer || !acFacts.IsWherePlayerIs;
+}
+
 // Cross-version RFAB & Skyrim quest filter: blocks personal transformation, MCM, UI, widget, and background
 // maintenance quests from being synced across the party, regardless of load order.
 [[nodiscard]] inline bool IsQuestNonSyncableByEditorIdOrBaseId(

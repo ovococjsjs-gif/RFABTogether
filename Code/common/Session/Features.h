@@ -46,9 +46,10 @@ enum class Feature : uint32_t
     kDesyncDetector = 1u << 10,        // clients report what they believe about each character (EntityDigest.h)
     kWorldScopedHookEvents = 1u << 11, // hook events die with the world they were posted in (MainThreadQueue.h)
     kQuestXpSingleAward = 1u << 12,    // quest XP is paid once in every arrival order (CoopExperienceLedger.h)
+    kPersonalMerchantStock = 1u << 13, // merchants' chests and remotely opened containers are not shared
 };
 
-inline constexpr uint32_t kAllKnownFeatureBits = 0x1FFFu;
+inline constexpr uint32_t kAllKnownFeatureBits = 0x3FFFu;
 
 struct FeatureInfo
 {
@@ -56,7 +57,7 @@ struct FeatureInfo
     std::string_view Name;  // stable, used in logs and in the server console listing
 };
 
-inline constexpr std::array<FeatureInfo, 13> kFeatureTable{{
+inline constexpr std::array<FeatureInfo, 14> kFeatureTable{{
     {Feature::kDownedSystem, "DownedSystem"},
     {Feature::kCoordinatedSaves, "CoordinatedSaves"},
     {Feature::kTacticalHud, "TacticalHud"},
@@ -70,6 +71,7 @@ inline constexpr std::array<FeatureInfo, 13> kFeatureTable{{
     {Feature::kDesyncDetector, "DesyncDetector"},
     {Feature::kWorldScopedHookEvents, "WorldScopedHookEvents"},
     {Feature::kQuestXpSingleAward, "QuestXpSingleAward"},
+    {Feature::kPersonalMerchantStock, "PersonalMerchantStock"},
 }};
 
 [[nodiscard]] constexpr uint32_t Bit(Feature aFeature) noexcept
