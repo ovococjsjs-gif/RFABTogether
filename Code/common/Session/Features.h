@@ -47,9 +47,11 @@ enum class Feature : uint32_t
     kWorldScopedHookEvents = 1u << 11, // hook events die with the world they were posted in (MainThreadQueue.h)
     kQuestXpSingleAward = 1u << 12,    // quest XP is paid once in every arrival order (CoopExperienceLedger.h)
     kPersonalMerchantStock = 1u << 13, // merchants' chests and remotely opened containers are not shared
+    kNeighbourCellContainers = 1u << 14, // outdoors, containers within reach of the player's cell are registered ahead
+    kEarlyTakeReplay = 1u << 15, // a take made before the server answered the cell scan is sent again, not dropped
 };
 
-inline constexpr uint32_t kAllKnownFeatureBits = 0x3FFFu;
+inline constexpr uint32_t kAllKnownFeatureBits = 0xFFFFu;
 
 struct FeatureInfo
 {
@@ -57,7 +59,7 @@ struct FeatureInfo
     std::string_view Name;  // stable, used in logs and in the server console listing
 };
 
-inline constexpr std::array<FeatureInfo, 14> kFeatureTable{{
+inline constexpr std::array<FeatureInfo, 16> kFeatureTable{{
     {Feature::kDownedSystem, "DownedSystem"},
     {Feature::kCoordinatedSaves, "CoordinatedSaves"},
     {Feature::kTacticalHud, "TacticalHud"},
@@ -72,6 +74,8 @@ inline constexpr std::array<FeatureInfo, 14> kFeatureTable{{
     {Feature::kWorldScopedHookEvents, "WorldScopedHookEvents"},
     {Feature::kQuestXpSingleAward, "QuestXpSingleAward"},
     {Feature::kPersonalMerchantStock, "PersonalMerchantStock"},
+    {Feature::kNeighbourCellContainers, "NeighbourCellContainers"},
+    {Feature::kEarlyTakeReplay, "EarlyTakeReplay"},
 }};
 
 [[nodiscard]] constexpr uint32_t Bit(Feature aFeature) noexcept

@@ -2223,6 +2223,72 @@ struct ContainerSyncFacts
     return acFacts.IsMerchantContainer || !acFacts.IsWherePlayerIs;
 }
 
+// Work plan 6.4, the rest of defect M11: when is a container registered.
+//
+// A container is shared from the moment a player's game registers it; until then every game holds
+// its own roll of the leveled loot. The client registers the containers of the player's own cell
+// when he enters it, before he can take anything. Outdoors that is not early enough: a chest that
+// stands by a cell border can be opened from the neighbouring cell (QuickLootIE's window, or an
+// ordinary activation at arm's length) before the player has entered its cell. The first take then
+// registers the chest, and the second player to do the same keeps one item of his own roll: the
+// server grants an item it never listed once (CoopLootLedger), because refusing it would eat loot
+// a script added.
+//
+// With Gameplay:bEnableNeighbourCellContainers the client also registers, on every cell change
+// outdoors, the containers of the eight cells around the player's cell that stand within reach of
+// his cell and that it does not hold yet. Indoors there is nothing to do: a cell is entered
+// through a door, and the scan of the cell runs first.
+struct CellOffset
+{
+    int32_t X;
+    int32_t Y;
+};
+
+inline constexpr CellOffset kNeighbourCellOffsets[8] = {
+    {-1, -1}, {0, -1}, {1, -1},
+    {-1, 0},           {1, 0},
+    {-1, 1},  {0, 1},  {1, 1},
+};
+
+// The side of an exterior cell in game units (GridCellCoords::CalculateGridCellCoords).
+inline constexpr float kExteriorCellSizeUnits = 4096.0f;
+
+// How far outside the player's cell a container is registered ahead: about 14.6 m. The crosshair
+// picks a container at about 2 m, further from a third-person camera; a quarter of a cell leaves
+// a wide margin and keeps the scan to the ground of about one cell (the band around a cell is
+// 4 x 1/4 + 4 x 1/16 of a cell) instead of eight.
+inline constexpr float kNeighbourContainerReachUnits = 1024.0f;
+
+[[nodiscard]] constexpr bool ShouldScanNeighbourCells(bool aNeighbourCellContainers, bool aPlayerIsOutdoors) noexcept
+{
+    return aNeighbourCellContainers && aPlayerIsOutdoors;
+}
+
+// Is the point within aReachUnits of the square of the exterior cell (aCellX, aCellY)?
+[[nodiscard]] constexpr bool IsWithinReachOfCell(
+    float aX, float aY, int32_t aCellX, int32_t aCellY, float aReachUnits = kNeighbourContainerReachUnits) noexcept
+{
+    if (!(aX == aX) || !(aY == aY))
+        return false; // not a number: a reference without a position
+
+    const float minX = static_cast<float>(aCellX) * kExteriorCellSizeUnits;
+    const float minY = static_cast<float>(aCellY) * kExteriorCellSizeUnits;
+    const float maxX = minX + kExteriorCellSizeUnits;
+    const float maxY = minY + kExteriorCellSizeUnits;
+    const float dx = aX < minX ? minX - aX : (aX > maxX ? aX - maxX : 0.0f);
+    const float dy = aY < minY ? minY - aY : (aY > maxY ? aY - maxY : 0.0f);
+    return dx * dx + dy * dy <= aReachUnits * aReachUnits;
+}
+
+// A container of a neighbouring cell is sent only if it stands within reach of the player's cell
+// and this client does not hold the server's id for it yet. The containers of the player's own
+// cell are sent on every entry, as before; sending the neighbours every time would have the
+// server answer, and the client rewrite, every chest around the player on every border he crosses.
+[[nodiscard]] constexpr bool ShouldRegisterNeighbourContainer(bool aAlreadyHeld, bool aIsPersonal, bool aIsWithinReach) noexcept
+{
+    return !aAlreadyHeld && !aIsPersonal && aIsWithinReach;
+}
+
 // Cross-version RFAB & Skyrim quest filter: blocks personal transformation, MCM, UI, widget, and background
 // maintenance quests from being synced across the party, regardless of load order.
 [[nodiscard]] inline bool IsQuestNonSyncableByEditorIdOrBaseId(

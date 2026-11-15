@@ -93,6 +93,20 @@ Console::Setting bEnableQuestXpSingleAward{"Gameplay:bEnableQuestXpSingleAward",
 // whatever its copy of the chest does not hold.
 Console::Setting bEnablePersonalMerchantStock{"Gameplay:bEnablePersonalMerchantStock",
                                               "Merchants' stock and gold, and storage chests opened from another place, are each player's own and not shared", true};
+// On: outdoors the client registers, on every cell change, the containers of the cells around the
+// player that stand within reach of his cell, so a chest by a cell border has one list of contents
+// before anyone can loot it across the border (RfabCompat::ShouldScanNeighbourCells; the rest of
+// defect M11). Off restores 4.1.0: such a chest is registered by the first take, and the second
+// player to loot it the same way keeps one item of his own roll.
+Console::Setting bEnableNeighbourCellContainers{"Gameplay:bEnableNeighbourCellContainers",
+                                                "Outdoors, containers within reach of a player's cell are registered before they can be looted across a cell border", true};
+// On: a take or a put made between the client's registration of a container (by the cell scan, an
+// activation or an earlier take) and the server's answer is sent to the server when the answer
+// arrives (CoopLootLedger::ShouldReplayPendingDelta, defect M28). Off restores 4.1.0: such a
+// change is dropped, and a taken item is both in the player's pack and back in the container for
+// everybody.
+Console::Setting bEnableEarlyTakeReplay{"Gameplay:bEnableEarlyTakeReplay",
+                                        "A take made before the server answered the container's registration is sent again instead of being dropped", true};
 extern Console::Setting<bool> bEnableItemDrops;
 extern Console::Setting<bool> bEnableXpSync;
 extern Console::Setting<bool> bEnableRfabXpSync;
@@ -256,6 +270,8 @@ uint32_t GetDisabledCoopFeatureMask() noexcept
     mask = Session::WithFeature(mask, Feature::kWorldScopedHookEvents, bEnableWorldScopedHookEvents);
     mask = Session::WithFeature(mask, Feature::kQuestXpSingleAward, bEnableQuestXpSingleAward);
     mask = Session::WithFeature(mask, Feature::kPersonalMerchantStock, bEnablePersonalMerchantStock);
+    mask = Session::WithFeature(mask, Feature::kNeighbourCellContainers, bEnableNeighbourCellContainers);
+    mask = Session::WithFeature(mask, Feature::kEarlyTakeReplay, bEnableEarlyTakeReplay);
     return mask;
 }
 

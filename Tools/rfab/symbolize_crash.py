@@ -411,6 +411,8 @@ EVENT_CRUMBS = {
     "world-load-end": "world-load-end ({online})",
     "cell-change-exterior": "cell-change-exterior to cell {a:X}, worldspace {b:X}",
     "cell-change-interior": "cell-change-interior to cell {a:X}",
+    "neighbour-cell-containers": "neighbour-cell-containers: registering containers of the neighbouring cell {a:X} (Gameplay:bEnableNeighbourCellContainers)",
+    "early-container-change": "early-container-change: container {a:X} changed before the server answered its registration, in the sent list: {b} (Gameplay:bEnableEarlyTakeReplay)",
     "remove-character": "remove-character: server id {a:X}",
     "ownership-transfer": "ownership-transfer: server id {a:X}, epoch {b}",
     "remote-actor-materialize": "remote-actor-materialize: server id {a:X} into cell {b:X}",

@@ -154,7 +154,7 @@ void InventoryService::OnInventoryChangeEvent(const InventoryChangeEvent& acEven
             pContainer && pContainer->baseForm && pContainer->baseForm->formType == FormType::Container)
         {
             m_world.GetObjectService().RequestContainerSyncForLoot(
-                pContainer, acEvent.Item, acEvent.Drop, acEvent.UpdateClients);
+                pContainer, acEvent.Item, acEvent.Drop, acEvent.UpdateClients, acEvent.Sequence);
         }
         return;
     }

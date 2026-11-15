@@ -4759,6 +4759,202 @@ int main(int argc, char** argv)
         std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
     }
 
+    // =========================================================================
+    // Scene 22: a take between a registration and its answer (work plan 6.4, defect M28).
+    // =========================================================================
+    //
+    // A client registers a container by sending its list: the cell scan when the player enters a
+    // cell, an activation of a container the client holds no id for, and a take from such a
+    // container (the take is queued, the list is sent as it is after the take). The answer "you
+    // are first" made 4.1.0's client drop every queued take.
+    //
+    // A take made between a request and its answer meets a client that still holds no id, so it
+    // registers the chest a second time. The scene shows what the server makes of it. Parts 1 and
+    // 4 are 4.1.0's client: two registrations, the queued take dropped by the first answer. Parts
+    // 2, 3 and 5 are the client with Gameplay:bEnableEarlyTakeReplay: one registration, and the
+    // change sent when the answer arrives. The server is the same in all of them; which sequence
+    // the client sends is pinned by the core suite rfab_v411_early_take_replay.cpp, and the
+    // client's code runs only in the game (P21).
+    {
+        std::printf("[scene 22] a take between a registration and its answer\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kFirstConn = 0xF701u;
+        constexpr TiltedPhoques::ConnectionId_t kSecondConn = 0xF702u;
+        const GameId kCamp{0u, 0x00121001u};
+        const GameId kChestOld{0u, 0x00122001u};
+        const GameId kChestNew{0u, 0x00122002u};
+        const GameId kChestPut{0u, 0x00122003u};
+        const GameId kChestTwoOld{0u, 0x00122004u};
+        const GameId kChestTwoNew{0u, 0x00122005u};
+        const GameId kGold{0u, 0x0000000Fu};
+        const GameId kSword{0u, 0x000139B9u};
+        const GameId kAxe{0u, 0x000139B3u};
+        const GameId kHelmet{0u, 0x00013913u};
+
+        Player* pFirst = world.GetPlayerManager().Create(kFirstConn);
+        Player* pSecond = world.GetPlayerManager().Create(kSecondConn);
+        TimeModel t0{};
+        t0.Time = 13.0f;
+        t0.Day = 7;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pFirst, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pSecond, {}, {}, DateTime{t0}});
+        pFirst->SetCellComponent(CellIdComponent{kCamp});
+        pSecond->SetCellComponent(CellIdComponent{kCamp});
+
+        const auto registerPlayerCharacter = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, uint32_t aCookie) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = aCookie;
+            request.ReferenceId = GameId{0u, 0x14u};
+            request.CellId = kCamp;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[24] = 100.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 100.0f;
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const auto stack = [](const GameId& acItem, int32_t aCount) {
+            Inventory::Entry entry{};
+            entry.BaseId = acItem;
+            entry.Count = aCount;
+            return entry;
+        };
+        // A registration as either path of the client sends it: the container and its list.
+        const auto registerChest = [&](Player* apPlayer, TiltedPhoques::ConnectionId_t aConn, const GameId& acChest,
+                                       std::initializer_list<Inventory::Entry> aLocalContents) {
+            Harness::ClearOutbox();
+            AssignObjectsRequest request{};
+            ObjectData chest{};
+            chest.Id = acChest;
+            chest.CellId = kCamp;
+            for (const auto& entry : aLocalContents)
+                chest.CurrentInventory.AddOrRemoveEntry(entry);
+            request.Objects.push_back(chest);
+            (void)DeliverWire(world, request, apPlayer);
+            const auto responses = DecodeOutboxMessagesFor<AssignObjectsResponse>(aConn);
+            return (responses.size() == 1 && responses[0].Objects.size() == 1) ? responses[0].Objects[0] : ObjectData{};
+        };
+        const auto chestChange = [&](Player* apPlayer, uint32_t aChestServerId, const GameId& acItem, int32_t aDelta) {
+            RequestInventoryChanges request{};
+            request.ServerId = aChestServerId;
+            request.Item = stack(acItem, aDelta);
+            request.UpdateClients = true;
+            return DeliverWire(world, request, apPlayer);
+        };
+        const auto takenBackFrom = [](TiltedPhoques::ConnectionId_t aConn, uint32_t aCharacterServerId, const GameId& acItem) {
+            int32_t total = 0;
+            for (const auto& notify : DecodeOutboxMessagesFor<NotifyInventoryChanges>(aConn))
+                if (notify.ServerId == aCharacterServerId && notify.Item.BaseId == acItem)
+                    total -= notify.Item.Count;
+            return total;
+        };
+        const auto toldToChange = [](TiltedPhoques::ConnectionId_t aConn, uint32_t aEntityServerId, const GameId& acItem) {
+            int32_t total = 0;
+            for (const auto& notify : DecodeOutboxMessagesFor<NotifyInventoryChanges>(aConn))
+                if (notify.ServerId == aEntityServerId && notify.Item.BaseId == acItem)
+                    total += notify.Item.Count;
+            return total;
+        };
+        const auto inChest = [&](uint32_t aChestServerId, const GameId& acItem) {
+            GameId lookup = acItem;
+            return world.get<InventoryComponent>(static_cast<entt::entity>(aChestServerId)).Content.GetEntryCountById(lookup);
+        };
+        const auto countOf = [](const Inventory& acInventory, const GameId& acItem) {
+            GameId lookup = acItem;
+            return acInventory.GetEntryCountById(lookup);
+        };
+
+        const uint32_t firstChar = registerPlayerCharacter(pFirst, kFirstConn, 2200u);
+        const uint32_t secondChar = registerPlayerCharacter(pSecond, kSecondConn, 2201u);
+        Check(firstChar != 0xFFFFFFFFu && secondChar != 0xFFFFFFFFu, "both player characters are registered");
+
+        // --- 1. 4.1.0's client -------------------------------------------------------------------
+        // The first player crosses into the cell; the scan sends the chest: a sword and 50 gold.
+        const ObjectData scanOld = registerChest(pFirst, kFirstConn, kChestOld, {stack(kSword, 1), stack(kGold, 50)});
+        Check(scanOld.IsSenderFirst && scanOld.ServerId != 0, "the scan's registration makes the first player's list the server's: a sword and 50 gold");
+        // Before that answer reaches him he takes the sword. His client holds no id for the chest,
+        // so the take registers it again, with the list after the take.
+        const ObjectData onDemandOld = registerChest(pFirst, kFirstConn, kChestOld, {stack(kGold, 50)});
+        Check(!onDemandOld.IsSenderFirst && onDemandOld.ServerId == scanOld.ServerId,
+              "the take's own registration of the same chest is answered 'not first'");
+        Check(countOf(onDemandOld.CurrentInventory, kSword) == 1,
+              "and carries the list as the scan read it: the sword he holds is in it, and his client writes that list over the chest");
+        // The first answer ("you are first") dropped the queued take: 4.1.0 sends nothing more.
+        Check(inChest(scanOld.ServerId, kSword) == 1, "nothing told the server about the take: its copy of the chest still holds the sword");
+
+        const ObjectData secondSeesOld = registerChest(pSecond, kSecondConn, kChestOld, {stack(kGold, 35)});
+        Check(!secondSeesOld.IsSenderFirst && countOf(secondSeesOld.CurrentInventory, kSword) == 1,
+              "the second player enters the cell: the chest he is shown holds the sword");
+        Harness::ClearOutbox();
+        Check(chestChange(pSecond, scanOld.ServerId, kSword, -1) && takenBackFrom(kSecondConn, secondChar, kSword) == 0 &&
+                  inChest(scanOld.ServerId, kSword) == 0,
+              "he takes it and keeps it: one sword in the chest has become two, one in each pack");
+
+        // --- 2. The client with bEnableEarlyTakeReplay --------------------------------------------
+        const ObjectData scanNew = registerChest(pFirst, kFirstConn, kChestNew, {stack(kAxe, 1), stack(kGold, 50)});
+        Check(scanNew.IsSenderFirst && scanNew.ServerId != 0 && scanNew.ServerId != scanOld.ServerId,
+              "another chest, the same scan: an axe and 50 gold");
+        // He takes the axe before the answer. The client knows the scan's request is unanswered:
+        // it sends no second registration, and when the answer says "you are first" it sends the
+        // take, because the scan read the list before the take.
+        Harness::ClearOutbox();
+        Check(chestChange(pFirst, scanNew.ServerId, kAxe, -1) && inChest(scanNew.ServerId, kAxe) == 0,
+              "the take is sent at the answer: the server's copy of the chest gives up the axe");
+        Check(takenBackFrom(kFirstConn, firstChar, kAxe) == 0, "nothing is taken back from him: the server's list held the axe");
+        Check(toldToChange(kSecondConn, scanNew.ServerId, kAxe) == -1, "the second player, in the same cell, is told the axe left the chest");
+
+        const ObjectData secondSeesNew = registerChest(pSecond, kSecondConn, kChestNew, {stack(kAxe, 1), stack(kGold, 35)});
+        Check(!secondSeesNew.IsSenderFirst && countOf(secondSeesNew.CurrentInventory, kAxe) == 0 &&
+                  countOf(secondSeesNew.CurrentInventory, kGold) == 50,
+              "the chest the second player is shown holds 50 gold and no axe, whatever his own game had rolled");
+        Harness::ClearOutbox();
+        Check(chestChange(pSecond, scanNew.ServerId, kAxe, -1) && takenBackFrom(kSecondConn, secondChar, kAxe) == 1,
+              "an axe he takes from his own stale copy is taken back from him: the axe went to the first player, once");
+
+        // --- 3. A put in the same moment ----------------------------------------------------------
+        const ObjectData scanPut = registerChest(pFirst, kFirstConn, kChestPut, {stack(kGold, 50)});
+        Check(scanPut.IsSenderFirst && inChest(scanPut.ServerId, kHelmet) == 0, "a third chest: 50 gold");
+        // He puts a helmet in before the answer. 4.1.0 dropped that change too: the helmet stayed
+        // in his own copy only, and vanished when the server's list was next written over it.
+        Harness::ClearOutbox();
+        Check(chestChange(pFirst, scanPut.ServerId, kHelmet, +1) && inChest(scanPut.ServerId, kHelmet) == 1,
+              "the put is sent at the answer: the server's copy of the chest holds the helmet");
+        const ObjectData secondSeesPut = registerChest(pSecond, kSecondConn, kChestPut, {stack(kGold, 35)});
+        Check(!secondSeesPut.IsSenderFirst && countOf(secondSeesPut.CurrentInventory, kHelmet) == 1,
+              "the second player is shown the helmet in the chest");
+
+        // --- 4. Two takes in a row from a chest nobody had registered: 4.1.0's client -------------
+        // The chest stands across a cell border: a sword, an axe, 50 gold. The first player takes
+        // the sword through QuickLootIE's window; the take registers the chest with the list after it.
+        const ObjectData takeOneOld = registerChest(pFirst, kFirstConn, kChestTwoOld, {stack(kAxe, 1), stack(kGold, 50)});
+        Check(takeOneOld.IsSenderFirst && takeOneOld.ServerId != 0, "the first take registers the chest: an axe and 50 gold are left");
+        // He takes the axe before that answer reaches him: still no id, so a registration again.
+        const ObjectData takeTwoOld = registerChest(pFirst, kFirstConn, kChestTwoOld, {stack(kGold, 50)});
+        Check(!takeTwoOld.IsSenderFirst && countOf(takeTwoOld.CurrentInventory, kAxe) == 1 && inChest(takeOneOld.ServerId, kAxe) == 1,
+              "the second take's registration is answered 'not first' with the axe in the list: the axe he holds is back in the chest for everybody");
+
+        // --- 5. The same two takes from the client with bEnableEarlyTakeReplay ---------------------
+        const ObjectData takeOneNew = registerChest(pFirst, kFirstConn, kChestTwoNew, {stack(kAxe, 1), stack(kGold, 50)});
+        Check(takeOneNew.IsSenderFirst && takeOneNew.ServerId != 0, "another such chest, the first take registers it");
+        // The second take finds the first registration unanswered: no registration, the take is sent at the answer.
+        Harness::ClearOutbox();
+        Check(chestChange(pFirst, takeOneNew.ServerId, kAxe, -1) && inChest(takeOneNew.ServerId, kAxe) == 0 &&
+                  takenBackFrom(kFirstConn, firstChar, kAxe) == 0,
+              "the second take is sent at the answer: the chest gives up the axe, nothing is taken back");
+        const ObjectData secondSeesTwo = registerChest(pSecond, kSecondConn, kChestTwoNew, {stack(kSword, 1), stack(kAxe, 1), stack(kGold, 35)});
+        Check(!secondSeesTwo.IsSenderFirst && countOf(secondSeesTwo.CurrentInventory, kAxe) == 0 &&
+                  countOf(secondSeesTwo.CurrentInventory, kSword) == 0 && countOf(secondSeesTwo.CurrentInventory, kGold) == 50,
+              "the second player is shown 50 gold: neither the sword nor the axe");
+
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+    }
+
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures,
                 g_failures == 1 ? "" : "s");
     return g_failures == 0 ? 0 : 1;

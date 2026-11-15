@@ -382,6 +382,9 @@ public:
         bool Drop{false};
         bool UpdateClients{true};
         uint64_t QueuedAtMs{0};
+        // false: the list the server was sent for this container was read BEFORE this change, so
+        // the server's copy does not have it (defect M28, ShouldReplayPendingDelta).
+        bool ReflectedInRegistration{true};
     };
 
     void Clear() noexcept { m_entries.clear(); }
@@ -406,7 +409,8 @@ public:
         bool aDrop,
         bool aUpdateClients,
         uint64_t aNowMs,
-        uint64_t aTtlMs = kDefaultTtlMs)
+        uint64_t aTtlMs = kDefaultTtlMs,
+        bool aReflectedInRegistration = true)
     {
         if (aContainerFormId == 0)
             return false;
@@ -415,7 +419,7 @@ public:
         while (m_entries.size() >= kMaxPendingDeltas)
             m_entries.pop_front();
 
-        m_entries.push_back(PendingDelta{aContainerFormId, acItem, aDrop, aUpdateClients, aNowMs});
+        m_entries.push_back(PendingDelta{aContainerFormId, acItem, aDrop, aUpdateClients, aNowMs, aReflectedInRegistration});
         return true;
     }
 
@@ -445,6 +449,137 @@ public:
 
 private:
     std::deque<PendingDelta> m_entries{};
+};
+
+// ---------------------------------------------------------------------------------------------
+// A change made while a registration is unanswered (work plan 6.4, defect M28).
+//
+// The client registers a container with the server in three ways, each sending the container's
+// list as the client's game holds it at that moment:
+//   - the cell scan, when the player enters a cell, for every container of the cell;
+//   - an activation of a container the client holds no server id for;
+//   - a take or a put (QuickLootIE's window) in such a container: the change is queued and the
+//     list is sent as it is AFTER the change.
+// The answer says whether the server built its copy from that list ("you are first") or already
+// had one ("not first": the server's list replaces the local one, and queued changes are sent for
+// the server to arbitrate). 4.1.0 dropped the queued changes on "you are first", on the ground
+// that the list the server was sent already had them.
+//
+// That holds only for the change that caused the registration. Any change made between a request
+// and its answer finds the client still without an id, registers the container a second time and
+// is queued. The first answer says "you are first" and drops it, although the list the server
+// built its copy from was read BEFORE the change. The second answer says "not first" and writes
+// that list over the chest. The item is in the player's pack, back in the chest for everybody,
+// and the server will grant it again. A put is lost the same way. It happens when a player
+//   - takes an item right after crossing a cell border outdoors (the scan is unanswered);
+//   - opens a container the client had not registered and takes an item before the answer;
+//   - takes two items in a row from such a container, the second before the first is answered.
+//
+// The fix: every local inventory change carries a number from one counter, and every registration
+// notes the counter when it reads the list. A change with a higher number is not in that list.
+// While a registration of a container is unanswered, a change is only queued - no second
+// registration - marked with whether the list has it; on "you are first" the changes the list
+// lacks are sent instead of dropped.
+
+// How long a registration counts as unanswered. Far above any round trip, below the 8 s a queued
+// change lives; after it a change registers the container itself, as in 4.1.0.
+inline constexpr uint64_t kRegistrationWindowMs = 3000ULL;
+
+[[nodiscard]] constexpr bool IsRegistrationInFlight(
+    uint64_t aSentAtMs, uint64_t aNowMs, uint64_t aWindowMs = kRegistrationWindowMs) noexcept
+{
+    return aNowMs >= aSentAtMs && (aNowMs - aSentAtMs) <= aWindowMs;
+}
+
+// aChangeSequence: the counter value the change was given, just before the game applied it.
+// aListSequence: the counter value when the registration read the container's list.
+[[nodiscard]] constexpr bool IsChangeReflectedInRegistration(uint64_t aChangeSequence, uint64_t aListSequence) noexcept
+{
+    return aChangeSequence <= aListSequence;
+}
+
+// The answer to a registration arrived; is a queued change sent to the server?
+[[nodiscard]] constexpr bool ShouldReplayPendingDelta(bool aIsSenderFirst, bool aReflectedInRegistration) noexcept
+{
+    if (!aIsSenderFirst)
+        return true; // another player's list stands: the server arbitrates the change against it
+    // The server's copy was built from this client's list. A change the list already has would be
+    // applied twice; a change made after the list was read is missing from the copy.
+    return !aReflectedInRegistration;
+}
+
+// The containers this client has sent a registration for whose answer has not arrived.
+class RegistrationTracker
+{
+public:
+    static constexpr size_t kMaxTracked = 4096;
+
+    struct Lookup
+    {
+        bool InFlight{false};
+        uint64_t Sequence{0};
+    };
+
+    void Clear() noexcept { m_sent.clear(); }
+    [[nodiscard]] size_t Size() const noexcept { return m_sent.size(); }
+
+    // A registration read this container's list when the change counter stood at aSequence, and
+    // sent it. While an earlier registration of the container is unanswered, that one stands: if
+    // the server builds its copy from this client's list at all, it is from the earlier list.
+    void Note(uint32_t aContainerFormId, uint64_t aNowMs, uint64_t aSequence, uint64_t aWindowMs = kRegistrationWindowMs)
+    {
+        if (aContainerFormId == 0)
+            return;
+
+        const auto it = m_sent.find(aContainerFormId);
+        if (it != m_sent.end())
+        {
+            if (!IsRegistrationInFlight(it->second.SentAtMs, aNowMs, aWindowMs))
+                it->second = Sent{aNowMs, aSequence};
+            return;
+        }
+
+        if (m_sent.size() >= kMaxTracked)
+        {
+            Prune(aNowMs, aWindowMs);
+            if (m_sent.size() >= kMaxTracked)
+                return; // more unanswered containers than any scan sends: leave this one to 4.1.0's path
+        }
+
+        m_sent.emplace(aContainerFormId, Sent{aNowMs, aSequence});
+    }
+
+    // The server answered for this container.
+    void Erase(uint32_t aContainerFormId) noexcept { m_sent.erase(aContainerFormId); }
+
+    [[nodiscard]] Lookup Find(
+        uint32_t aContainerFormId, uint64_t aNowMs, uint64_t aWindowMs = kRegistrationWindowMs) const noexcept
+    {
+        const auto it = m_sent.find(aContainerFormId);
+        if (it == m_sent.end() || !IsRegistrationInFlight(it->second.SentAtMs, aNowMs, aWindowMs))
+            return Lookup{};
+        return Lookup{true, it->second.Sequence};
+    }
+
+    void Prune(uint64_t aNowMs, uint64_t aWindowMs = kRegistrationWindowMs) noexcept
+    {
+        for (auto it = m_sent.begin(); it != m_sent.end();)
+        {
+            if (IsRegistrationInFlight(it->second.SentAtMs, aNowMs, aWindowMs))
+                ++it;
+            else
+                it = m_sent.erase(it);
+        }
+    }
+
+private:
+    struct Sent
+    {
+        uint64_t SentAtMs{0};
+        uint64_t Sequence{0};
+    };
+
+    std::unordered_map<uint32_t, Sent> m_sent{};
 };
 
 } // namespace CoopLootLedger

@@ -1,5 +1,6 @@
 #include <Services/ObjectService.h>
 
+#include <CrashBreadcrumbs.h>
 #include <common/CoopTeleportGuard.h>
 #include <common/CoopWorldStabilizer.h>
 #include <common/RfabModpackCompat.h>
@@ -7,6 +8,7 @@
 #include <World.h>
 #include <Events/UpdateEvent.h>
 #include <Events/CellChangeEvent.h>
+#include <Events/InventoryChangeEvent.h>
 #include <Events/ActivateEvent.h>
 #include <Events/LockChangeEvent.h>
 #include <Events/ScriptAnimationEvent.h>
@@ -30,6 +32,7 @@
 
 #include <chrono>
 #include <inttypes.h>
+#include <unordered_set>
 
 ObjectService::ObjectService(World& aWorld, entt::dispatcher& aDispatcher, TransportService& aTransport)
     : m_world(aWorld)
@@ -46,6 +49,15 @@ ObjectService::ObjectService(World& aWorld, entt::dispatcher& aDispatcher, Trans
 
     EventDispatcherManager::Get()->activateEvent.RegisterSink(this);
 }
+
+namespace
+{
+uint64_t SteadyNowMs() noexcept
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+} // namespace
 
 bool IsPlayerHome(const TESObjectCELL* pCell) noexcept
 {
@@ -200,6 +212,7 @@ void ObjectService::OnWorldLoadBegin(const Session::Transition&) noexcept
 void ObjectService::DestroyObjectEntities() noexcept
 {
     m_pendingContainerLoot.Clear();
+    m_registrationsInFlight.Clear();
     auto view = m_world.view<ObjectComponent>();
     Vector<entt::entity> toDestroy(view.begin(), view.end());
     for (entt::entity entity : toDestroy)
@@ -213,7 +226,8 @@ bool ObjectService::RequestContainerSyncForLoot(
     TESObjectREFR* apContainer,
     const Inventory::Entry& acItem,
     bool aDrop,
-    bool aUpdateClients) noexcept
+    bool aUpdateClients,
+    uint64_t aChangeSequence) noexcept
 {
     if (!m_transport.IsConnected() || !apContainer || !apContainer->baseForm)
         return false;
@@ -239,6 +253,34 @@ bool ObjectService::RequestContainerSyncForLoot(
         return false;
     }
 
+    const uint64_t nowMs = SteadyNowMs();
+
+    // Gameplay:bEnableEarlyTakeReplay on the server (defect M28, common/CoopLootLedger.h). This
+    // container has been sent to the server (by the cell scan, an activation or an earlier take)
+    // and the answer is on its way. A second registration would be answered "not first" with the
+    // list as the first one read it and written over the chest, after the first answer ("you are
+    // first") had dropped this change. So the change is only queued, marked with whether the
+    // list the server was sent already has it, and the answer decides.
+    const bool earlyTakeReplay = World::IsFeatureEnabled(Session::Feature::kEarlyTakeReplay);
+    if (earlyTakeReplay)
+    {
+        const auto sent = m_registrationsInFlight.Find(apContainer->formID, nowMs);
+        if (sent.InFlight)
+        {
+            const bool reflected = CoopLootLedger::IsChangeReflectedInRegistration(aChangeSequence, sent.Sequence);
+            RFAB_EVENT_CRUMB("early-container-change", apContainer->formID, reflected ? 1u : 0u);
+            m_pendingContainerLoot.Enqueue(
+                apContainer->formID,
+                acItem,
+                aDrop,
+                aUpdateClients,
+                nowMs,
+                CoopLootLedger::PendingContainerLootQueue<Inventory::Entry>::kDefaultTtlMs,
+                reflected);
+            return true;
+        }
+    }
+
     m_world.GetModSystem().GetServerModId(pCell->formID, objectData.CellId);
     if (TESWorldSpace* pWorldSpace = pPlayer ? pPlayer->GetWorldSpace() : nullptr)
         m_world.GetModSystem().GetServerModId(pWorldSpace->formID, objectData.WorldSpaceId);
@@ -250,12 +292,11 @@ bool ObjectService::RequestContainerSyncForLoot(
         objectData.CurrentLockData.LockLevel = pLock->lockLevel;
     }
 
+    // The counter is read before the list (defect M28): this change is in the list, a later one is not.
+    if (earlyTakeReplay)
+        m_registrationsInFlight.Note(apContainer->formID, nowMs, CurrentInventoryChangeSequence());
     objectData.CurrentInventory = apContainer->GetInventory();
 
-    const uint64_t nowMs = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count());
     m_pendingContainerLoot.Enqueue(apContainer->formID, acItem, aDrop, aUpdateClients, nowMs);
 
     AssignObjectsRequest request{};
@@ -266,6 +307,7 @@ bool ObjectService::RequestContainerSyncForLoot(
 
 void ObjectService::RefreshCurrentCellObjectsAfterRollback() noexcept
 {
+    m_registrationsInFlight.Clear();
     auto view = m_world.view<ObjectComponent>();
     Vector<entt::entity> toDestroy(view.begin(), view.end());
     for (entt::entity entity : toDestroy)
@@ -309,6 +351,9 @@ void ObjectService::OnCellChange(const CellChangeEvent& acEvent) noexcept
     // Door seemed to be at the wrong form id (29, now 32), verify this.
     Vector<TESObjectREFR*> objects = pCell->GetRefsByFormTypes(formTypes);
 
+    const bool earlyTakeReplay = World::IsFeatureEnabled(Session::Feature::kEarlyTakeReplay);
+    const uint64_t nowMs = SteadyNowMs();
+
     AssignObjectsRequest request{};
 
     for (TESObjectREFR* pObject : objects)
@@ -338,13 +383,123 @@ void ObjectService::OnCellChange(const CellChangeEvent& acEvent) noexcept
         }
 
         if (pObject->baseForm->formType == FormType::Container)
+        {
+            // The counter is read before the list (defect M28): a change counted later is not in it.
+            if (earlyTakeReplay)
+                m_registrationsInFlight.Note(pObject->formID, nowMs, CurrentInventoryChangeSequence());
             objectData.CurrentInventory = pObject->GetInventory();
+        }
 
         request.Objects.push_back(objectData);
     }
 
     if (!request.Objects.empty())
         m_transport.Send(request);
+
+    RegisterNeighbourCellContainers();
+}
+
+void ObjectService::RegisterNeighbourCellContainers() noexcept
+{
+    PlayerCharacter* pPlayer = PlayerCharacter::Get();
+    if (!pPlayer || !pPlayer->parentCell)
+        return;
+
+    // Gameplay:bEnableNeighbourCellContainers on the server. Why, and why outdoors only:
+    // RfabCompat::ShouldScanNeighbourCells.
+    TESWorldSpace* pWorldSpace = pPlayer->GetWorldSpace();
+    if (!RfabCompat::ShouldScanNeighbourCells(
+            World::IsFeatureEnabled(Session::Feature::kNeighbourCellContainers), pWorldSpace != nullptr))
+    {
+        return;
+    }
+
+    const TES* pTES = TES::Get();
+    ModManager* pModManager = ModManager::Get();
+    if (!pTES || !pModManager)
+        return;
+
+    GameId worldSpaceId{};
+    if (!m_world.GetModSystem().GetServerModId(pWorldSpace->formID, worldSpaceId))
+        return;
+
+    // The containers this client already holds the server's id for.
+    std::unordered_set<uint32_t> held;
+    {
+        const auto view = m_world.view<FormIdComponent, ObjectComponent>();
+        for (entt::entity entity : view)
+            held.insert(view.get<FormIdComponent>(entity).Id);
+    }
+
+    // The player's cell as the game counts it: the same pair the cell change was detected from.
+    const int32_t playerCellX = pTES->currentGridX;
+    const int32_t playerCellY = pTES->currentGridY;
+
+    const bool syncPlayerHomes = World::Get().GetServerSettings().SyncPlayerHomes;
+    const bool earlyTakeReplay = World::IsFeatureEnabled(Session::Feature::kEarlyTakeReplay);
+    const uint64_t nowMs = SteadyNowMs();
+    const Vector<FormType> formTypes = {FormType::Container};
+
+    for (const RfabCompat::CellOffset& offset : RfabCompat::kNeighbourCellOffsets)
+    {
+        // false: the cell is looked up, never loaded for this. A cell the game is still attaching
+        // is left for the next cell change; until then the first take registers its containers,
+        // as before.
+        TESObjectCELL* pCell = pModManager->GetCellFromCoordinates(playerCellX + offset.X, playerCellY + offset.Y, pWorldSpace, false);
+        if (!pCell || pCell == pPlayer->parentCell || !pCell->IsAttachedAndLoaded())
+            continue;
+
+        if (!syncPlayerHomes && IsPlayerHome(pCell))
+            continue;
+
+        GameId cellId{};
+        if (!m_world.GetModSystem().GetServerModId(pCell->formID, cellId))
+            continue;
+
+        RFAB_EVENT_CRUMB("neighbour-cell-containers", pCell->formID);
+
+        // One request per cell keeps each packet no larger than the scan of the player's own cell.
+        AssignObjectsRequest request{};
+        for (TESObjectREFR* pObject : pCell->GetRefsByFormTypes(formTypes))
+        {
+            if (!pObject || !pObject->baseForm || pObject->IsDeleted())
+                continue;
+
+            const bool withinReach =
+                RfabCompat::IsWithinReachOfCell(pObject->position.x, pObject->position.y, playerCellX, playerCellY);
+            // The reach is tested first: it is arithmetic, and it spares the walk over the factions
+            // that ShouldSyncObject does for every container further away.
+            // "Held" includes a container already sent whose answer is on its way.
+            const bool alreadyHeld =
+                held.find(pObject->formID) != held.end() || m_registrationsInFlight.Find(pObject->formID, nowMs).InFlight;
+            if (!withinReach || !RfabCompat::ShouldRegisterNeighbourContainer(alreadyHeld, !ShouldSyncObject(pObject), true))
+                continue;
+
+            ObjectData objectData{};
+            if (!m_world.GetModSystem().GetServerModId(pObject->formID, objectData.Id) || objectData.Id.ModId == 0xFFFFFFFF)
+                continue;
+
+            objectData.CellId = cellId;
+            objectData.WorldSpaceId = worldSpaceId;
+            objectData.CurrentCoords = GridCellCoords::CalculateGridCellCoords(pObject->position.x, pObject->position.y);
+
+            if (Lock* pLock = pObject->GetLock())
+            {
+                objectData.CurrentLockData.IsLocked = pLock->IsLocked();
+                objectData.CurrentLockData.LockLevel = pLock->lockLevel;
+            }
+
+            // The counter is read before the list (defect M28): a change counted later is not in it.
+            if (earlyTakeReplay)
+                m_registrationsInFlight.Note(pObject->formID, nowMs, CurrentInventoryChangeSequence());
+            objectData.CurrentInventory = pObject->GetInventory();
+
+            request.Objects.push_back(std::move(objectData));
+        }
+
+        if (!request.Objects.empty())
+            m_transport.Send(request);
+    }
 }
 
 void ObjectService::OnAssignObjectsResponse(const AssignObjectsResponse& acMessage) noexcept
@@ -360,6 +515,7 @@ void ObjectService::OnAssignObjectsResponse(const AssignObjectsResponse& acMessa
         }
 
         CreateObjectEntity(pObject->formID, objectData.ServerId);
+        m_registrationsInFlight.Erase(pObject->formID);
 
         const uint64_t nowMs = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -372,6 +528,22 @@ void ObjectService::OnAssignObjectsResponse(const AssignObjectsResponse& acMessa
             // Server initialized its authoritative inventory from our AssignObjectsRequest
             // (which already reflects the QuickLootIE / AutoLoot mutation), so drop pending deltas
             // instead of double-applying them!
+            //
+            // Except a change made after the registration read the list it sent (defect M28):
+            // the server's copy lacks it. Such a change is queued with ReflectedInRegistration
+            // false (RequestContainerSyncForLoot) and is sent here.
+            for (const auto& pending : pendingDeltas)
+            {
+                if (!CoopLootLedger::ShouldReplayPendingDelta(true, pending.ReflectedInRegistration))
+                    continue;
+
+                RequestInventoryChanges req{};
+                req.ServerId = objectData.ServerId;
+                req.Item = pending.Item;
+                req.Drop = pending.Drop;
+                req.UpdateClients = pending.UpdateClients;
+                m_transport.Send(req);
+            }
             continue;
         }
 
@@ -605,7 +777,13 @@ void ObjectService::OnActivate(const ActivateEvent& acEvent) noexcept
                     objectData.CurrentLockData.LockLevel = pObjLock->lockLevel;
                 }
                 if (pObject->baseForm->formType == FormType::Container)
+                {
+                    // The counter is read before the list (defect M28): a take made in the opened
+                    // container before the answer is not in this list.
+                    if (World::IsFeatureEnabled(Session::Feature::kEarlyTakeReplay))
+                        m_registrationsInFlight.Note(pObject->formID, SteadyNowMs(), CurrentInventoryChangeSequence());
                     objectData.CurrentInventory = pObject->GetInventory();
+                }
 
                 AssignObjectsRequest assignReq{};
                 assignReq.Objects.push_back(std::move(objectData));
