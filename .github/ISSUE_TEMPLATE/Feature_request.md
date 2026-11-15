@@ -1,16 +1,20 @@
 ---
-name: Feature request
-about: Suggest an idea for this project
+name: Предложить улучшение
+about: Идея или пожелание к совместной игре в RFAB
 title: ''
-labels: Feature
+labels: enhancement
 assignees: ''
 
 ---
 
-## Description
+## Что хочется получить
 
-A short description about your feature request.
+<!-- Коротко: что должно происходить в игре. -->
 
-## Additional context
+## Зачем это нужно
 
-Add any other context or screenshots about the feature request here.
+<!-- В какой ситуации этого не хватает сейчас. -->
+
+## Что уже пробовали
+
+<!-- Настройки сервера, обходные пути, другие моды. Можно оставить пустым. -->
