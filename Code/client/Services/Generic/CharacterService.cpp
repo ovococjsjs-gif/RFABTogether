@@ -666,7 +666,7 @@ bool CharacterService::TakeOwnership(const uint32_t acFormId, const uint32_t acS
     if (const auto* pWaiting3D = m_world.try_get<WaitingFor3D>(acEntity))
         wasRemoteWeaponDrawn = wasRemoteWeaponDrawn || pWaiting3D->SpawnRequest.IsWeaponDrawn;
     if (const auto drawIt = m_weaponDrawUpdates.find(acFormId); drawIt != m_weaponDrawUpdates.end())
-        wasRemoteWeaponDrawn = wasRemoteWeaponDrawn || drawIt->second.m_isWeaponDrawn;
+        wasRemoteWeaponDrawn = wasRemoteWeaponDrawn || drawIt->second.m_drawWeapon;
 
     // CRITICAL: When CharacterSpawnRequest + NotifyOwnershipTransfer arrive back-to-back in the same
     // network poll batch (dormant wake-up, party leader change, peer disconnect, or lease expiry),
