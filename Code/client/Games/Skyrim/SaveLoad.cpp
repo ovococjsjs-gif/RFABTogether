@@ -1,5 +1,6 @@
 #include <TiltedOnlinePCH.h>
 #include <CrashBreadcrumbs.h>
+#include <RfabDiag.h>
 
 #include <SaveLoad.h>
 #include <common/CoopWorldStabilizer.h>
@@ -183,6 +184,13 @@ bool TP_MAKE_THISCALL(HookLoadEntry, BGSSaveLoadManager, void* apFileEntry, uint
 bool TP_MAKE_THISCALL(HookLoadCallSite, BGSSaveLoadManager, uint64_t* apUnk0, uint32_t aUnk1, uint32_t aUnk2, void* apUnk3)
 {
     RFAB_EXPECT_MAIN_THREAD("HookLoadCallSite");
+    // The main loop stands still until the engine returns: tell the hang watch it is a load, not a hang.
+    struct LoadInProgress
+    {
+        LoadInProgress() noexcept { RfabDiag::SetWorldLoadInProgress(true); }
+        ~LoadInProgress() noexcept { RfabDiag::SetWorldLoadInProgress(false); }
+    } loadInProgress;
+
     if (!World::IsCreated())
         return TiltedPhoques::ThisCall(RealLoadCallSite, apThis, apUnk0, aUnk1, aUnk2, apUnk3);
 

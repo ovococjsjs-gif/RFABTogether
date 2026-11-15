@@ -8,7 +8,10 @@ extern std::unique_ptr<TiltedOnlineApp> g_appInstance;
 #include <Misc/BSFixedString.h>
 #include <PlayerCharacter.h>
 #include <World.h>
+#include <CrashBreadcrumbs.h>
+#include <RfabDiag.h>
 #include <common/CoopWorldStabilizer.h>
+#include <common/Diag/HangWatch.h>
 
 #include <atomic>
 #include <cstddef>
@@ -52,6 +55,49 @@ bool IsMainOrLoadingMenuOpen() noexcept
     static const BSFixedString* s_pLoadingMenu = new BSFixedString("Loading Menu");
     return pUi->GetMenuOpen(*s_pMainMenu) || pUi->GetMenuOpen(*s_pLoadingMenu);
 }
+
+// The "black screen" that is not a hang: the loop turns, but a loading screen or a faded screen
+// stays up (common/Diag/HangWatch.h, ScreenWatchState). One line per minute while it lasts and one
+// when it ends, with what the session and the world are doing, so a report shows what it waited for.
+void WatchBlockingScreens() noexcept
+{
+    static Diag::ScreenWatchState s_watch{};
+    static uint64_t s_lastCheckMs = 0;
+
+    const uint64_t now = GetTickCount64();
+    if (now - s_lastCheckMs < 1000)
+        return;
+    s_lastCheckMs = now;
+
+    auto* const pUi = UI::Get();
+    if (!pUi)
+        return;
+
+    static const BSFixedString* s_pLoadingMenu = new BSFixedString("Loading Menu");
+    static const BSFixedString* s_pFaderMenu = new BSFixedString("Fader Menu");
+    Diag::BlockingScreen screen = Diag::BlockingScreen::kNone;
+    if (pUi->GetMenuOpen(*s_pLoadingMenu))
+        screen = Diag::BlockingScreen::kLoading;
+    else if (pUi->GetMenuOpen(*s_pFaderMenu))
+        screen = Diag::BlockingScreen::kFaded;
+
+    const Diag::ScreenVerdict verdict = s_watch.Evaluate(now, screen);
+    if (!verdict.Report)
+        return;
+
+    if (verdict.Ended)
+    {
+        spdlog::warn("[RFAB Screen] the {} is gone after {} s", Diag::ToString(verdict.Screen), verdict.ForMs / 1000);
+        return;
+    }
+
+    RFAB_EVENT_CRUMB("blocking-screen", static_cast<uint32_t>(verdict.Screen), static_cast<uint32_t>(verdict.ForMs / 1000));
+    if (World::IsCreated())
+        World::Get().LogStuckScreen(Diag::ToString(verdict.Screen), verdict.ForMs / 1000);
+    else
+        spdlog::warn("[RFAB Screen] the {} has been up for {} s (the client's world is not created yet)", Diag::ToString(verdict.Screen),
+                     verdict.ForMs / 1000);
+}
 } // namespace
 
 TP_THIS_FUNCTION(TVMUpdate, int, VMContext, float);
@@ -73,6 +119,13 @@ int TP_MAKE_THISCALL(HookVMUpdate, VMContext, float a2)
 short TP_MAKE_THISCALL(HookMainLoop, Main)
 {
     const bool vmWasActive = s_vmActiveSinceLastMainLoop.exchange(false, std::memory_order_acq_rel);
+
+    // Proof of life for the hang watch (RfabDiag.h), also in menus and before the world exists.
+    RfabDiag::Beat();
+    if (apThis && apThis->quitGame)
+        RfabDiag::NoteExitRequested("the game is quitting (main loop saw the quit flag)");
+    else
+        WatchBlockingScreens();
 
     if (apThis && !apThis->quitGame && World::IsCreated())
     {

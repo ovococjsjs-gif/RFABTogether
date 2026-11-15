@@ -352,7 +352,18 @@ _RECORD = re.compile(
 _SHORT_RECORD = re.compile(
     r"Unhandled crash: code=0x(?P<code>[0-9A-Fa-f]+)\s+RIP=0x(?P<rip>[0-9A-Fa-f]+)\s+module='(?P<module>[^']*)'\s+\+0x(?P<rva>[0-9A-Fa-f]+)"
 )
-_FRAME = re.compile(r"\[unwind #(?P<n>\d+)\]\s+(?P<module>[^\s\[+]+)(?P<tramp>\[TiltedTrampoline\])?\+0x(?P<rva>[0-9A-Fa-f]+)")
+# "[unwind #n]" is a frame of a real unwind; "[stack #n]" is a return address found by scanning the
+# stack (a crash without unwind data, and every [HANG] record: the stuck thread is not unwound).
+_FRAME = re.compile(r"\[(?P<how>unwind|stack) #(?P<n>\d+)\]\s+(?P<module>[^\s\[+]+)(?P<tramp>\[TiltedTrampoline\])?\+0x(?P<rva>[0-9A-Fa-f]+)")
+# The client's records of an ending that raised no exception (Code/client/RfabDiag.cpp, 4.1.2).
+_EVENT = re.compile(r"\[(?P<kind>HANG|TERMINATE|PURECALL|INVALID_PARAMETER|ABORT)\]\s+(?P<text>.*)$")
+_EVENT_TITLES = {
+    "HANG": "hang: the game's main loop stopped turning",
+    "TERMINATE": "std::terminate: an exception left a thread or a noexcept function",
+    "PURECALL": "pure virtual call",
+    "INVALID_PARAMETER": "the C runtime rejected an argument",
+    "ABORT": "abort() was called",
+}
 _CPP = re.compile(r"Type=\[(?P<type>[^\]]*)\]\s+what\(\)=\[\"(?P<what>.*?)\"\]")
 _TIMESTAMP = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\]")
 # The server's second kind of record (Code/server_runner/CrashRecord.cpp): std::terminate was called.
@@ -417,6 +428,7 @@ EVENT_CRUMBS = {
     "ownership-transfer": "ownership-transfer: server id {a:X}, epoch {b}",
     "remote-actor-materialize": "remote-actor-materialize: server id {a:X} into cell {b:X}",
     "remote-actor-dematerialize": "remote-actor-dematerialize: form {a:X}, server id {b:X}",
+    "blocking-screen": "blocking-screen: a loading (1) or black (2) screen, kind {a}, has been up for {b} s",
 }
 
 
@@ -455,11 +467,13 @@ class CrashRecord:
     cpp_type: str = ""
     cpp_what: str = ""
     thread: int = 0
-    frames: list[tuple[int, str, int]] = field(default_factory=list)  # (index, module, rva)
+    frames: list[tuple[int, str, int, bool]] = field(default_factory=list)  # (index, module, rva, found by a stack scan)
     crumbs: list["Crumb"] = field(default_factory=list)
+    kind: str = "crash"  # or one of _EVENT_TITLES
+    text: str = ""       # the sentence of an event record
 
     def key(self) -> tuple:
-        return (self.stamp, self.code, self.module.lower(), self.rva, tuple(self.frames))
+        return (self.stamp, self.kind, self.text, self.code, self.module.lower(), self.rva, tuple(self.frames))
 
 
 def parse_records(text: str) -> list[CrashRecord]:
@@ -484,9 +498,15 @@ def parse_records(text: str) -> list[CrashRecord]:
                     thread=int(thread.group(1)) if thread else 0,
                 )
             )
+        event = None if (record or short) else _EVENT.search(line)
+        if event:
+            stamp = _TIMESTAMP.match(line)
+            thread = _THREAD.search(line)
+            records.append(CrashRecord(stamp=stamp.group(1) if stamp else "", code=0, fault=None, module="", rva=0,
+                                       thread=int(thread.group(1)) if thread else 0, kind=event.group("kind"), text=event.group("text").strip()))
         if records:
             for frame in _FRAME.finditer(line):
-                records[-1].frames.append((int(frame.group("n")), frame.group("module"), int(frame.group("rva"), 16)))
+                records[-1].frames.append((int(frame.group("n")), frame.group("module"), int(frame.group("rva"), 16), frame.group("how") == "stack"))
             for crumb in _CRUMB.finditer(line):
                 records[-1].crumbs.append(
                     Crumb(
@@ -499,23 +519,32 @@ def parse_records(text: str) -> list[CrashRecord]:
                         count=int(crumb.group("count")),
                     )
                 )
-    return records
+    # A [TERMINATE] line with no call stack is the server's (render_terminations shows those).
+    return [r for r in records if not (r.kind == "TERMINATE" and not r.frames)]
 
 
 def render_record(number: int, record: CrashRecord, maps: list[LinkerMap], game: GameIdMap) -> list[str]:
-    out = ["", f"=== crash {number}" + (f"  {record.stamp}" if record.stamp else "")]
-    out.append(f"    0x{record.code:08X}  {describe_code(record.code, record.fault)}")
-    if record.cpp_type or record.cpp_what:
-        out.append(f"    C++ type {record.cpp_type}  what(): {record.cpp_what}")
-    short_name = record.module.replace(chr(92), "/").rsplit("/", 1)[-1] or "?"
-    out.append(f"    at      {short_name}+0x{record.rva:X}")
-    out.append(f"            {explain(record.module, record.rva, maps, game)}")
-    for index, module, rva in record.frames:
-        out.append(f"    #{index:<2}     {module}+0x{rva:X}")
+    if record.kind == "crash":
+        out = ["", f"=== crash {number}" + (f"  {record.stamp}" if record.stamp else "")]
+        out.append(f"    0x{record.code:08X}  {describe_code(record.code, record.fault)}")
+        if record.cpp_type or record.cpp_what:
+            out.append(f"    C++ type {record.cpp_type}  what(): {record.cpp_what}")
+        short_name = record.module.replace(chr(92), "/").rsplit("/", 1)[-1] or "?"
+        out.append(f"    at      {short_name}+0x{record.rva:X}")
+        out.append(f"            {explain(record.module, record.rva, maps, game)}")
+    else:
+        out = ["", f"=== record {number}" + (f"  {record.stamp}" if record.stamp else "") + f"  {_EVENT_TITLES.get(record.kind, record.kind)}"]
+        out.append(f"    {record.text}")
+        if record.kind == "HANG":
+            out.append("    The frames marked '~' are return addresses found on the stuck thread's stack, innermost first;")
+            out.append("    a few may be left over from earlier calls. The first OURS or GAME frames say where it stood.")
+    for index, module, rva, scanned in record.frames:
+        out.append(f"    {'~' if scanned else '#'}{index:<2}     {module}+0x{rva:X}")
         out.append(f"            {explain(module, rva, maps, game)}")
     if record.crumbs:
         opcodes = load_opcode_names()
-        out.append("    before the fault (oldest first; '*' = on the thread that crashed):")
+        out.append("    before the fault (oldest first; '*' = on the thread that crashed):" if record.kind == "crash"
+                   else "    before the record (oldest first; '*' = on the thread the record names):")
         # Both rings are written oldest first; one timeline is easier to read than two.
         for crumb in sorted(record.crumbs, key=lambda c: -c.age_ms):
             mark = "*" if record.thread and crumb.thread == record.thread else " "
@@ -551,7 +580,7 @@ def symbolize_text(text: str, maps: list[LinkerMap], game: GameIdMap, last: int 
     if not records:
         if terminations:
             return terminations
-        return ["no crash record found (looked for [UNHANDLED_CRASH], [TERMINATE] and 'Unhandled crash:' lines)"]
+        return ["no crash record found (looked for [UNHANDLED_CRASH], [HANG], [TERMINATE], [PURECALL], [INVALID_PARAMETER], [ABORT] and 'Unhandled crash:' lines)"]
     out: list[str] = []
     first = max(0, len(records) - last) if last > 0 else 0
     if first:
@@ -574,6 +603,71 @@ def read_input(path: str) -> str:
 _REPORT_BINARY = re.compile(r"^(?P<path>[^|]+?)\s*\|.*?\bpe_timestamp=(?P<stamp>[0-9A-Fa-f]+)", re.M)
 
 
+_BOOT_START = re.compile(r"\[BOOT\] Checkpoint \|.*GamePathSet=1")
+_BOOT_BUILD = re.compile(r"Build='(?P<build>[^']*)'")
+_START_MARKS = (
+    ("[UNHANDLED_CRASH]", "CRASHED (see the crash records)"),
+    ("[TERMINATE]", "ended by std::terminate (see the records)"),
+    ("[PURECALL]", "ended by a pure virtual call (see the records)"),
+    ("[INVALID_PARAMETER]", "ended by the C runtime (see the records)"),
+    ("[ABORT]", "ended by abort() (see the records)"),
+    ("[HANG-END]", None),  # a stall that ended is not an ending
+    ("[HANG]", "HUNG (see the records)"),
+    ("[EXIT]", "ended normally"),
+)
+
+
+def summarize_starts(text: str, last: int = 12) -> list[str]:
+    """One line per start of the game from RFAB_Online_Startup.log: when, how far it got, how it ended.
+
+    A start with no ending at all is the case the 2026-11-15 playtest was full of: the process
+    disappeared (closed from the task manager, killed by Windows or by a driver reset, a fast-fail
+    that no handler sees). Windows may know more: windows/application_events.txt of the report.
+    """
+    starts: list[dict] = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if _BOOT_START.search(line):
+            stamp = _TIMESTAMP.match(line)
+            build = _BOOT_BUILD.search(line)
+            starts.append({"stamp": stamp.group(1) if stamp else "(no time: written by 4.1.1 or older)", "build": build.group("build") if build else "",
+                           "reached": "launcher", "ending": "", "stalls": 0})
+            continue
+        if not starts:
+            continue
+        current = starts[-1]
+        if "[BOOT OK]" in line:
+            current["reached"] = "game start"
+        elif "main loop is turning" in line:
+            current["reached"] = "main menu"
+        for mark, ending in _START_MARKS:
+            if mark in line:
+                if mark == "[HANG-END]":
+                    current["stalls"] += 1
+                    if current["ending"].startswith("HUNG"):
+                        current["ending"] = ""
+                elif mark == "[HANG]":
+                    current["ending"] = current["ending"] or ending
+                elif ending and (not current["ending"] or mark != "[EXIT]"):
+                    current["ending"] = ending
+                break
+    if not starts:
+        return []
+    first = max(0, len(starts) - last) if last > 0 else 0
+    out = ["", f"=== starts of the game: {len(starts)}" + (f", showing the last {len(starts) - first}" if first else "")]
+    for start in starts[first:]:
+        timed = not start["stamp"].startswith("(")
+        if start["ending"]:
+            ending = start["ending"]
+        elif not timed:
+            ending = "unknown (this version wrote no ending)"
+        else:
+            ending = "NO RECORD OF AN ENDING: the process disappeared (killed, closed from outside, or a failure no handler sees)"
+        stalls = f", {start['stalls']} long stall(s) that ended" if start["stalls"] else ""
+        build = f" build {start['build']}" if start["build"] else ""
+        out.append(f"    {start['stamp']}{build}: reached {start['reached']}{stalls}; {ending}")
+    return out
+
+
 def symbolize_report(folder: Path, extra_maps: list[LinkerMap], game: GameIdMap, last: int) -> list[str]:
     out: list[str] = [f"report folder: {folder}"]
     maps = list(extra_maps)
@@ -592,17 +686,25 @@ def symbolize_report(folder: Path, extra_maps: list[LinkerMap], game: GameIdMap,
     # Do the symbols belong to the binary that was installed when the report was made?
     report_txt = next(iter(sorted(folder.rglob("REPORT.txt"))), None)
     if report_txt is not None:
-        installed = {m.group("path").strip().replace(chr(92), "/").rsplit("/", 1)[-1].lower(): m.group("stamp").lower()
-                     for m in _REPORT_BINARY.finditer(report_txt.read_text(encoding="utf-8", errors="replace"))}
+        # The same file name can be listed more than once: client\\SkyrimSE.exe is our launcher under
+        # the game's name, game\\SkyrimSE.exe is the game itself. The symbols are right when ANY
+        # binary of that name carries their timestamp (until 4.1.2 the last one listed won, and
+        # every report claimed that our own function names were wrong).
+        installed: dict[str, list[str]] = {}
+        for match in _REPORT_BINARY.finditer(report_txt.read_text(encoding="utf-8", errors="replace")):
+            binary = match.group("path").strip().replace(chr(92), "/").rsplit("/", 1)[-1].lower()
+            installed.setdefault(binary, []).append(match.group("stamp").lower())
         for linker_map in maps:
             stem = linker_map.module.lower().rsplit(".", 1)[0]
-            for binary, stamp in installed.items():
+            for binary, stamps in installed.items():
                 if binary.rsplit(".", 1)[0] != stem or not linker_map.timestamp:
                     continue
-                if int(stamp, 16) == int(linker_map.timestamp, 16):
-                    out.append(f"  {binary}: the symbols belong to the installed binary (timestamp {stamp})")
+                wanted = int(linker_map.timestamp, 16)
+                matching = [stamp for stamp in stamps if int(stamp, 16) == wanted]
+                if matching:
+                    out.append(f"  {binary}: the symbols belong to the installed binary (timestamp {matching[0]})")
                 else:
-                    out.append(f"  WARNING {binary}: installed binary has timestamp {stamp}, the symbols are for {linker_map.timestamp}. "
+                    out.append(f"  WARNING {binary}: installed binary has timestamp {', '.join(stamps)}, the symbols are for {linker_map.timestamp}. "
                                f"Names of OUR functions below are WRONG; game addresses are still right.")
 
     crash_logs = sorted(folder.rglob("RFAB_Online_Crash.log"))
@@ -623,18 +725,26 @@ def symbolize_report(folder: Path, extra_maps: list[LinkerMap], game: GameIdMap,
         if source in server_logs:
             terminations.extend(render_terminations(text, last))
     records.sort(key=lambda r: r.stamp)
+    # How each start of the game ended. The copy in the game folder keeps every start.
+    starts: list[str] = []
+    startup_logs = sorted(folder.rglob("RFAB_Online_Startup.log"), key=lambda p: (0 if "game" in p.parts else 1, str(p)))
+    if startup_logs:
+        starts = summarize_starts(startup_logs[0].read_text(encoding="utf-8", errors="replace"))
     if not records:
         if terminations:
             out.append("  no crash record with a call stack; the server ended itself:")
             out.extend(terminations)
+            out.extend(starts)
             return out
         out.append("  no crash record in " + (", ".join(str(s.relative_to(folder)) for s in sources) if sources else "the folder (no RFAB_Online_Crash.log, no STServer_Crash.log, no tp_client log)"))
+        out.extend(starts)
         return out
     first = max(0, len(records) - last) if last > 0 else 0
     out.append(f"  {len(records)} crash record(s)" + (f", showing the last {len(records) - first}" if first else ""))
     for number, record in enumerate(records[first:], first + 1):
         out.extend(render_record(number, record, maps, game))
     out.extend(terminations)
+    out.extend(starts)
     return out
 
 
@@ -795,6 +905,12 @@ def self_test() -> int:
         (root / "REPORT.txt").write_text("client\\SkyrimSE.exe | size=1 | pe_timestamp=11111111 | sha256=00\n", encoding="utf-8")
         expect("WARNING skyrimse.exe: installed binary has timestamp 11111111" in "\n".join(symbolize_report(root, [], game, 10)),
                "folder: a binary that does not match the symbols is called out")
+        # The game's own SkyrimSE.exe is listed too; it must not hide the client binary of the same name.
+        (root / "REPORT.txt").write_text(
+            "client\\SkyrimSE.exe | size=1 | pe_timestamp=6736A5C1 | sha256=00\ngame\\SkyrimSE.exe | size=2 | pe_timestamp=5DCAE282 | sha256=11\n", encoding="utf-8")
+        both = "\n".join(symbolize_report(root, [], game, 10))
+        expect("the symbols belong to the installed binary" in both and "WARNING" not in both,
+               "folder: the game's SkyrimSE.exe next to the client's does not make the symbols look wrong")
         (root / "client" / "RFAB_Online_Symbols.gz").unlink()
         expect("NO SYMBOLS in the report" in "\n".join(symbolize_report(root, [], game, 10)), "folder: missing symbols are called out")
 
@@ -838,12 +954,85 @@ def self_test() -> int:
         expect("2 crash record(s)" in folder_report and "RfabServerCrashSelfTestFault" in folder_report and "std::terminate: 1 record(s)" in folder_report,
                "folder: the server's crash log is read and named with the server's symbols")
 
+    # 4.1.2: the endings that raise no exception, and how each start of the game ended.
+    hang_log = (
+        "[2026-11-16 20:10:05.000] [UNHANDLED_CRASH] TID=4242 Code=0xC0000005 RIP=0x1405E4C9A FaultAddr=0x38 "
+        "Module='D:\\Games\\Skyrim\\SkyrimSE.exe' Base=0x140000000 RVA=+0x5E4C9A RSP=0x1 RBP=0x2\r\n"
+        "    [unwind #0] SkyrimSE.exe+0x5E4C9A (0x1405E4C9A)\r\n"
+        "[2026-11-16 21:03:11.512] [HANG] the game's main loop has not turned for 20 s (running; window does not answer; main thread TID=4242; 5000 turns before; record 1). "
+        "If the game was closed after this line, this is the reason and there is no crash record.\r\n"
+        "    [unwind #0] ntdll.dll+0x9F8A4 (0x7FF8CCCCF8A4)\r\n"
+        "    [stack #1] SkyrimSE.exe[TiltedTrampoline]+0x4001010 (0x144001010)\r\n"
+        "    [stack #2] SkyrimSE.exe+0x5E4C9A (0x1405E4C9A)\r\n"
+        "    [crumbs] events=1 packets=0 hooks=1 dropped=0 (newest last; a/b: see the RFAB_*_CRUMB call sites)\r\n"
+        "    [crumb event -61000ms T4242] blocking-screen a=0x2 b=0x3C x1\r\n"
+        "    [crumb hook -20010ms T4242] HookSaveImpl a=0x0 b=0x0 x1\r\n"
+        "[2026-11-16 21:20:00.000] [TERMINATE] TID=77 the game was stopped by std::terminate: an exception left a thread or a noexcept function "
+        "(the stack below names it); what()=[\"vector too long\"]\r\n"
+        "    [unwind #0] ucrtbase.dll+0x1234 (0x7FF8AAAA1234)\r\n"
+        "    [unwind #1] SkyrimSE.exe[TiltedTrampoline]+0x4001410 (0x144001410)\r\n"
+        "[2026-11-16 21:30:00.000] [PURECALL] TID=78 a pure virtual function was called: an object was used while it was being built or after it was destroyed\r\n"
+        "    [unwind #0] SkyrimSE.exe[TiltedTrampoline]+0x4002040 (0x144002040)\r\n")
+    hang_records = parse_records(hang_log)
+    expect([r.kind for r in hang_records] == ["crash", "HANG", "TERMINATE", "PURECALL"], f"events: four records in order ({[r.kind for r in hang_records]})")
+    expect(len(hang_records[0].frames) == 1 and not hang_records[0].crumbs, "events: a hang's frames and crumbs do not land on the crash before it")
+    expect(len(hang_records[1].frames) == 3 and [f[3] for f in hang_records[1].frames] == [False, True, True] and len(hang_records[1].crumbs) == 2,
+           "events: the hang keeps its unwind frame, its scanned frames and its crumbs")
+    expect(hang_records[1].thread == 4242, "events: the hang names the main thread")
+    hang_report = "\n".join(symbolize_text(hang_log, [linker_map], game))
+    expect("=== record 2  2026-11-16 21:03:11.512  hang: the game's main loop stopped turning" in hang_report, "events: the hang's heading")
+    expect("~1      SkyrimSE.exe+0x4001010" in hang_report and "OURS  CharacterService::OnUpdate +0x10" in hang_report, "events: a scanned frame is marked and named")
+    expect("blocking-screen: a loading (1) or black (2) screen, kind 2, has been up for 60 s" in hang_report, "events: the stuck screen crumb is explained")
+    expect("=== record 3" in hang_report and "what()=[\"vector too long\"]" in hang_report and "OURS  World::{ctor} +0x10" in hang_report,
+           "events: the client's terminate record has its text and its call stack")
+    expect("=== record 4" in hang_report and "pure virtual call" in hang_report and "OURS  HookDamageActor +0x40" in hang_report, "events: pure call")
+    expect(len(parse_records("[2026-11-14 22:05:00.010] [TERMINATE] the server stopped itself: std::terminate was called; what()=[\"x\"]\n")) == 0,
+           "events: the server's one-line terminate record is not a call-stack record")
+
+    startup_log = (
+        "[BOOT] Checkpoint | ExeVersion='1.5.97.0' | GamePathSet=1\r\n"
+        "[BOOT OK] BeginMain() + StartSKSE() completed; entering WinMain!\r\n"
+        "[2026-11-16 20:00:00.000] [BOOT] Checkpoint | Build='4.1.2-abc' | PID=100 | ExeVersion='1.5.97.0' | GamePathSet=1\r\n"
+        "[2026-11-16 20:00:05.000] [BOOT OK] BeginMain() + StartSKSE() completed; entering WinMain!\r\n"
+        "[2026-11-16 20:00:40.000] [BOOT] the game's main loop is turning (first turn 40 s after start, TID=1)\r\n"
+        "[2026-11-16 20:30:00.000] [EXIT] the game is quitting (main loop saw the quit flag) (ran for 1800 s, 99 main-loop turns)\r\n"
+        "[2026-11-16 20:30:01.000] [EXIT] the process is ending the normal way\r\n"
+        "[2026-11-16 20:31:00.000] [BOOT] Checkpoint | Build='4.1.2-abc' | PID=101 | ExeVersion='1.5.97.0' | GamePathSet=1\r\n"
+        "[2026-11-16 20:31:05.000] [BOOT OK] BeginMain() + StartSKSE() completed; entering WinMain!\r\n"
+        "[2026-11-16 20:36:05.000] [HANG] the game was started 300 s ago and its main loop has not turned once (no game window; main thread TID=1; record 1). x\r\n"
+        "[2026-11-16 20:40:00.000] [BOOT] Checkpoint | Build='4.1.2-abc' | PID=102 | ExeVersion='1.5.97.0' | GamePathSet=1\r\n"
+        "[2026-11-16 20:40:05.000] [BOOT OK] BeginMain() + StartSKSE() completed; entering WinMain!\r\n"
+        "[2026-11-16 20:40:40.000] [BOOT] the game's main loop is turning (first turn 40 s after start, TID=1)\r\n"
+        "[2026-11-16 20:50:00.000] [HANG] the game's main loop has not turned for 20 s (running; window does not answer; main thread TID=1; 5 turns before; record 1). x\r\n"
+        "[2026-11-16 20:50:15.000] [HANG-END] the main loop turns again; it stood for 35 s\r\n"
+        "[2026-11-16 21:00:00.000] [BOOT] Checkpoint | Build='4.1.2-abc' | PID=103 | ExeVersion='1.5.97.0' | GamePathSet=1\r\n"
+        "[2026-11-16 21:00:05.000] [BOOT OK] BeginMain() + StartSKSE() completed; entering WinMain!\r\n"
+        "[2026-11-16 21:00:40.000] [BOOT] the game's main loop is turning (first turn 40 s after start, TID=1)\r\n"
+        "[2026-11-16 21:10:00.000] [UNHANDLED_CRASH] TID=1 Code=0xC0000005 RIP=0x1 FaultAddr=0x0 Module='x' Base=0x0 RVA=+0x1\r\n")
+    starts = summarize_starts(startup_log)
+    expect(len(starts) == 7 and starts[1].startswith("=== starts of the game: 5"), f"starts: five starts are listed ({len(starts)} lines)")
+    if len(starts) == 7:
+        expect("no time" in starts[2] and "unknown (this version wrote no ending)" in starts[2], "starts: a start written by an old version claims nothing")
+        expect("2026-11-16 20:00:00.000 build 4.1.2-abc: reached main menu; ended normally" in starts[3], f"starts: a normal session ({starts[3].strip()})")
+        expect("reached game start; HUNG" in starts[4], f"starts: a start that never reached the main loop ({starts[4].strip()})")
+        expect("reached main menu, 1 long stall(s) that ended; NO RECORD OF AN ENDING" in starts[5], f"starts: a stall that ended, then the process disappeared ({starts[5].strip()})")
+        expect("reached main menu; CRASHED" in starts[6], f"starts: a crash ({starts[6].strip()})")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "game").mkdir()
+        (root / "game" / "RFAB_Online_Startup.log").write_text(startup_log, encoding="utf-8")
+        (root / "game" / "RFAB_Online_Crash.log").write_text(hang_log, encoding="utf-8")
+        folder_report = "\n".join(symbolize_report(root, [], game, 10))
+        expect("4 crash record(s)" in folder_report and "=== starts of the game: 5" in folder_report and "hang: the game's main loop stopped turning" in folder_report,
+               "folder: hang records and the list of starts are part of the report")
+
     if failures:
         print("symbolize_crash self-test FAILED:")
         for failure in failures:
             print(f"  - {failure}")
         return 1
-    print("symbolize_crash self-test: map parsing, game ids, both record formats, C++ exceptions, breadcrumbs, the server's crash log")
+    print("symbolize_crash self-test: map parsing, game ids, both record formats, C++ exceptions, breadcrumbs, the server's crash log, "
+          "hang and terminate records, the list of starts")
     return 0
 
 

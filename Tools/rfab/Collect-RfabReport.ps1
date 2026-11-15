@@ -5,7 +5,9 @@
 .DESCRIPTION
     One playtest has to give a place in the code, not "it crashed". This script gathers, from an
     installed RFAB + RFAB Online:
-      - client logs (tp_client*.log), the startup and crash logs, the last crash dump;
+      - client logs (tp_client*.log), the startup and crash logs, the last crash dump - from every
+        folder the client can write to (the game folder, the mod folder, MO2's overwrite folder);
+      - what Windows itself recorded about the game ending (Application Error / Application Hang);
       - the symbol table installed with the client (RFAB_Online_Symbols.gz), so that crash
         addresses can be named for exactly this binary (Tools/rfab/symbolize_crash.py);
       - the co-op config overlay report;
@@ -43,7 +45,7 @@ param(
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
-$CollectorVersion = "1"
+$CollectorVersion = "2"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:Notes = New-Object System.Collections.Generic.List[string]
 $script:Manifest = New-Object System.Collections.Generic.List[string]
@@ -85,6 +87,12 @@ function Add-ReportFile([string]$Src, [string]$RelDst, [long]$MaxBytes) {
         if (-not (Test-Path -LiteralPath $Src -PathType Leaf)) { return $false }
         $item = Get-Item -LiteralPath $Src
         $dst = Join-Path $script:Stage $RelDst
+        # The first file under a name stays: places are read newest first (two folders can hold a
+        # log of the same name after an update moved where the client writes).
+        if (Test-Path -LiteralPath $dst -PathType Leaf) {
+            Add-Note ("not included, a file of this name was already collected: {0}" -f $Src)
+            return $false
+        }
         $truncated = Copy-Capped $Src $dst $MaxBytes
         $mark = ""
         if ($truncated) { $mark = " (only the last $([math]::Round($MaxBytes / 1MB)) MB)" }
@@ -164,6 +172,59 @@ function Find-GameRoot([string]$Hint, [string]$ScriptDir, [bool]$AllowDialog) {
     return ""
 }
 
+function Get-Mo2OverwriteDirs([string]$Mo2Base) {
+    # MO2 keeps files a program creates inside the virtual Data folder in its overwrite folder: the
+    # default one, or the one ModOrganizer.ini names (overwrite_directory, %BASE_DIR% allowed).
+    $dirs = New-Object System.Collections.Generic.List[string]
+    [void]$dirs.Add((Join-Path $Mo2Base "overwrite"))
+    try {
+        $mo2Ini = Join-Path $Mo2Base "ModOrganizer.ini"
+        if (Test-Path -LiteralPath $mo2Ini) {
+            $baseDir = $Mo2Base
+            $custom = ""
+            foreach ($line in [System.IO.File]::ReadAllLines($mo2Ini)) {
+                if ($line -match '^\s*base_directory\s*=\s*(.+?)\s*$') { $baseDir = $Matches[1].Replace("/", "\") }
+                elseif ($line -match '^\s*overwrite_directory\s*=\s*(.+?)\s*$') { $custom = $Matches[1].Replace("/", "\") }
+            }
+            if ($custom) {
+                $custom = $custom.Replace("%BASE_DIR%", $baseDir)
+                if (-not $dirs.Contains($custom)) { [void]$dirs.Add($custom) }
+            }
+        }
+    } catch { }
+    return $dirs
+}
+
+function Add-ClientWriteDir([string]$Dir, [string]$Label, [long]$LogCap, [bool]$WithDumps) {
+    # One folder the client may have written to. Returns the number of tp_client logs found there.
+    # Layouts: <dir>\logs\tp_client*.log (4.1.1 and older) and <dir>\tp_client*.log (RFAB_Online_Logs).
+    if ([string]::IsNullOrWhiteSpace($Dir) -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return 0 }
+    $clientLogs = 0
+    foreach ($logDir in @((Join-Path $Dir "logs"), $Dir)) {
+        if (-not (Test-Path -LiteralPath $logDir -PathType Container)) { continue }
+        foreach ($log in @(Get-ChildItem -LiteralPath $logDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*.log*" -and $_.Name -notlike "RFAB_Online_*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 12)) {
+            if (Add-ReportFile $log.FullName (Join-Parts $Label @("logs", $log.Name)) $LogCap) {
+                if ($log.Name -like "tp_client*") { $clientLogs++ }
+            }
+        }
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath $Dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "RFAB_Online_*" })) {
+        [void](Add-ReportFile $file.FullName (Join-Path $Label $file.Name) $LogCap)
+    }
+    $overlayDir = Join-Path $Dir "rfab_coop_config"
+    if (Test-Path -LiteralPath $overlayDir) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $overlayDir -File -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 2MB } | Select-Object -First 40)) {
+            [void](Add-ReportFile $file.FullName (Join-Parts $Label @("rfab_coop_config", $file.Name)) $LogCap)
+        }
+    }
+    if ($WithDumps) {
+        foreach ($dump in @(Get-ChildItem -LiteralPath $Dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "crash_*.dmp" -or $_.Name -like "hang_*.dmp" } | Sort-Object LastWriteTime -Descending | Select-Object -First 2)) {
+            [void](Add-ReportFile $dump.FullName (Join-Path $Label $dump.Name) 0)
+        }
+    }
+    return $clientLogs
+}
+
 function Hide-Secrets([string]$Text) {
     # "sPassword = hunter2" -> "sPassword = <hidden>"; an empty value stays empty.
     $lines = $Text -split "`r?`n"
@@ -194,26 +255,34 @@ function Invoke-Collect([string]$Root, [string]$TargetDir, [int]$LogCapMB, [bool
     $clientDir = Join-Path $modRoot "SkyrimTogetherReborn"
 
     Invoke-Step "client logs" {
-        if (-not (Test-Path -LiteralPath $clientDir)) { Add-Note "client folder not found: $clientDir"; return }
-        $logDir = Join-Path $clientDir "logs"
-        if (Test-Path -LiteralPath $logDir) {
-            foreach ($log in @(Get-ChildItem -LiteralPath $logDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*.log*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 12)) {
-                [void](Add-ReportFile $log.FullName (Join-Parts "client" @("logs", $log.Name)) $logCap)
-            }
-        } else { Add-Note "no client log folder: $logDir (the client has never started from this install)" }
-        foreach ($file in @(Get-ChildItem -LiteralPath $clientDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "RFAB_Online_*" })) {
-            [void](Add-ReportFile $file.FullName (Join-Path "client" $file.Name) $logCap)
+        if (-not (Test-Path -LiteralPath $clientDir)) { Add-Note "client folder not found: $clientDir" }
+        # Every folder the client can write to. Started through MO2, the client finds itself under the
+        # game's virtual Data folder, and what it creates there lands in MO2's overwrite folder, not
+        # in the mod folder. Playtest 2026-11-15: both reports came without a single client log
+        # because only the mod folder was read. From 4.1.2 the client writes to
+        # <game>\RFAB_Online_Logs; the other folders are read for older builds and as a fallback.
+        $places = New-Object System.Collections.Generic.List[object]
+        [void]$places.Add(@((Join-Path $Root "RFAB_Online_Logs"), "client"))
+        [void]$places.Add(@($clientDir, "client"))
+        $overwriteIndex = 0
+        foreach ($overwrite in @(Get-Mo2OverwriteDirs $mo2Base)) {
+            $label = "client_overwrite"
+            if ($overwriteIndex -gt 0) { $label = "client_overwrite" + $overwriteIndex }
+            [void]$places.Add(@((Join-Path $overwrite "SkyrimTogetherReborn"), $label))
+            $overwriteIndex++
         }
-        $overlayDir = Join-Path $clientDir "rfab_coop_config"
-        if (Test-Path -LiteralPath $overlayDir) {
-            foreach ($file in @(Get-ChildItem -LiteralPath $overlayDir -File -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 2MB } | Select-Object -First 40)) {
-                [void](Add-ReportFile $file.FullName (Join-Parts "client" @("rfab_coop_config", $file.Name)) $logCap)
-            }
+        [void]$places.Add(@((Join-Parts $Root @("Data", "SkyrimTogetherReborn")), "client_gamedata"))
+
+        $clientLogCount = 0
+        $searched = New-Object System.Collections.Generic.List[string]
+        foreach ($place in $places) {
+            $dir = [string]$place[0]
+            if ($searched.Contains($dir)) { continue }
+            [void]$searched.Add($dir)
+            $clientLogCount += (Add-ClientWriteDir $dir ([string]$place[1]) $logCap $WithDumps)
         }
-        if ($WithDumps) {
-            foreach ($dump in @(Get-ChildItem -LiteralPath $clientDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "crash_*.dmp" } | Sort-Object LastWriteTime -Descending | Select-Object -First 2)) {
-                [void](Add-ReportFile $dump.FullName (Join-Path "client" $dump.Name) 0)
-            }
+        if ($clientLogCount -eq 0) {
+            Add-Note ("NO CLIENT LOG (tp_client*.log) was found. Searched: " + ($searched -join "; "))
         }
         foreach ($binary in @("SkyrimSE.exe", "SkyrimTogether.exe", "EarlyLoad.dll", "TPProcess.exe")) {
             Add-BinaryInfo (Join-Path $clientDir $binary) ("client\" + $binary)
@@ -232,8 +301,43 @@ function Invoke-Collect([string]$Root, [string]$TargetDir, [int]$LogCapMB, [bool
     Invoke-Step "server" {
         $serverDir = ""
         foreach ($candidate in @((Join-Path $Root "RFAB_Online_Server"), (Join-Path (Split-Path -Parent $Root) "RFAB_Online_Server"))) {
-            if ($candidate -and (Test-Path -LiteralPath $candidate)) { $serverDir = $candidate; break }
+            if ($candidate -and (Test-Path -LiteralPath $candidate)) {
+                if (-not $serverDir) { $serverDir = $candidate }
+                else { Add-Note ("a second server folder exists and was NOT collected: {0}" -f $candidate) }
+            }
         }
+
+        # A server that is running right now, and where it runs from. Playtest 2026-11-15: the log
+        # of the installed server ended at its start although the session went on, and nothing in the
+        # report said whether another copy of the server had been the one in use.
+        $runningDirs = New-Object System.Collections.Generic.List[string]
+        try {
+            foreach ($proc in @(Get-Process -Name "SkyrimTogetherServer" -ErrorAction SilentlyContinue)) {
+                $procPath = ""
+                $procStart = ""
+                try { $procPath = [string]$proc.Path } catch { $procPath = "" }
+                try { $procStart = $proc.StartTime.ToString("yyyy-MM-dd HH:mm:ss") } catch { $procStart = "?" }
+                Add-Note ("server process running now: pid {0}, started {1}, from {2}" -f $proc.Id, $procStart, $procPath)
+                if ($procPath) {
+                    $procDir = Split-Path -Parent $procPath
+                    if ($procDir -and -not $runningDirs.Contains($procDir)) { [void]$runningDirs.Add($procDir) }
+                }
+            }
+        } catch { Add-Note ("could not list running server processes: {0}" -f $_.Exception.Message) }
+        if ($runningDirs.Count -eq 0) { Add-Note "no server process is running on this machine now" }
+        $otherIndex = 0
+        foreach ($runningDir in $runningDirs) {
+            if ($serverDir -and ([string]::Compare($runningDir.TrimEnd([char]92), $serverDir.TrimEnd([char]92), $true) -eq 0)) { continue }
+            $otherIndex++
+            Add-Note ("THE RUNNING SERVER IS NOT THE INSTALLED ONE: it runs from {0}; its logs are collected as server_running_{1}" -f $runningDir, $otherIndex)
+            $otherLogs = Join-Path $runningDir "logs"
+            if (Test-Path -LiteralPath $otherLogs) {
+                foreach ($log in @(Get-ChildItem -LiteralPath $otherLogs -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 6)) {
+                    [void](Add-ReportFile $log.FullName (Join-Parts ("server_running_" + $otherIndex) @("logs", $log.Name)) $logCap)
+                }
+            }
+        }
+
         if (-not $serverDir) { Add-Note "no RFAB_Online_Server folder next to the game (fine if this machine does not host)"; return }
         $serverLogs = Join-Path $serverDir "logs"
         if (Test-Path -LiteralPath $serverLogs) {
@@ -249,6 +353,13 @@ function Invoke-Collect([string]$Root, [string]$TargetDir, [int]$LogCapMB, [bool
             [System.IO.File]::WriteAllText($dst, $text, $Utf8NoBom)
             [void]$script:Manifest.Add("server\config\STServer.ini | passwords and tokens hidden | from $ini")
         }
+        # The logs of the installation before the last update (kept by the installer since 4.1.2).
+        $oldServerLogs = Join-Path $serverDir "logs_before_update"
+        if (Test-Path -LiteralPath $oldServerLogs) {
+            foreach ($log in @(Get-ChildItem -LiteralPath $oldServerLogs -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 6)) {
+                [void](Add-ReportFile $log.FullName (Join-Parts "server" @("logs_before_update", $log.Name)) $logCap)
+            }
+        }
         foreach ($file in @(Get-ChildItem -LiteralPath $serverDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "RFAB_Online_*" })) {
             [void](Add-ReportFile $file.FullName (Join-Path "server" $file.Name) $logCap)
         }
@@ -256,6 +367,8 @@ function Invoke-Collect([string]$Root, [string]$TargetDir, [int]$LogCapMB, [bool
         if (Test-Path -LiteralPath $checkpoints) {
             $cp = Get-Item -LiteralPath $checkpoints
             Add-Note ("server checkpoint store: {0} bytes, written {1:yyyy-MM-dd HH:mm:ss} (not included)" -f $cp.Length, $cp.LastWriteTime)
+        } else {
+            Add-Note ("no server checkpoint store ({0}): the server in this folder has never completed a group save" -f $checkpoints)
         }
         foreach ($binary in @("SkyrimTogetherServer.exe", "STServer.dll")) {
             Add-BinaryInfo (Join-Path $serverDir $binary) ("server\" + $binary)
@@ -272,6 +385,32 @@ function Invoke-Collect([string]$Root, [string]$TargetDir, [int]$LogCapMB, [bool
         foreach ($file in @($found | Sort-Object LastWriteTime -Descending | Select-Object -First 5)) {
             [void](Add-ReportFile $file.FullName (Join-Path "netscriptframework" $file.Name) $logCap)
         }
+    }
+
+    Invoke-Step "windows event log" {
+        # A game that ends without a crash record of its own (killed by Windows, by a driver, by a
+        # fast-fail, or closed by the player after it stopped responding) still leaves a line here.
+        if (-not (Get-Command Get-WinEvent -ErrorAction SilentlyContinue)) { return }
+        $since = (Get-Date).AddDays(-4)
+        $lines = New-Object System.Collections.Generic.List[string]
+        foreach ($provider in @("Application Error", "Application Hang", "Windows Error Reporting")) {
+            $events = @()
+            try { $events = @(Get-WinEvent -FilterHashtable @{ LogName = "Application"; ProviderName = $provider; StartTime = $since } -MaxEvents 400 -ErrorAction Stop) } catch { $events = @() }
+            foreach ($winEvent in $events) {
+                $message = [string]$winEvent.Message
+                if ($message -notmatch '(?i)SkyrimSE|SkyrimTogether|TPProcess|skse64|STServer') { continue }
+                if ($message.Length -gt 2500) { $message = $message.Substring(0, 2500) + " ..." }
+                [void]$lines.Add(("=== {0:yyyy-MM-dd HH:mm:ss} | {1} | event {2}" -f $winEvent.TimeCreated, $provider, $winEvent.Id))
+                [void]$lines.Add($message.Trim())
+                [void]$lines.Add("")
+                if ($lines.Count -gt 600) { break }
+            }
+        }
+        if ($lines.Count -eq 0) { Add-Note "Windows recorded no application error or hang for the game in the last 4 days"; return }
+        $dst = Join-Parts $script:Stage @("windows", "application_events.txt")
+        New-Item -ItemType Directory -Path (Split-Path -Parent $dst) -Force | Out-Null
+        [System.IO.File]::WriteAllLines($dst, $lines, $Utf8NoBom)
+        [void]$script:Manifest.Add("windows\application_events.txt | Application Error / Application Hang / Windows Error Reporting, last 4 days")
     }
 
     Invoke-Step "SKSE logs" {
@@ -346,8 +485,28 @@ function Invoke-Collect([string]$Root, [string]$TargetDir, [int]$LogCapMB, [bool
     if (-not (Test-Path -LiteralPath $TargetDir)) { New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null }
     $zipPath = Join-Path $TargetDir ("RFAB_Report_" + $stamp + ".zip")
     if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+    # Entry names are written with forward slashes by hand: ZipFile.CreateFromDirectory of the
+    # .NET Framework behind Windows PowerShell 5.1 writes back-slashes, and such an archive unpacks
+    # into files literally named "game\RFAB_Online_Startup.log" anywhere but on Windows.
+    Add-Type -AssemblyName System.IO.Compression | Out-Null
     Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
-    [System.IO.Compression.ZipFile]::CreateFromDirectory($script:Stage, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+    $stageFull = (Get-Item -LiteralPath $script:Stage).FullName.TrimEnd([char[]]@([char]92, [char]47))
+    $zipStream = New-Object System.IO.FileStream($zipPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+    try {
+        $zipArchive = New-Object System.IO.Compression.ZipArchive($zipStream, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($file in @(Get-ChildItem -LiteralPath $script:Stage -File -Recurse | Sort-Object FullName)) {
+                $entryName = $file.FullName.Substring($stageFull.Length + 1).Replace([string][char]92, "/")
+                $entry = $zipArchive.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+                $entry.LastWriteTime = [System.DateTimeOffset]$file.LastWriteTime
+                $entryStream = $entry.Open()
+                try {
+                    $fileStream = New-Object System.IO.FileStream($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                    try { $fileStream.CopyTo($entryStream) } finally { $fileStream.Dispose() }
+                } finally { $entryStream.Dispose() }
+            }
+        } finally { $zipArchive.Dispose() }
+    } finally { $zipStream.Dispose() }
     Remove-Item -LiteralPath $script:Stage -Recurse -Force -ErrorAction SilentlyContinue
     return $zipPath
 }
@@ -381,6 +540,17 @@ function Invoke-SelfTest {
         [System.IO.File]::WriteAllBytes((Join-Path $client "crash_2026-11-14_10-00-00.dmp"), [byte[]](0x4D, 0x44, 0x4D, 0x50))
         [System.IO.File]::WriteAllText((Join-Parts $client @("rfab_coop_config", "coop_config_report.txt")), "overlay report`n", $Utf8NoBom)
         [System.IO.File]::WriteAllText((Join-Path $root "RFAB_Online_Startup.log"), "startup`n", $Utf8NoBom)
+        # What a client started through MO2 really leaves behind (playtest 2026-11-15): its logs and
+        # dumps in MO2's overwrite folder; and what 4.1.2 writes: <game>\RFAB_Online_Logs.
+        $overwriteClient = Join-Parts $root @("MO2", "overwrite", "SkyrimTogetherReborn")
+        New-Item -ItemType Directory -Path (Join-Path $overwriteClient "logs") -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Parts $overwriteClient @("logs", "tp_client.log")), "overwrite client log`n", $Utf8NoBom)
+        [System.IO.File]::WriteAllText((Join-Path $overwriteClient "RFAB_Online_Startup.log"), "overwrite startup`n", $Utf8NoBom)
+        [System.IO.File]::WriteAllBytes((Join-Path $overwriteClient "crash_2026-11-15_17-00-00.dmp"), [byte[]](0x4D, 0x44, 0x4D, 0x50))
+        $gameLogs = Join-Path $root "RFAB_Online_Logs"
+        New-Item -ItemType Directory -Path $gameLogs -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $gameLogs "tp_client_instance_2.log"), "second instance log`n", $Utf8NoBom)
+        [System.IO.File]::WriteAllBytes((Join-Path $gameLogs "hang_2026-11-15_17-05-00.dmp"), [byte[]](0x4D, 0x44, 0x4D, 0x50))
         [System.IO.File]::WriteAllText((Join-Parts $root @("MO2", "ModOrganizer.ini")), "[General]`r`nselected_profile=@ByteArray(RFAB)`r`n", $Utf8NoBom)
         [System.IO.File]::WriteAllText((Join-Parts $root @("MO2", "profiles", "RFAB", "plugins.txt")), "*RFAB.esp`r`n", $Utf8NoBom)
         [System.IO.File]::WriteAllText((Join-Parts $root @("MO2", "overwrite", "NetScriptFramework", "Crash", "Crash_2026_11_14.txt")), "nsf crash`n", $Utf8NoBom)
@@ -397,7 +567,10 @@ function Invoke-SelfTest {
             $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
             try {
                 $entries = @{}
-                foreach ($entry in $archive.Entries) { $entries[$entry.FullName.Replace("\", "/")] = $entry }
+                foreach ($entry in $archive.Entries) {
+                    if ($entry.FullName.Contains([string][char]92)) { [void]$failures.Add("a zip entry name has a back-slash: " + $entry.FullName) }
+                    $entries[$entry.FullName.Replace("\", "/")] = $entry
+                }
                 foreach ($expected in @(
                         "REPORT.txt",
                         "client/logs/tp_client.log",
@@ -405,6 +578,11 @@ function Invoke-SelfTest {
                         "client/RFAB_Online_Symbols.gz",
                         "client/crash_2026-11-14_10-00-00.dmp",
                         "client/rfab_coop_config/coop_config_report.txt",
+                        "client/logs/tp_client_instance_2.log",
+                        "client/hang_2026-11-15_17-05-00.dmp",
+                        "client_overwrite/logs/tp_client.log",
+                        "client_overwrite/RFAB_Online_Startup.log",
+                        "client_overwrite/crash_2026-11-15_17-00-00.dmp",
                         "game/RFAB_Online_Startup.log",
                         "server/logs/STServerOut.log",
                         "server/config/STServer.ini",
@@ -421,6 +599,9 @@ function Invoke-SelfTest {
                 $reportText = & $readEntry "REPORT.txt"
                 if ($reportText -notmatch 'client\\SkyrimSE\.exe \| size=96 \| .*pe_timestamp=6736a5c1') { [void]$failures.Add("REPORT.txt has no PE timestamp line for the client: " + $reportText) }
                 if ($reportText -notmatch "MO2 selected profile: 'RFAB'") { [void]$failures.Add("the selected MO2 profile was not recognised") }
+                if ($reportText -match "NO CLIENT LOG") { [void]$failures.Add("client logs were collected, yet the report says there are none") }
+                $overwriteLogText = & $readEntry "client_overwrite/logs/tp_client.log"
+                if ($overwriteLogText -notmatch "overwrite client log") { [void]$failures.Add("the client log in MO2's overwrite folder was not collected") }
                 $iniText = & $readEntry "server/config/STServer.ini"
                 if ($iniText -match "hunter2") { [void]$failures.Add("a password leaked into the report") }
                 if ($iniText -notmatch "sPassword = <hidden>") { [void]$failures.Add("the password line was not replaced") }
@@ -443,7 +624,7 @@ function Invoke-SelfTest {
         foreach ($failure in $failures) { Write-Host "  - $failure" }
         return 1
     }
-    Write-Host "[RFAB_RESULT] report collector self-test: 11 files collected, secrets hidden, log capped (PowerShell $($PSVersionTable.PSVersion))"
+    Write-Host "[RFAB_RESULT] report collector self-test: 16 files collected (MO2 overwrite and RFAB_Online_Logs included), secrets hidden, log capped (PowerShell $($PSVersionTable.PSVersion))"
     return 0
 }
 

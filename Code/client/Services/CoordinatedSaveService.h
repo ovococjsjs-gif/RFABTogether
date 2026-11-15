@@ -68,6 +68,10 @@ public:
                m_postReloadSyncPending || m_waitingForHostBarrierRelease;
     }
 
+    // Everything this service is waiting for, in one line, for the "stuck screen" and "passive NPC"
+    // records of the client log. Empty when it waits for nothing.
+    [[nodiscard]] std::string DescribeWaits() const;
+
     [[nodiscard]] uint64_t GetLastCommittedEpoch() const noexcept { return m_lastCommittedEpoch; }
     [[nodiscard]] const std::string& GetLastCommittedSlot() const noexcept { return m_lastCommittedSlot; }
 

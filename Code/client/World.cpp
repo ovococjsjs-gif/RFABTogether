@@ -322,6 +322,33 @@ void World::LogMainThreadQueueStats(const char* apWhen) const noexcept
     }
 }
 
+std::string World::DescribeWaits() const
+{
+    const Session::Machine& machine = m_lifecycle.GetMachine();
+    std::string out = fmt::format("phase {}, session #{}, world #{}{}{}", std::string(Session::ToString(m_lifecycle.GetPhase())),
+                                  machine.GetSessionGeneration(), machine.GetWorldGeneration(),
+                                  s_isConnectedCached.load(std::memory_order_acquire) ? ", connected" : ", not connected",
+                                  m_lifecycle.IsWorldLoadingAnyThread() ? ", WORLD LOAD OPEN" : "");
+    if (GetCharacterService().IsSavePurgeActive())
+        out += ", SAVE PURGE RAISED";
+    const std::string saveWaits = GetCoordinatedSaveService().DescribeWaits();
+    if (!saveWaits.empty())
+        out += ", save service: " + saveWaits;
+    return out;
+}
+
+void World::LogStuckScreen(const char* apScreen, uint64_t aSeconds) const noexcept
+{
+    try
+    {
+        spdlog::warn("[RFAB Screen] the {} has been up for {} s while the game keeps running. Waiting for: {}", apScreen, aSeconds, DescribeWaits());
+        LogMainThreadQueueStats("stuck screen");
+    }
+    catch (...)
+    {
+    }
+}
+
 bool World::IsMainThread() noexcept
 {
     const uint32_t mainTid = s_mainThreadId.load(std::memory_order_acquire);

@@ -211,6 +211,29 @@ void CoordinatedSaveService::QueuePurgedAuthorizedSave(const std::string& acSlot
     charSvc.PreSavePurgeDynamicActors();
 }
 
+std::string CoordinatedSaveService::DescribeWaits() const
+{
+    std::string out;
+    const auto add = [&out](bool aSet, const char* apText) {
+        if (!aSet)
+            return;
+        if (!out.empty())
+            out += ", ";
+        out += apText;
+    };
+    add(!m_pendingSaveSlot.empty(), "a save is queued");
+    add(!m_deferredLoadSlot.empty(), "a load is queued");
+    add(m_hasDeferredPrepareSave, "a save request waits for a menu to close");
+    add(m_liveSessionWorldReloadPending, "a coordinated reload is pending");
+    add(m_liveSessionWorldReloadInFlight, "a coordinated reload is in flight");
+    add(m_postReloadSyncPending, "the sync after a reload is pending");
+    add(m_waitingForHostBarrierRelease, "waiting for the host to release the reload barrier");
+    add(m_autoReconnectPendingAfterLoad, "a reconnect after a load is pending");
+    add(m_pendingPreJoinBackup, "the pre-join backup is pending");
+    add(m_deferredInSessionRollback != nullptr, "a rollback waits for a menu to close");
+    return out;
+}
+
 void CoordinatedSaveService::ProcessReadyDeferredSaveOrLoad(BGSSaveLoadManager* apMgr) noexcept
 {
     if (!apMgr)
@@ -232,6 +255,15 @@ void CoordinatedSaveService::ProcessReadyDeferredSaveOrLoad(BGSSaveLoadManager* 
 
         if (CanSafelySaveNow(failReason))
         {
+            if (!charSvc.IsSavePurgeActive())
+            {
+                // The purge was lowered while this save waited (below). Raise it again and give the
+                // engine the same two calm frames the first attempt had.
+                charSvc.PreSavePurgeDynamicActors();
+                m_pendingSavePurgeFrames = 2;
+                return;
+            }
+
             charSvc.PreSavePurgeDynamicActors();
             m_authorizedPendingSaveSlot = RfabCompat::Detail::NormalizeSaveSlotStem(slot);
             ScopedSaveLoadAllowance guard;
@@ -244,6 +276,12 @@ void CoordinatedSaveService::ProcessReadyDeferredSaveOrLoad(BGSSaveLoadManager* 
             --m_pendingSaveRetriesLeft;
             m_pendingSaveRetryDelaySec = 0.25;
             m_pendingSavePurgeFrames = 1;
+            // A save that cannot run yet (the player is in a fight, a menu is open) waits up to six
+            // seconds here. Until 4.1.2 the purge stayed raised for all of it, and while it is raised
+            // this client does not create, remove or re-place the actors it shows for other players
+            // (ReconcileRemoteWorldViews, MoveActor and BuildLocalObserverState stand down) and does
+            // not register its own player. The purge only has to cover the save itself.
+            charSvc.SchedulePostSaveRemoteRestore();
             return;
         }
 

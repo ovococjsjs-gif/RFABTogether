@@ -26,6 +26,9 @@ protected:
     void OnHitEvent(const HitEvent& acEvent) const noexcept;
 
     void RunTargetUpdates(const float acDelta) const noexcept;
+    // Counts the NPCs around the players and writes to the log when enemies stand idle next to a
+    // player (common/Diag/NpcWatch.h). Reads only; changes nothing in the game.
+    void RunNpcWatch(const float acDelta) const noexcept;
 
 private:
     World& m_world;

@@ -64,6 +64,12 @@ struct World : WorldParts::DispatcherOwner, entt::registry
     // Gameplay work belongs in GetRunner().Queue (simulated frames, dropped when its session ends).
     void QueueMainThreadTask(std::function<void()> aTask) noexcept;
     [[nodiscard]] const Session::MainThreadQueue& GetMainThreadQueue() const noexcept { return m_mainThreadQueue; }
+    // One line with everything the client is waiting for: session phase, world load, save service,
+    // save purge. Main thread. Used by the records "a loading or black screen stays up" and
+    // "hostile NPCs stand idle" so that a playtest log names the wait.
+    [[nodiscard]] std::string DescribeWaits() const;
+    // A loading or faded screen has been up for aSeconds while the main loop turns (SkyrimVM64.cpp).
+    void LogStuckScreen(const char* apScreen, uint64_t aSeconds) const noexcept;
 
     [[nodiscard]] bool IsPausedPumpActive() const noexcept { return m_isPausedPumpActive; }
 

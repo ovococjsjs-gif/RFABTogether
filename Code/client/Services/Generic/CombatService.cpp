@@ -22,6 +22,7 @@
 #include <Services/RfabAdapterService.h>
 #include <common/CoopWorldStabilizer.h>
 #include <common/RfabModpackCompat.h>
+#include <common/Diag/NpcWatch.h>
 
 CombatService::CombatService(World& aWorld, TransportService& aTransport, entt::dispatcher& aDispatcher)
     : m_world(aWorld)
@@ -38,6 +39,168 @@ CombatService::CombatService(World& aWorld, TransportService& aTransport, entt::
 void CombatService::OnUpdate(const UpdateEvent& acEvent) const noexcept
 {
     RunTargetUpdates(static_cast<float>(acEvent.Delta));
+    RunNpcWatch(static_cast<float>(acEvent.Delta));
+}
+
+void CombatService::RunNpcWatch(const float acDelta) const noexcept
+{
+    static float s_sinceScanSec = 0.0f;
+    static Diag::NpcReportPacer s_pacer{};
+
+    if (!m_transport.IsConnected())
+    {
+        s_pacer.Reset();
+        s_sinceScanSec = 0.0f;
+        return;
+    }
+
+    s_sinceScanSec += acDelta;
+    if (s_sinceScanSec < 4.0f)
+        return;
+    s_sinceScanSec = 0.0f;
+
+    PlayerCharacter* pLocalPlayer = PlayerCharacter::Get();
+    if (!pLocalPlayer || pLocalPlayer->IsStillLoading() || (!pLocalPlayer->parentCell && !pLocalPlayer->GetWorldSpace()))
+        return;
+
+    // The players: this one and every party peer shown here.
+    TiltedPhoques::Vector<uint32_t> peerFormIds;
+    m_world.GetRfabAdapterService().CollectPartyPeerActorFormIds(peerFormIds);
+
+    constexpr size_t kMaxPlayers = 8;
+    Actor* players[kMaxPlayers]{};
+    size_t playerCount = 0;
+    players[playerCount++] = pLocalPlayer;
+    for (const uint32_t peerFormId : peerFormIds)
+    {
+        if (playerCount >= kMaxPlayers)
+            break;
+        Actor* pPeer = Cast<Actor>(TESForm::GetById(peerFormId));
+        if (!pPeer || pPeer == pLocalPlayer || !pPeer->GetNiNode() || pPeer->IsStillLoading() || pPeer->IsDeleted() || pPeer->IsDead())
+            continue;
+        players[playerCount++] = pPeer;
+    }
+
+    // An enemy this close to a standing player would be fighting. ~12 m; bows and spells reach
+    // further, but further away "has not noticed yet" is a normal state.
+    constexpr float kPlainSightRange = 850.0f;
+    // Only NPCs around the players are counted at all. ~40 m.
+    constexpr float kWatchRange = 2800.0f;
+
+    struct Example
+    {
+        uint32_t FormId{0};
+        Diag::NpcOwner Owner{Diag::NpcOwner::kNobody};
+        bool InCombat{false};
+        bool WeaponDrawn{false};
+        bool HostileToLocal{false};
+        bool RemoteFlag{false};
+        bool TargetLock{false};
+        float Distance{0.0f};
+    };
+    constexpr size_t kMaxExamples = 4;
+    Example examples[kMaxExamples]{};
+    size_t exampleCount = 0;
+
+    Diag::NpcTally tally{};
+
+    auto actors = m_world.view<FormIdComponent>();
+    for (const entt::entity entity : actors)
+    {
+        const uint32_t formId = actors.get<FormIdComponent>(entity).Id;
+        if (formId == 0 || formId == 0x14)
+            continue;
+
+        Actor* pNpc = Cast<Actor>(TESForm::GetById(formId));
+        if (!pNpc || !pNpc->GetNiNode() || pNpc->IsStillLoading() || pNpc->IsDeleted() || pNpc->IsDead())
+            continue;
+
+        const auto* pExt = pNpc->GetExtension();
+        if (!pExt || pExt->IsPlayer())
+            continue;
+        if (pNpc->IsPlayerTeammate() || pNpc->IsPlayerSummon() || pNpc->IsCommandedActor() || pNpc->IsGhost())
+            continue;
+
+        float nearest = -1.0f;
+        bool inPlainSightRange = false;
+        bool hostile = false;
+        for (size_t i = 0; i < playerCount; ++i)
+        {
+            Actor* pPlayer = players[i];
+            if (pPlayer->GetWorldSpace() != pNpc->GetWorldSpace())
+                continue;
+            if (!pNpc->GetWorldSpace() && pPlayer->parentCell != pNpc->parentCell)
+                continue;
+
+            const float dx = pPlayer->position.x - pNpc->position.x;
+            const float dy = pPlayer->position.y - pNpc->position.y;
+            const float dz = pPlayer->position.z - pNpc->position.z;
+            const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (distance > kWatchRange)
+                continue;
+            if (nearest < 0.0f || distance < nearest)
+                nearest = distance;
+
+            const bool hostileToThisPlayer = pNpc->IsHostileToActor(pPlayer);
+            hostile = hostile || hostileToThisPlayer;
+            if (hostileToThisPlayer && distance <= kPlainSightRange && std::abs(dz) <= 250.0f && !pPlayer->actorState.IsSneaking())
+                inPlainSightRange = true;
+        }
+        if (nearest < 0.0f)
+            continue;
+
+        Diag::NpcObservation npc{};
+        npc.Owner = m_world.all_of<LocalComponent>(entity)
+                        ? Diag::NpcOwner::kHere
+                        : (m_world.all_of<RemoteComponent>(entity) ? Diag::NpcOwner::kElsewhere : Diag::NpcOwner::kNobody);
+        npc.HostileToAPlayer = hostile;
+        npc.InCombat = pNpc->IsInCombat();
+        npc.WeaponDrawn = pNpc->actorState.IsWeaponDrawn();
+        // Sleeping draugr, NPCs in furniture or in a scene do not fight by design.
+        npc.PlayerInPlainSightRange = inPlainSightRange && pNpc->GetOccupiedFurniture() == nullptr && !pNpc->IsSpeakingInScene();
+
+        if (tally.Add(npc) && exampleCount < kMaxExamples)
+        {
+            Example& example = examples[exampleCount++];
+            example.FormId = formId;
+            example.Owner = npc.Owner;
+            example.InCombat = npc.InCombat;
+            example.WeaponDrawn = npc.WeaponDrawn;
+            example.HostileToLocal = pNpc->IsHostileToActor(pLocalPlayer);
+            example.RemoteFlag = pExt->IsRemote();
+            example.TargetLock = pExt->HasCombatTargetLock();
+            example.Distance = nearest;
+        }
+    }
+
+    const Diag::NpcReport report = s_pacer.Evaluate(GetTickCount64(), tally.Total, tally.Anomalies());
+    if (report == Diag::NpcReport::kNone)
+        return;
+
+    const auto level = report == Diag::NpcReport::kAnomaly ? spdlog::level::warn : spdlog::level::info;
+    spdlog::log(level,
+                "[RFAB NPC] within 40 m of {} player(s): {} NPC(s), hostile to a player {}; simulated here {} (in combat {}), "
+                "simulated by another player {} (weapon drawn {}), given to nobody {}",
+                playerCount, tally.Total, tally.Hostile, tally.OwnedHere, tally.OwnedHereInCombat, tally.OwnedElsewhere,
+                tally.OwnedElsewhereArmed, tally.Unowned);
+
+    if (report != Diag::NpcReport::kAnomaly)
+        return;
+
+    spdlog::warn("[RFAB NPC] ENEMIES STAND IDLE next to a player for 8 s or longer: simulated here and not fighting {}, "
+                 "simulated by another player and shown unarmed {}, given to nobody {}. Client waits: {}",
+                 tally.IdleHostileHere, tally.IdleHostileElsewhere, tally.HostileUnowned, m_world.DescribeWaits());
+    for (size_t i = 0; i < exampleCount; ++i)
+    {
+        const Example& example = examples[i];
+        const char* pOwner = example.Owner == Diag::NpcOwner::kHere
+                                 ? "simulated here"
+                                 : (example.Owner == Diag::NpcOwner::kElsewhere ? "simulated by another player" : "given to nobody");
+        spdlog::warn("[RFAB NPC]   form {:X}: {}, {:.0f} units from the nearest player, in combat: {}, weapon drawn: {}, "
+                     "hostile to this player: {}, AI switched off here (remote flag): {}, combat target lock: {}",
+                     example.FormId, pOwner, example.Distance, example.InCombat, example.WeaponDrawn, example.HostileToLocal,
+                     example.RemoteFlag, example.TargetLock);
+    }
 }
 
 void CombatService::OnLocalComponentRemoved(entt::registry& aRegistry, entt::entity aEntity) const noexcept
