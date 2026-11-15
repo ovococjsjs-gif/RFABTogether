@@ -243,7 +243,7 @@ void InventoryService::OnEquipmentChangeEvent(const EquipmentChangeEvent& acEven
 
     const bool isLeader = m_world.GetPartyService().IsLeader(); // Helps distinguish in 2-party logs
     Actor* pActor = Cast<Actor>(TESForm::GetById(acEvent.ActorId));
-    if (!pActor || pActor->IsStillLoading() || pActor->IsDeleted())
+    if (!pActor || pActor->IsDeleted())
         return;
 
     const auto* pActorExt = pActor->GetExtension();
@@ -252,6 +252,8 @@ void InventoryService::OnEquipmentChangeEvent(const EquipmentChangeEvent& acEven
 
     const char* pActorBaseName = pActor->baseForm ? pActor->baseForm->GetName() : "<null>";
 
+    // Flag DirtyInventory BEFORE checking IsStillLoading() so outfits/weapons equipped while the
+    // actor is finishing background stream-in during WaitingForAssignment are never lost!
     if (auto* pWaitingAssign = m_world.try_get<WaitingForAssignmentComponent>(actorEntity))
     {
         pWaitingAssign->DirtyInventory = true;
@@ -262,6 +264,9 @@ void InventoryService::OnEquipmentChangeEvent(const EquipmentChangeEvent& acEven
             pActorBaseName);
         return;
     }
+
+    if (pActor->IsStillLoading())
+        return;
 
     std::optional<uint32_t> serverIdRes = Utils::GetServerId(actorEntity);
     if (!serverIdRes.has_value())

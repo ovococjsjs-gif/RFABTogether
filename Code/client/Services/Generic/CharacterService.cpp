@@ -23,6 +23,7 @@
 
 #include <BranchInfo.h>
 #include <Components.h>
+#include <common/CoopEquipGuard.h>
 #include <common/CoopInventoryDiff.h>
 
 #include <Systems/InterpolationSystem.h>
@@ -659,11 +660,91 @@ bool CharacterService::TakeOwnership(const uint32_t acFormId, const uint32_t acS
         return false;
     }
 
+    bool wasRemoteWeaponDrawn = false;
+    if (const auto modelIt = m_remoteModels.find(acServerId); modelIt != m_remoteModels.end())
+        wasRemoteWeaponDrawn = wasRemoteWeaponDrawn || modelIt->second.SpawnRequest.IsWeaponDrawn;
+    if (const auto* pWaiting3D = m_world.try_get<WaitingFor3D>(acEntity))
+        wasRemoteWeaponDrawn = wasRemoteWeaponDrawn || pWaiting3D->SpawnRequest.IsWeaponDrawn;
+    if (const auto drawIt = m_weaponDrawUpdates.find(acFormId); drawIt != m_weaponDrawUpdates.end())
+        wasRemoteWeaponDrawn = wasRemoteWeaponDrawn || drawIt->second.m_isWeaponDrawn;
+
+    // CRITICAL: When CharacterSpawnRequest + NotifyOwnershipTransfer arrive back-to-back in the same
+    // network poll batch (dormant wake-up, party leader change, peer disconnect, or lease expiry),
+    // MaterializeRemoteView staged WaitingFor3D without applying InventoryContent yet. Flush WaitingFor3D
+    // BEFORE deleting remote components or calling BuildActorData(pActor) so we never discard the server's
+    // authoritative weapons/spells or overwrite them on the server with an uninitialized local inventory!
+    if (m_world.all_of<WaitingFor3D>(acEntity) && pActor->GetNiNode() && !pActor->IsStillLoading())
+    {
+        const auto& waitingFor3D = m_world.get<WaitingFor3D>(acEntity);
+        const CharacterSpawnRequest& activeSpawn = ResolveAuthoritativeSpawnState(acEntity, waitingFor3D.SpawnRequest);
+        if (pActor->IsDead() != activeSpawn.IsDead)
+            activeSpawn.IsDead ? KillActorSuppressingDuplicateXp(pActor) : pActor->ResurrectInPlace();
+        if (CoopInventoryDiff::ShouldApplyWholesaleActorInventory(
+                activeSpawn.InventoryContent,
+                activeSpawn.IsPlayer,
+                activeSpawn.IsDead || pActor->IsDead()))
+        {
+            pActor->SetActorInventory(activeSpawn.InventoryContent);
+        }
+        pActor->SetActorValues(activeSpawn.InitialActorValues);
+        pActor->SetFactions(activeSpawn.FactionsContent);
+    }
+
     pExtension->SetRemote(false);
     SanitizeActorCombatStateForLocalOwnership(pActor);
     pExtension->SetNakedDeadline();
     if (!pActor->IsDead() && pActor->formID != 0x14)
         pActor->EvaluatePackage();
+
+    // If the actor was actively fighting / had its weapon drawn before ownership handed off to us
+    // (e.g. leader switch or peer disconnect mid-combat), keep its weapon drawn and re-engage the
+    // nearest valid hostile party target so it never drops aggro and stands passively!
+    const bool isCompanionOrSummon =
+        pActor->IsPlayerTeammate() || pActor->IsPlayerSummon() || pActor->IsCommandedActor();
+    if (!pActor->IsDead() && pActor->formID != 0x14 && wasRemoteWeaponDrawn && !isCompanionOrSummon &&
+        !pActor->IsGhost() && pActor->GetOccupiedFurniture() == nullptr && !pActor->IsSpeakingInScene())
+    {
+        pActor->SetWeaponDrawnEx(true);
+        if (!pActor->IsInCombat())
+        {
+            Actor* pBestTarget = nullptr;
+            float bestDistSq = 2200.0f * 2200.0f;
+            const auto& downedSvc = m_world.GetDownedStateService();
+            auto considerPartyTarget = [&](Actor* apCandidate) noexcept
+            {
+                if (!apCandidate || !apCandidate->GetNiNode() || apCandidate->IsStillLoading() || apCandidate->IsDeleted())
+                    return;
+                if (apCandidate->GetWorldSpace() != pActor->GetWorldSpace())
+                    return;
+                if (!pActor->GetWorldSpace() && apCandidate->parentCell != pActor->parentCell)
+                    return;
+                if (apCandidate->IsDead() || apCandidate->actorState.IsBleedingOut() ||
+                    downedSvc.IsActorDowned(apCandidate->formID) || apCandidate->IsGhost())
+                    return;
+                if (!pActor->IsHostileToActor(apCandidate))
+                    return;
+                const float dx = apCandidate->position.x - pActor->position.x;
+                const float dy = apCandidate->position.y - pActor->position.y;
+                const float absDz = std::abs(apCandidate->position.z - pActor->position.z);
+                const float distSq = dx * dx + dy * dy;
+                if (absDz <= 600.0f && distSq < bestDistSq)
+                {
+                    bestDistSq = distSq;
+                    pBestTarget = apCandidate;
+                }
+            };
+
+            considerPartyTarget(PlayerCharacter::Get());
+
+            TiltedPhoques::Vector<uint32_t> peerFormIds;
+            m_world.GetRfabAdapterService().CollectPartyPeerActorFormIds(peerFormIds);
+            for (const uint32_t peerFormId : peerFormIds)
+                considerPartyTarget(Cast<Actor>(TESForm::GetById(peerFormId)));
+
+            if (pBestTarget)
+                pActor->StartCombatEx(pBestTarget);
+        }
+    }
 
     const uint64_t effectiveEpoch = aOwnershipEpoch != 0 ? aOwnershipEpoch : m_ownershipLeases.EpochOf(acServerId);
     m_weaponDrawUpdates.erase(acFormId);
@@ -1357,35 +1438,43 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
 
     m_world.GetActorValueService().NoteAuthoritativeHealthRevision(acMessage.ServerId, acMessage.HealthRevision);
 
-    if (acMessage.Owner)
+    uint64_t pendingModelGrantEpoch = 0;
+    uint32_t pendingModelHealthRev = 0;
+    if (const auto pendingIt = m_remoteModels.find(acMessage.ServerId); pendingIt != m_remoteModels.end())
     {
-        m_ownershipLeases.AcceptEpoch(acMessage.ServerId, acMessage.OwnershipEpoch, true);
+        pendingModelGrantEpoch = pendingIt->second.PendingOwnershipEpoch;
+        pendingModelHealthRev = pendingIt->second.PendingHealthRevision;
+    }
+
+    const bool isPlayerActor = (pActor->formID == 0x14) || (acMessage.PlayerId != 0);
+    const uint64_t effectiveOwnerEpoch = std::max(acMessage.OwnershipEpoch, pendingModelGrantEpoch);
+    const bool acceptedAsLocalOwner =
+        acMessage.Owner && m_ownershipLeases.AcceptEpoch(acMessage.ServerId, effectiveOwnerEpoch, true);
+
+    if (acceptedAsLocalOwner)
+    {
+        if (pendingModelHealthRev != 0)
+            m_world.GetActorValueService().NoteAuthoritativeHealthRevision(acMessage.ServerId, pendingModelHealthRev);
+
         spdlog::info(__FUNCTION__ ": received local actor, form id: {:X}, {}", pActor->formID, pActor->baseForm ? pActor->baseForm->GetName() : "<null>");
 
-        if (const auto modelIt = m_remoteModels.find(acMessage.ServerId);
-            modelIt != m_remoteModels.end() && acMessage.PlayerId == 0)
+        if (const auto modelIt = m_remoteModels.find(acMessage.ServerId); modelIt != m_remoteModels.end())
         {
-            // NEVER re-template a live, locally owned actor here. RFAB resolves `TESLevCharacter` placed
-            // references into its own dynamic leveled templates (`0xFF00xxxx`), so the server-side cached
-            // `BaseId` is by definition older than the live base form. Forcing it back used to run
-            // `DisableImpl()` -> `SetBaseForm()` -> `EnableImpl()`, which made the engine drop the NiNode,
-            // which `DiscoveryService` reported as `ActorRemovedEvent`, which triggered
-            // `CancelServerAssignment()` -> ownership transfer to the server -> the NPC lost its local AI
-            // (it "ignored" the player) and had its equipment re-applied from stale spawn data (it fought
-            // with a non-primary weapon) until the next assignment round.
-            // The owner client is authoritative for its own actors: keep the live base form. The wire format is
-            // deliberately left untouched (`ActorData` carries no base id), because RFAB's leveled templates live
-            // in the dynamic `0xFF00xxxx` range and `ModSystem::GetServerModId` would map them onto an unrelated
-            // static form on the receiving side. Full template parity for peers is the v2.0.4 backlog item.
-            const uint32_t cExpectedBaseId = m_world.GetModSystem().GetGameId(modelIt->second.SpawnRequest.BaseId);
-            if (cExpectedBaseId != 0 && pActor->baseForm && pActor->baseForm->formID != cExpectedBaseId)
+            if (acMessage.PlayerId == 0)
             {
-                spdlog::debug(
-                    "[RFAB LeveledSync] keeping owner-authoritative base form {:X} on locally owned actor {:X} "
-                    "(server cached {:X}); publishing it upwards instead of re-templating the live reference",
-                    pActor->baseForm->formID,
-                    pActor->formID,
-                    cExpectedBaseId);
+                // NEVER re-template a live, locally owned actor here. RFAB resolves `TESLevCharacter` placed
+                // references into its own dynamic leveled templates (`0xFF00xxxx`), so the server-side cached
+                // `BaseId` is by definition older than the live base form.
+                const uint32_t cExpectedBaseId = m_world.GetModSystem().GetGameId(modelIt->second.SpawnRequest.BaseId);
+                if (cExpectedBaseId != 0 && pActor->baseForm && pActor->baseForm->formID != cExpectedBaseId)
+                {
+                    spdlog::debug(
+                        "[RFAB LeveledSync] keeping owner-authoritative base form {:X} on locally owned actor {:X} "
+                        "(server cached {:X}); publishing it upwards instead of re-templating the live reference",
+                        pActor->baseForm->formID,
+                        pActor->formID,
+                        cExpectedBaseId);
+                }
             }
 
             m_remoteModels.erase(modelIt);
@@ -1416,7 +1505,6 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
                 }
             }
 
-            const bool isPlayerActor = (pActor->formID == 0x14) || (acMessage.PlayerId != 0);
             const bool shouldApplyInventory = CoopInventoryDiff::ShouldApplyWholesaleActorInventory(
                 acMessage.CurrentInventory,
                 isPlayerActor,
@@ -1453,7 +1541,7 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
             m_weaponDrawUpdates.erase(pActor->formID);
         }
 
-        m_world.emplace_or_replace<LocalComponent>(cEntity, acMessage.ServerId, acMessage.OwnershipEpoch);
+        m_world.emplace_or_replace<LocalComponent>(cEntity, acMessage.ServerId, effectiveOwnerEpoch);
         auto& localAnimationComponent = m_world.emplace_or_replace<LocalAnimationComponent>(cEntity);
 
         pActor->GetExtension()->SetRemote(false);
@@ -1470,10 +1558,21 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
         }
         m_world.remove<EarlyAnimationBufferComponent>(cEntity);
 
-        // Flush mutations that occurred during the `WaitingForAssignment` RTT window (#932):
-        // if an NPC finished equipping its outfit/weapons while `AssignCharacterRequest` was in flight,
-        // push the updated `ActorData` immediately so peers never see naked NPCs!
-        if (!serverProvidedExistingState && waitingSnapshot.DirtyInventory)
+        // Flush mutations that occurred during the `WaitingForAssignment` RTT window (#932),
+        // silent engine InitOutfitItems / InitLeveledItems weapon populations, and unseeded
+        // dormant checkpoint records whose live NPC weapons were preserved locally!
+        const Inventory liveInventory = pActor->GetActorInventory();
+        const bool serverInvEmpty = CoopInventoryDiff::IsActorInventoryEmpty(acMessage.CurrentInventory);
+        const bool liveInvNonEmpty = !CoopInventoryDiff::IsActorInventoryEmpty(liveInventory);
+        const bool liveInvDiffers = (liveInventory != acMessage.CurrentInventory);
+        if (CoopEquipGuard::ShouldSyncPostAssignmentInventory(
+                serverProvidedExistingState,
+                waitingSnapshot.DirtyInventory,
+                liveInvDiffers,
+                isPlayerActor,
+                acMessage.IsDead || pActor->IsDead(),
+                serverInvEmpty,
+                liveInvNonEmpty))
         {
             RequestOwnershipClaim syncClaim{};
             syncClaim.ServerId = acMessage.ServerId;
@@ -1492,7 +1591,8 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
     }
     else
     {
-        m_ownershipLeases.AcceptEpoch(acMessage.ServerId, acMessage.OwnershipEpoch, false);
+        if (!acMessage.Owner)
+            (void)m_ownershipLeases.AcceptEpoch(acMessage.ServerId, acMessage.OwnershipEpoch, false);
         spdlog::info(__FUNCTION__ ": received remote actor, form id: {:X}, isweapondrawn: {}, {}", pActor->formID, acMessage.IsWeaponDrawn, pActor->baseForm ? pActor->baseForm->GetName() : "<null>");
 
         if (const auto modelIt = m_remoteModels.find(acMessage.ServerId);
@@ -1516,8 +1616,13 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
         m_world.emplace_or_replace<ReplayedActionsDebugComponent>(cEntity, acMessage.ActionsToReplay);
 #endif
 
-        // Equip inventory immediately only if 3D is already loaded; otherwise WaitingFor3D applies it once GetNiNode() != nullptr.
-        if (pActor->GetNiNode() && !pActor->IsStillLoading())
+        // Equip inventory immediately only if 3D is already loaded AND the server inventory is valid
+        // (never wipe a live non-player NPC's weapons when the server record is still empty!).
+        const bool shouldApplyRemoteInv = CoopInventoryDiff::ShouldApplyWholesaleActorInventory(
+            acMessage.CurrentInventory,
+            isPlayerActor,
+            acMessage.IsDead || pActor->IsDead());
+        if (shouldApplyRemoteInv && pActor->GetNiNode() && !pActor->IsStillLoading())
             pActor->SetActorInventory(acMessage.CurrentInventory);
         pActor->SetActorValues(acMessage.AllActorValues);
 
@@ -1566,12 +1671,33 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
         model.LatestRotation.y = pActor->rotation.z;
         model.IsMaterialized = true;
 
-        if (!pActor->GetNiNode())
+        const bool hasNewerDeferredGrant =
+            !acMessage.Owner && pendingModelGrantEpoch > acMessage.OwnershipEpoch;
+        if (hasNewerDeferredGrant)
+        {
+            model.PendingOwnershipEpoch = pendingModelGrantEpoch;
+            model.PendingHealthRevision = pendingModelHealthRev;
+        }
+
+        if (!pActor->GetNiNode() || pActor->IsStillLoading())
             m_world.emplace_or_replace<WaitingFor3D>(cEntity, model.SpawnRequest);
 
         if (!MoveActor(pActor, acMessage.WorldSpaceId, acMessage.CellId, acMessage.Position))
         {
             DematerializeRemoteView(cEntity, &model);
+            return;
+        }
+
+        // If a newer NotifyOwnershipTransfer arrived while AssignCharacterRequest was in flight,
+        // promote immediately once 3D is ready so the actor never freezes with zero owners!
+        if (hasNewerDeferredGrant && pActor->GetNiNode() && !pActor->IsStillLoading())
+        {
+            if (pendingModelHealthRev != 0)
+                m_world.GetActorValueService().NoteAuthoritativeHealthRevision(acMessage.ServerId, pendingModelHealthRev);
+            model.PendingOwnershipEpoch = 0;
+            model.PendingHealthRevision = 0;
+            pActor->GetExtension()->SetNakedDeadline();
+            (void)TakeOwnership(pActor->formID, acMessage.ServerId, cEntity, pendingModelGrantEpoch);
             return;
         }
     }
@@ -1808,8 +1934,13 @@ void CharacterService::OnOwnershipTransfer(const NotifyOwnershipTransfer& acMess
     const bool isRemoteHere = hasFormId && m_world.all_of<RemoteComponent>(entity);
     const bool isLocalHere = hasFormId && m_world.all_of<LocalComponent>(entity);
     const bool isQueued = m_remoteModels.find(acMessage.ServerId) != m_remoteModels.end();
+    Actor* pBoundRemoteActor = isRemoteHere
+        ? Cast<Actor>(TESForm::GetById(m_world.get<FormIdComponent>(entity).Id))
+        : nullptr;
+    const bool isWaitingFor3DNotReady =
+        isRemoteHere && (!pBoundRemoteActor || !pBoundRemoteActor->GetNiNode() || pBoundRemoteActor->IsStillLoading());
 
-    switch (RemoteLifecycle::DecideGrantHandling(hasFormId, isRemoteHere, isLocalHere, isQueued))
+    switch (RemoteLifecycle::DecideGrantHandling(hasFormId, isRemoteHere, isLocalHere, isQueued, isWaitingFor3DNotReady))
     {
     case RemoteLifecycle::GrantAction::TakeOver:
     {
@@ -1837,20 +1968,23 @@ void CharacterService::OnOwnershipTransfer(const NotifyOwnershipTransfer& acMess
     }
     case RemoteLifecycle::GrantAction::Defer:
     {
-        // Two-phase dormant wake-up: if `RemoteEntityModel` already exists (queued behind the 4/frame spawn budget
-        // or waiting for `TESForm::IsLoading()` / cell `loadedCellData` to finish streaming), stage
-        // `PendingOwnershipEpoch` so `MaterializeRemoteView` promotes it to `TakeOwnership` on the very frame it
-        // materializes — NEVER prematurely decline and strand the NPC in `Owner == nullptr` dormant limbo!
+        // Two-phase dormant wake-up & 3D-streaming protection: if `RemoteEntityModel` already exists
+        // (queued behind the 4/frame spawn budget, waiting for cell `loadedCellData`, or materialized
+        // with GetNiNode() == nullptr), stage `PendingOwnershipEpoch` so `MaterializeRemoteView` /
+        // `RunRemoteUpdates` promotes it to `TakeOwnership` only AFTER applying `WaitingFor3D`!
         if (auto modelIt = m_remoteModels.find(acMessage.ServerId); modelIt != m_remoteModels.end())
         {
             (void)m_ownershipLeases.AcceptEpoch(acMessage.ServerId, acMessage.OwnershipEpoch, false);
             modelIt.value().PendingOwnershipEpoch = acMessage.OwnershipEpoch;
             modelIt.value().PendingHealthRevision = acMessage.HealthRevision;
+            if (isRemoteHere && !m_world.all_of<WaitingFor3D>(entity))
+                m_world.emplace_or_replace<WaitingFor3D>(entity, modelIt.value().SpawnRequest);
             spdlog::info(
-                "Deferred ownership claim for queued WorldModel {:X} (epoch {}) until FormView materializes",
+                "Deferred ownership claim for queued WorldModel {:X} (epoch {}) until FormView/3D materializes",
                 acMessage.ServerId,
                 acMessage.OwnershipEpoch);
-            ReconcileRemoteWorldViews();
+            if (!hasFormId)
+                ReconcileRemoteWorldViews();
             return;
         }
         break;
@@ -1935,6 +2069,28 @@ void CharacterService::OnRemoveCharacter(const NotifyRemoveCharacter& acMessage)
                 m_world.destroy(entity);
             break;
         }
+    }
+    else if (entity != entt::null && m_world.all_of<LocalComponent>(entity))
+    {
+        // Server removed an entity we still held locally (e.g. duplicate-owner race or server prune, #932):
+        // strip stale LocalComponent so we never continue quoting a destroyed ServerId, and re-register if loaded.
+        m_world.remove<LocalAnimationComponent, LocalComponent>(entity);
+        Actor* pLiveActor = nullptr;
+        uint32_t formId = 0;
+        if (const auto* pFormComp = m_world.try_get<FormIdComponent>(entity))
+        {
+            formId = pFormComp->Id;
+            pLiveActor = Cast<Actor>(TESForm::GetById(formId));
+        }
+        if (pLiveActor)
+        {
+            if (auto* pExt = pLiveActor->GetExtension())
+                pExt->SetRemote(false);
+        }
+        if (formId != 0 && pLiveActor && pLiveActor->parentCell && pLiveActor->parentCell->loadedCellData)
+            ProcessNewEntity(entity);
+        else if (m_world.orphan(entity))
+            m_world.destroy(entity);
     }
 }
 

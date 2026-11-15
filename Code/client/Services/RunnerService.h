@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ThreadAffinity.h>
 #include <common/Session/MainThreadQueue.h>
 
 struct UpdateEvent;
@@ -33,6 +34,8 @@ struct RunnerService
      */
     template <class T> void Trigger(T acEvent)
     {
+        if (RejectIfSimulationLaneFull())
+            return;
         QueueForThisWorld([event = std::move(acEvent), this]() { m_dispatcher.trigger(std::move(event)); });
     }
 
@@ -42,6 +45,8 @@ struct RunnerService
      */
     template <class T> void TriggerInSession(T acEvent)
     {
+        if (RejectIfSimulationLaneFull())
+            return;
         Queue([event = std::move(acEvent), this]() { m_dispatcher.trigger(std::move(event)); });
     }
 
@@ -58,7 +63,8 @@ struct RunnerService
     void QueueForThisWorld(std::function<void()> aFunctor) noexcept;
 
 private:
-    void WarnOverflow() noexcept;
+    RFAB_ANY_THREAD [[nodiscard]] bool RejectIfSimulationLaneFull() noexcept;
+    RFAB_ANY_THREAD void WarnOverflow() noexcept;
 
     entt::dispatcher& m_dispatcher;
     Session::MainThreadQueue& m_queue;

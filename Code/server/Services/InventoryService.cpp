@@ -267,6 +267,68 @@ void InventoryService::OnEquipmentChanges(const PacketEvent<RequestEquipmentChan
     {
         auto& inventoryComponent = view.get<InventoryComponent>(*it);
         inventoryComponent.Content.UpdateEquipment(message.CurrentInventory);
+
+        // Fallback when Skyrim queued the equip transition so GetEquipment() did not yet mark ExtraWorn:
+        // ensure an explicit physical equip packet always leaves message.ItemId present and worn on the server.
+        if (!message.Unequip && !message.IsSpell && !message.IsShout && message.ItemId != GameId{})
+        {
+            const bool isLeftHandSlot =
+                (message.EquipSlotId.ModId == 0 && message.EquipSlotId.BaseId == 0x00013F43u);
+            const bool isRightHandSlot =
+                (message.EquipSlotId.ModId == 0 && message.EquipSlotId.BaseId == 0x00013F42u);
+
+            auto existingWorn = std::find_if(
+                inventoryComponent.Content.Entries.begin(),
+                inventoryComponent.Content.Entries.end(),
+                [&](const Inventory::Entry& aEntry) {
+                    if (aEntry.BaseId != message.ItemId || aEntry.Count <= 0)
+                        return false;
+                    return isLeftHandSlot ? aEntry.ExtraWornLeft : aEntry.ExtraWorn;
+                });
+
+            if (existingWorn == inventoryComponent.Content.Entries.end())
+            {
+                auto existingAny = std::find_if(
+                    inventoryComponent.Content.Entries.begin(),
+                    inventoryComponent.Content.Entries.end(),
+                    [&](const Inventory::Entry& aEntry) {
+                        return aEntry.BaseId == message.ItemId && aEntry.Count > 0 && !aEntry.IsWorn();
+                    });
+
+                const int32_t minCount = static_cast<int32_t>(std::max<uint32_t>(1u, message.Count));
+                if (existingAny != inventoryComponent.Content.Entries.end())
+                {
+                    if (isLeftHandSlot)
+                        existingAny->ExtraWornLeft = true;
+                    else
+                        existingAny->ExtraWorn = true;
+                    if (existingAny->Count < minCount)
+                        existingAny->Count = minCount;
+                }
+                else
+                {
+                    Inventory::Entry added{};
+                    added.BaseId = message.ItemId;
+                    added.Count = minCount;
+                    added.ExtraWornLeft = isLeftHandSlot;
+                    added.ExtraWorn = !isLeftHandSlot;
+                    inventoryComponent.Content.Entries.push_back(std::move(added));
+                }
+
+                if (isLeftHandSlot)
+                    inventoryComponent.Content.CurrentMagicEquipment.LeftHandSpell = GameId{};
+                else if (isRightHandSlot)
+                    inventoryComponent.Content.CurrentMagicEquipment.RightHandSpell = GameId{};
+            }
+        }
+
+        if (!inventoryComponent.Content.Entries.empty() ||
+            inventoryComponent.Content.CurrentMagicEquipment.LeftHandSpell != GameId{} ||
+            inventoryComponent.Content.CurrentMagicEquipment.RightHandSpell != GameId{} ||
+            inventoryComponent.Content.CurrentMagicEquipment.Shout != GameId{})
+        {
+            inventoryComponent.HasSeededInventory = true;
+        }
     }
 
     NotifyEquipmentChanges notify;

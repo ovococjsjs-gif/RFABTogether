@@ -13,6 +13,9 @@
 #include <AI/AIProcess.h>
 #include <Games/Skyrim/Misc/MiddleProcess.h>
 #include <DefaultObjectManager.h>
+#include <common/CoopEquipGuard.h>
+
+#include <chrono>
 
 struct BGSEquipSlot : TESForm
 {
@@ -210,16 +213,51 @@ void* TP_MAKE_THISCALL(UnEquipHook, EquipManager, Actor* apActor, TESForm* apIte
     const auto pExtension = apActor->GetExtension();
     if (!pExtension)
         return TiltedPhoques::ThisCall(RealUnEquip, apThis, apActor, apItem, apData);
-    if (pExtension->IsRemote())
+
+    thread_local CoopEquipGuard::UnequipRetryGuard s_unequipRetryGuard{};
+    const uint64_t nowSteadyMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+
+    const bool isRemote = pExtension->IsRemote();
+    const bool isLocal = pExtension->IsLocal();
+    const bool scopedRemoteOverride = ScopedEquipOverride::IsOverriden() || ScopedInventoryOverride::IsOverriden();
+    const bool scopedUnequipOverride = ScopedUnequipOverride::IsOverriden();
+    const bool queueEquip = (apData != nullptr) && apData->bQueueEquip;
+
+    const auto decision = s_unequipRetryGuard.Evaluate(
+        apActor->formID,
+        apItem->formID,
+        nowSteadyMs,
+        isRemote,
+        isLocal,
+        scopedRemoteOverride,
+        scopedUnequipOverride,
+        queueEquip);
+
+    if (decision.WasLoopBroken)
     {
-        spdlog::debug("Actor[{:X}]::Unequip(), item form id: {:X}, IsOverridden, equip: {}, inventory: {}", apActor->formID, apItem->formID, ScopedEquipOverride::IsOverriden(), ScopedInventoryOverride::IsOverriden());
-        // The ScopedInventoryOverride check is here to allow the item to be unequipped if it is removed
-        // Without this check, the game will not accept null as a return, and it'll keep trying to unequip infinitely
-        if (!ScopedEquipOverride::IsOverriden() && !ScopedInventoryOverride::IsOverriden())
-            return nullptr;
+        spdlog::warn(
+            "[RFAB EquipGuard] Broke repeated UnEquip retry burst for actor {:X}, item {:X} (remote={}, local={})",
+            apActor->formID,
+            apItem->formID,
+            isRemote,
+            isLocal);
     }
 
-    if (World::IsCreated() && World::IsConnectedCached() && pExtension->IsLocal() && apData && !ScopedUnequipOverride::IsOverriden() && !apData->bQueueEquip)
+    if (!decision.AllowEngineCall)
+    {
+        spdlog::debug(
+            "Actor[{:X}]::Unequip(), item form id: {:X}, IsOverridden, equip: {}, inventory: {}",
+            apActor->formID,
+            apItem->formID,
+            ScopedEquipOverride::IsOverriden(),
+            ScopedInventoryOverride::IsOverriden());
+        return nullptr;
+    }
+
+    if (decision.EmitNetworkEvent && World::IsCreated() && World::IsConnectedCached() && apData)
     {
         EquipmentChangeEvent evt{};
         evt.ActorId = apActor->formID;

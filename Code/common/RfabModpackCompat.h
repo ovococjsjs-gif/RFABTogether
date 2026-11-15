@@ -21,7 +21,7 @@
 
 namespace RfabCompat
 {
-inline constexpr std::string_view kRfabOnlineVersion = "4.1.2";
+inline constexpr std::string_view kRfabOnlineVersion = "4.1.3";
 
 // Skyrim Creation Engine spatial unit ratio: 1 meter = 70.0 game units (64 units = 3 feet = 0.9144m; 70 units = 1.0m).
 inline constexpr float kSkyrimUnitsPerMeter = 70.0f;

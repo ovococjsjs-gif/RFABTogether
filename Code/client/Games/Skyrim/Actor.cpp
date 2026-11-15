@@ -2472,7 +2472,13 @@ static TUnequipObject* RealUnequipObject = nullptr;
 void TP_MAKE_THISCALL(HookUnequipObject, Actor, void* apUnk1, TESBoundObject* apObject, int32_t aUnk2, void* apUnk3)
 {
     RFAB_HOOK_CRUMB("HookUnequipObject", apThis ? apThis->formID : 0, apObject ? apObject->formID : 0);
-    if (!apThis || !apObject || apThis->IsDeleted() || !apThis->currentProcess || !apThis->currentProcess->middleProcess)
+    // CRITICAL FOR SKYRIM SE 1.5.97 FAST-TRAVEL / CARRIAGE STABILITY:
+    // During TES::FastTravel (e.g. RFAB_CarriagesTravel::OnAcceptTravel), origin-cell actors have their
+    // AIProcess downgraded to Low (currentProcess->middleProcess == nullptr) before worn equipment is
+    // unequipped. Character::UnequipObject (SE 36950) safely clears ExtraWorn/ExtraWornLeft from
+    // ExtraContainerChanges without middleProcess; returning early when !middleProcess left ExtraWorn
+    // set and caused Skyrim's native unequip retry loop to spin infinitely on the BSJobs worker thread.
+    if (!apThis || !apObject || apThis->IsDeleted())
         return;
 
     TiltedPhoques::ThisCall(RealUnequipObject, apThis, apUnk1, apObject, aUnk2, apUnk3);

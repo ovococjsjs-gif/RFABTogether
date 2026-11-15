@@ -203,6 +203,7 @@ void PartyService::OnPartyChangeLeader(const PacketEvent<PartyChangeLeaderReques
                         GetPlayerSessionIdentityKey(pPlayer));
                     spdlog::debug("[PartyService]: Changed party leader to {}, updating party members.", party.LeaderPlayerId);
                     BroadcastPartyInfo(*inviterPartyComponent.JoinedPartyId);
+                    m_world.GetCharacterService().ReconcileAllEntitiesForObserver(pPlayer);
                     break;
                 }
             }
@@ -288,6 +289,8 @@ void PartyService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept
             party.LeaderPlayerId == acEvent.pPlayer->GetId());
         SendPartyJoinedEvent(party, acEvent.pPlayer);
         BroadcastPartyInfo(partyId);
+        if (becameLeader)
+            m_world.GetCharacterService().ReconcileAllEntitiesForObserver(acEvent.pPlayer);
         return;
     }
 
@@ -305,6 +308,7 @@ void PartyService::OnPlayerJoin(const PlayerJoinEvent& acEvent) noexcept
             spdlog::info("[PartyService]: Auto-created co-op party {} with host {} as leader", partyId, acEvent.pPlayer->GetUsername().c_str());
             SendPartyJoinedEvent(party, acEvent.pPlayer);
             BroadcastPartyInfo(partyId);
+            m_world.GetCharacterService().ReconcileAllEntitiesForObserver(acEvent.pPlayer);
         }
         else if (!m_parties.empty() && !acEvent.pPlayer->GetParty().JoinedPartyId.has_value())
         {
@@ -496,15 +500,19 @@ void PartyService::RemovePlayerFromParty(Player* apPlayer, bool aExplicitLeave) 
         }
         else
         {
+            Player* pPromotedLeader = nullptr;
             if (party.LeaderPlayerId == apPlayer->GetId())
             {
-                party.LeaderPlayerId = members.at(0)->GetId(); // Reassign party leader
+                pPromotedLeader = members.at(0);
+                party.LeaderPlayerId = pPromotedLeader->GetId(); // Reassign party leader
                 if (aExplicitLeave)
-                    m_sessionLedger.RecordPartyLeaderChange(id, GetPlayerSessionIdentityKey(members.at(0)));
+                    m_sessionLedger.RecordPartyLeaderChange(id, GetPlayerSessionIdentityKey(pPromotedLeader));
                 spdlog::debug("[PartyService]: Leader left, reassigned party leader to {}", party.LeaderPlayerId);
             }
             spdlog::debug("[PartyService]: Updating other party players of removal.");
             BroadcastPartyInfo(id);
+            if (pPromotedLeader)
+                m_world.GetCharacterService().ReconcileAllEntitiesForObserver(pPromotedLeader);
         }
 
         spdlog::debug("[PartyService]: Sending party left event to player.");

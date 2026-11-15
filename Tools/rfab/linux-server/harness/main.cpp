@@ -77,7 +77,9 @@
 #include <Messages/NotifyHealthChangeBroadcast.h>
 #include <Messages/NotifyMount.h>
 #include <Messages/NotifyOwnershipTransfer.h>
+#include <Messages/NotifyPartyInfo.h>
 #include <Messages/NotifyRelinquishControl.h>
+#include <Messages/PartyChangeLeaderRequest.h>
 #include <Messages/NotifyRemoveCharacter.h>
 #include <Messages/NotifyResyncComplete.h>
 #include <Messages/NotifyRfabProgressionEvent.h>
@@ -5128,6 +5130,160 @@ int main(int argc, char** argv)
             }
         }
         Check(guestGotMageSpell, "the guest receives NotifySpawnData with the mage's equipped spell");
+
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+    }
+
+    // =========================================================================================
+    // Scene 24: v4.1.3 equipment upsert + party leader switch & reconnect enemy ownership sync
+    // =========================================================================================
+    {
+        std::printf("[scene 24] equipment upsert and party leader switch / reconnect enemy sync\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xF901u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xF902u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestReconnectConn = 0xF903u;
+        const GameId kCampCell{0u, 0x00141001u};
+        const GameId kBanditRef{0u, 0x00142001u};
+        const GameId kBanditBase{0u, 0x00039CF4u};
+        const GameId kGold{0u, 0x0000000Fu};
+        const GameId kSteelGreatsword{7u, 0x000160DFu};
+        const GameId kIronArrow{0u, 0x0001397Du};
+        const GameId kRightHandSlot{0u, 0x00013F42u};
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        pHost->SetUsername("Arbuz");
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        pGuest->SetUsername("nowtv");
+
+        TimeModel t0{};
+        t0.Time = 12.0f;
+        t0.Day = 9;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+
+        Check(world.GetPartyService().IsPlayerLeader(pHost) && !world.GetPartyService().IsPlayerLeader(pGuest),
+              "host starts as party leader and guest joins the same party");
+
+        EnterInteriorCellRequest enterCamp{};
+        enterCamp.CellId = kCampCell;
+        (void)DeliverWire(world, enterCamp, pHost);
+        (void)DeliverWire(world, enterCamp, pGuest);
+
+        // 1. Host registers a placed bandit whose frame-0 inventory only had 15 gold (before Skyrim's
+        //    InitOutfitItems / InitLeveledItems finished populating its weapon & arrows).
+        AssignCharacterRequest assignBandit{};
+        assignBandit.Cookie = 2401u;
+        assignBandit.ReferenceId = kBanditRef;
+        assignBandit.FormId = kBanditBase;
+        assignBandit.CellId = kCampCell;
+        {
+            Inventory::Entry gold{};
+            gold.BaseId = kGold;
+            gold.Count = 15;
+            assignBandit.CurrentActorData.InitialInventory.Entries.push_back(gold);
+        }
+        assignBandit.CurrentActorData.InitialActorValues.ActorValuesList[24] = 220.0f;
+        assignBandit.CurrentActorData.InitialActorValues.ActorMaxValuesList[24] = 220.0f;
+        assignBandit.CurrentActorData.IsDead = false;
+        assignBandit.CurrentActorData.IsWeaponDrawn = false;
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, assignBandit, pHost), "host registers the placed bandit initially carrying only gold");
+        const auto assignRes = DecodeOutboxMessagesFor<AssignCharacterResponse>(kHostConn);
+        Check(assignRes.size() == 1 && assignRes[0].Owner, "host is granted initial ownership of the bandit");
+        const uint32_t banditServerId = assignRes.empty() ? 0u : assignRes[0].ServerId;
+        const entt::entity banditEntity = static_cast<entt::entity>(banditServerId);
+
+        // 2. Skyrim finishes equipping the bandit's Steel Greatsword + 20 Iron Arrows via RequestEquipmentChanges
+        //    (without any prior RequestInventoryChanges because InitOutfitItems bypassed AddInventoryItem).
+        RequestEquipmentChanges equipSword{};
+        equipSword.ServerId = banditServerId;
+        equipSword.ItemId = kSteelGreatsword;
+        equipSword.EquipSlotId = kRightHandSlot;
+        equipSword.Count = 1;
+        equipSword.Unequip = false;
+        {
+            Inventory::Entry wornSword{};
+            wornSword.BaseId = kSteelGreatsword;
+            wornSword.Count = 1;
+            wornSword.ExtraWorn = true;
+            equipSword.CurrentInventory.Entries.push_back(wornSword);
+
+            Inventory::Entry wornArrows{};
+            wornArrows.BaseId = kIronArrow;
+            wornArrows.Count = 20;
+            wornArrows.ExtraWorn = true;
+            equipSword.CurrentInventory.Entries.push_back(wornArrows);
+        }
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, equipSword, pHost), "host reports bandit weapon + arrow equip via RequestEquipmentChanges");
+
+        GameId goldLookup = kGold;
+        GameId swordLookup = kSteelGreatsword;
+        GameId arrowLookup = kIronArrow;
+        const auto& invAfterEquip = world.get<InventoryComponent>(banditEntity).Content;
+        const auto swordEntryOpt = invAfterEquip.GetEntryById(swordLookup);
+        Check(invAfterEquip.GetEntryCountById(goldLookup) == 15 &&
+                  invAfterEquip.GetEntryCountById(swordLookup) == 1 &&
+                  invAfterEquip.GetEntryCountById(arrowLookup) == 20 &&
+                  swordEntryOpt.has_value() && swordEntryOpt->ExtraWorn,
+              "server InventoryComponent upserts the equipped sword and arrows instead of dropping them");
+
+        // 3. Host transfers party leadership to Guest in-place (without crossing any cell boundary).
+        PartyChangeLeaderRequest changeLeader{};
+        changeLeader.PartyMemberPlayerId = pGuest->GetId();
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, changeLeader, pHost), "host transfers party leadership to guest");
+
+        Check(world.GetPartyService().IsPlayerLeader(pGuest) &&
+                  world.get<OwnerComponent>(banditEntity).GetOwner() == pGuest,
+              "changing party leader immediately transfers calm placed bandit authority to the new leader");
+
+        const auto guestGrant = DecodeOutboxMessagesFor<NotifyOwnershipTransfer>(kGuestConn);
+        const auto hostRelinquish = DecodeOutboxMessagesFor<NotifyRelinquishControl>(kHostConn);
+        Check(!guestGrant.empty() && guestGrant[0].ServerId == banditServerId &&
+                  !hostRelinquish.empty() && hostRelinquish[0].ServerId == banditServerId,
+              "new leader receives NotifyOwnershipTransfer and old leader receives NotifyRelinquishControl");
+
+        // 4. New leader disconnects via real transport Disconnect(): Host is auto-promoted back to leader
+        //    and immediately reclaims the bandit, and when Guest reconnects, CharacterSpawnRequest still
+        //    carries the bandit's sword + arrows + gold.
+        Harness::ClearOutbox();
+        Disconnect(server, kGuestConn);
+        Check(world.GetPartyService().IsPlayerLeader(pHost) &&
+                  world.get<OwnerComponent>(banditEntity).GetOwner() == pHost,
+              "when the leader disconnects, remaining party member becomes leader and reclaims the bandit");
+
+        Player* pGuestRejoined = world.GetPlayerManager().Create(kGuestReconnectConn);
+        pGuestRejoined->SetUsername("nowtv");
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuestRejoined, {}, {}, DateTime{t0}});
+        Harness::ClearOutbox();
+        (void)DeliverWire(world, enterCamp, pGuestRejoined);
+
+        const auto rejoinSpawns = DecodeOutboxMessagesFor<CharacterSpawnRequest>(kGuestReconnectConn);
+        bool rejoinBanditStillArmed = false;
+        for (const auto& sp : rejoinSpawns)
+        {
+            if (sp.ServerId == banditServerId)
+            {
+                Inventory spInv = sp.InventoryContent;
+                const auto spSword = spInv.GetEntryById(swordLookup);
+                rejoinBanditStillArmed = (spInv.GetEntryCountById(goldLookup) == 15 &&
+                                          spInv.GetEntryCountById(swordLookup) == 1 &&
+                                          spInv.GetEntryCountById(arrowLookup) == 20 &&
+                                          spSword.has_value() && spSword->ExtraWorn);
+            }
+        }
+        Check(rejoinBanditStillArmed,
+              "reconnecting peer receives CharacterSpawnRequest with the bandit's full weapon + arrow loadout intact");
 
         std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
     }
