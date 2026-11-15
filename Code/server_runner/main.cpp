@@ -24,6 +24,7 @@
 #pragma comment(lib, "Comctl32.lib")
 #elif defined(__linux__)
 #include <signal.h>
+#include <unistd.h>
 #endif
 
 namespace
@@ -72,6 +73,10 @@ struct LogInstance
         globalOut->set_pattern("%^[%Y-%m-%d %H:%M:%S.%e] [%l] [tid %t] %$ %v");
 
         globalOut->set_level(level::from_str(sLogLevel.value()));
+        // Every line goes to disk when it is written (4.1.2). The server writes a few lines a minute,
+        // and a log that ends before the trouble started is worth nothing: the host's log of the
+        // 2026-11-15 playtest ended four lines after the start, with the session still running.
+        globalOut->flush_on(level::info);
         spdlog::flush_every(std::chrono::seconds(2));
 
         // as the library is compiled into the client + server we have to do this twice
@@ -79,6 +84,19 @@ struct LogInstance
 
         // also make the client aware of the file loggers
         SetDefaultLogger(globalOut);
+
+        // Which server this is and where it writes: a machine can hold more than one copy (the
+        // installed one, an unpacked release, an old folder), and a report must show which one ran.
+        const auto utf8 = Compat::SafeFs::CurrentPathOr(fs::path(".")).generic_u8string();
+        const std::string where(utf8.begin(), utf8.end());
+#ifdef _WIN32
+        const unsigned long processId = GetCurrentProcessId();
+#else
+        const unsigned long processId = static_cast<unsigned long>(getpid());
+#endif
+        globalOut->info("RFAB Online server process {} started; working directory '{}'; this log is '{}/logs/{}'; "
+                        "checkpoints go to '{}/Data/rfab_checkpoints.bin'",
+                        processId, where, where, kLogFileName, where);
     }
 
     ~LogInstance() { spdlog::shutdown(); }
@@ -171,6 +189,19 @@ void ConfigureConsoleMode()
     SetConsoleOutputCP(CP_UTF8);
     // Set the input code page to UTF-8
     SetConsoleCP(CP_UTF8);
+
+    // A click inside a console window starts a text selection ("QuickEdit"), and while it lasts
+    // Windows blocks every write to that console: the server's next log line stops the whole server
+    // until Enter or Esc is pressed, and the players see a world that stands still. Typing commands
+    // is not affected; text can still be selected through the window menu (Edit > Mark).
+    const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (input != nullptr && input != INVALID_HANDLE_VALUE && GetConsoleMode(input, &mode))
+    {
+        mode &= ~static_cast<DWORD>(ENABLE_QUICK_EDIT_MODE);
+        mode |= ENABLE_EXTENDED_FLAGS;
+        SetConsoleMode(input, mode);
+    }
 #endif
 }
 

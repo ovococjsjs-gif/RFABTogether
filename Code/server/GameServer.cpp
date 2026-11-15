@@ -23,6 +23,7 @@
 #include <Messages/NotifyPlayerLeft.h>
 #include <Messages/NotifySettingsChange.h>
 #include <common/CoopPacketSafety.h>
+#include <common/Diag/ServerPulse.h>
 #include <common/RfabModpackCompat.h>
 #include <console/ConsoleRegistry.h>
 #include <resources/ResourceCollection.h>
@@ -808,6 +809,70 @@ void GameServer::UpdateTimeScale()
     }
 }
 
+namespace
+{
+// One line a minute while somebody plays (ten minutes when nobody does), and a line at once when a
+// turn of the server loop took two seconds or more (common/Diag/ServerPulse.h). The numbers are the
+// server's side of "the enemies do not fight": an NPC that no player simulates stands still for
+// everybody.
+void WriteServerPulse(World& aWorld, uint64_t aTurnMs) noexcept
+{
+    static Diag::ServerPulseState s_pulse{};
+
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    const uint32_t players = aWorld.GetPlayerManager().Count();
+    const Diag::ServerPulse pulse = s_pulse.Evaluate(nowMs, aTurnMs, players > 0);
+
+    try
+    {
+        if (pulse.Kind == Diag::ServerPulseKind::kStall)
+        {
+            spdlog::warn("[RFAB Pulse] THE SERVER STOOD STILL for {} ms: nothing was sent to or read from the players during that time. "
+                         "Usual causes: a click inside this console window (it pauses the program until Enter or Esc is pressed), "
+                         "the computer went to sleep, the disk or an antivirus held a file.",
+                         pulse.LongestTurnMs);
+            return;
+        }
+        if (pulse.Kind != Diag::ServerPulseKind::kPulse)
+            return;
+
+        uint32_t npcs = 0;
+        uint32_t npcsOwned = 0;
+        uint32_t npcsUnowned = 0;
+        uint32_t npcsDead = 0;
+        uint32_t npcsArmed = 0;
+        const auto characters = aWorld.view<CharacterComponent>();
+        for (const auto entity : characters)
+        {
+            const auto& character = characters.get<CharacterComponent>(entity);
+            if (character.IsPlayer())
+                continue;
+            ++npcs;
+            if (character.IsDead())
+            {
+                ++npcsDead;
+                continue;
+            }
+            if (character.IsWeaponDrawn())
+                ++npcsArmed;
+            const auto* pOwner = aWorld.try_get<OwnerComponent>(entity);
+            if (pOwner && pOwner->GetOwner() != nullptr)
+                ++npcsOwned;
+            else
+                ++npcsUnowned;
+        }
+
+        spdlog::info("[RFAB Pulse] players {}, NPCs {} (alive and simulated by a player {}, alive and given to nobody {}, dead {}, weapon drawn {}); "
+                     "since the last pulse: {} loop turns, longest {} ms, turns of 2 s or more {}",
+                     players, npcs, npcsOwned, npcsUnowned, npcsDead, npcsArmed, pulse.Turns, pulse.LongestTurnMs, pulse.Stalls);
+    }
+    catch (...)
+    {
+    }
+}
+} // namespace
+
 void GameServer::OnUpdate()
 {
     const auto cNow = std::chrono::high_resolution_clock::now();
@@ -815,6 +880,8 @@ void GameServer::OnUpdate()
     m_lastFrameTime = cNow;
 
     const auto cDeltaSeconds = std::chrono::duration_cast<std::chrono::duration<float>>(cDelta).count();
+
+    WriteServerPulse(*m_pWorld, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(cDelta).count()));
 
     auto& dispatcher = m_pWorld->GetDispatcher();
 

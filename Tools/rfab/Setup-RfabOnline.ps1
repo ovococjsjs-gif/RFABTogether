@@ -1065,6 +1065,21 @@ if (-not [string]::IsNullOrWhiteSpace($ServerSourceDir) -and (Test-Path -Literal
     }
 
     if ([System.IO.Path]::GetFullPath($ServerSourceDir) -ne [System.IO.Path]::GetFullPath($InstalledServerDir)) {
+        # Логи сервера переживают обновление (4.1.2): раньше папка стиралась целиком, и отчёт,
+        # собранный после обновления, уже не содержал лога той сессии, из-за которой обновлялись.
+        # Они кладутся обратно как logs_before_update; сборщик отчёта берёт и их.
+        $KeptServerLogs = $null
+        try {
+            $OldServerLogs = Join-Path $InstalledServerDir "logs"
+            if (Test-Path -LiteralPath $OldServerLogs) {
+                $KeptServerLogs = Join-Path ([System.IO.Path]::GetTempPath()) ("RFAB_server_logs_" + [System.Guid]::NewGuid().ToString("N"))
+                New-Item -ItemType Directory -Path $KeptServerLogs -Force | Out-Null
+                foreach ($oldLog in @(Get-ChildItem -LiteralPath $OldServerLogs -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 12)) {
+                    Copy-Item -LiteralPath $oldLog.FullName -Destination (Join-Path $KeptServerLogs $oldLog.Name) -Force -ErrorAction SilentlyContinue
+                }
+            }
+        } catch { $KeptServerLogs = $null }
+
         if (Test-Path -LiteralPath $InstalledServerDir) {
             Remove-DirectoryClean $InstalledServerDir
             Write-Ok "Полностью очищена старая папка сервера: $InstalledServerDir"
@@ -1074,6 +1089,18 @@ if (-not [string]::IsNullOrWhiteSpace($ServerSourceDir) -and (Test-Path -Literal
         if ($LASTEXITCODE -ge 8) {
             throw "Ошибка копирования файлов сервера (robocopy код $LASTEXITCODE)."
         }
+
+        try {
+            if ($KeptServerLogs -and (Test-Path -LiteralPath $KeptServerLogs)) {
+                $KeptTarget = Join-Path $InstalledServerDir "logs_before_update"
+                New-Item -ItemType Directory -Path $KeptTarget -Force | Out-Null
+                foreach ($oldLog in @(Get-ChildItem -LiteralPath $KeptServerLogs -File -ErrorAction SilentlyContinue)) {
+                    Copy-Item -LiteralPath $oldLog.FullName -Destination (Join-Path $KeptTarget $oldLog.Name) -Force -ErrorAction SilentlyContinue
+                }
+                Remove-Item -LiteralPath $KeptServerLogs -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Ok "Логи сервера прошлой установки сохранены: $KeptTarget"
+            }
+        } catch { }
     }
 
     $SrvDataDir = Join-Path $InstalledServerDir "Data"

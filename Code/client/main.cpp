@@ -2,6 +2,7 @@
 #include <TiltedOnlineApp.h>
 #include <TiltedOnlinePCH.h>
 #include <CrashBreadcrumbs.h>
+#include <RfabDiag.h>
 
 #include <Commctrl.h>
 #include <Windows.h>
@@ -25,63 +26,9 @@ std::once_flag s_tiltedInitOnce;
 std::once_flag s_crashHandlerOnce;
 thread_local bool s_inCrashLogger = false;
 
-void WriteBootTraceRaw(const std::filesystem::path& aPath, const char* apMsg, bool aReset) noexcept
-{
-    if (aPath.empty() || !apMsg)
-        return;
-
-    HANDLE hFile = CreateFileW(aPath.c_str(),
-                               aReset ? GENERIC_WRITE : FILE_APPEND_DATA,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE,
-                               nullptr,
-                               aReset ? CREATE_ALWAYS : OPEN_ALWAYS,
-                               FILE_ATTRIBUTE_NORMAL,
-                               nullptr);
-    if (hFile != INVALID_HANDLE_VALUE)
-    {
-        DWORD written = 0;
-        WriteFile(hFile, apMsg, static_cast<DWORD>(std::strlen(apMsg)), &written, nullptr);
-        WriteFile(hFile, "\r\n", 2, &written, nullptr);
-        FlushFileBuffers(hFile);
-        CloseHandle(hFile);
-    }
-}
-
 void FormatAddrWithModulePod(uintptr_t aAddr, char* apOut, size_t aOutSz) noexcept
 {
-    if (!aOutSz)
-        return;
-    apOut[0] = '\0';
-
-    HMODULE hMod = nullptr;
-    char modBuf[MAX_PATH]{};
-    if (aAddr >= 0x10000 &&
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCSTR>(aAddr), &hMod) &&
-        hMod != nullptr)
-    {
-        GetModuleFileNameA(hMod, modBuf, MAX_PATH - 1);
-        const char* slash = std::strrchr(modBuf, '\\');
-        const char* shortName = slash ? (slash + 1) : modBuf;
-        const uintptr_t rva = aAddr - reinterpret_cast<uintptr_t>(hMod);
-        // SkyrimTogether.exe reserves ~1.05 GB above 0x140000000 for RipAllocator hook trampolines;
-        // RVAs >= 64 MB are TiltedHooks trampolines rather than SkyrimSE.exe's ~55 MB image!
-        if (hMod == GetModuleHandleA(nullptr) && rva >= 0x04000000ULL)
-        {
-            std::snprintf(apOut, aOutSz, "%s[TiltedTrampoline]+0x%llX (0x%llX)",
-                          shortName,
-                          static_cast<unsigned long long>(rva),
-                          static_cast<unsigned long long>(aAddr));
-            return;
-        }
-        std::snprintf(apOut, aOutSz, "%s+0x%llX (0x%llX)",
-                      shortName,
-                      static_cast<unsigned long long>(rva),
-                      static_cast<unsigned long long>(aAddr));
-        return;
-    }
-
-    std::snprintf(apOut, aOutSz, "0x%llX", static_cast<unsigned long long>(aAddr));
+    RfabDiag::FormatAddress(aAddr, apOut, aOutSz);
 }
 
 // Windows x64 MSVC __CxxThrowException ABI layout (frozen across all x64 MSVC versions since VS2005)
@@ -266,19 +213,17 @@ void DecodeCppExceptionAndStackPod(PEXCEPTION_POINTERS apInfo, char* apCppBuf, s
 }
 } // namespace
 
+// One line of the startup trace, with the local time in front. The time is what ties a start to
+// what the player saw: the 2026-11-15 reports had ten starts in one file and no way to tell which
+// of them was the black screen.
 void WriteBootTrace(const char* apMsg, bool aReset = false)
 {
     if (!apMsg)
         return;
 
-    const wchar_t* pClientDir = GetTiltedClientDirW();
-    const std::filesystem::path clientPath = (pClientDir && *pClientDir)
-                                                 ? std::filesystem::path(pClientDir)
-                                                 : TiltedPhoques::GetPath();
-
-    WriteBootTraceRaw(clientPath / L"RFAB_Online_Startup.log", apMsg, aReset);
-    if (!s_pendingGamePath.empty() && s_pendingGamePath != clientPath)
-        WriteBootTraceRaw(s_pendingGamePath / L"RFAB_Online_Startup.log", apMsg, aReset);
+    char line[768];
+    RfabDiag::StampLine(line, sizeof(line), apMsg);
+    RfabDiag::AppendToStartupLogs(line, aReset);
 }
 
 void LogUnhandledCrashToBootFile(PEXCEPTION_POINTERS apInfo) noexcept
@@ -397,16 +342,12 @@ void LogUnhandledCrashToBootFile(PEXCEPTION_POINTERS apInfo) noexcept
                   hexBytes,
                   cppInfo,
                   stackInfo);
-    WriteBootTrace(crashBuf, false);
-
-    // Also persist to append-only RFAB_Online_Crash.log so restarting Skyrim never overwrites prior crash records!
-    const wchar_t* pClientDir = GetTiltedClientDirW();
-    const std::filesystem::path clientPath = (pClientDir && *pClientDir)
-                                                 ? std::filesystem::path(pClientDir)
-                                                 : TiltedPhoques::GetPath();
-    WriteBootTraceRaw(clientPath / L"RFAB_Online_Crash.log", crashBuf, false);
-    if (!s_pendingGamePath.empty() && s_pendingGamePath != clientPath)
-        WriteBootTraceRaw(s_pendingGamePath / L"RFAB_Online_Crash.log", crashBuf, false);
+    // No std::filesystem, no heap from here on: the file names were resolved at start-up
+    // (RfabDiag::InitPaths). A crash writer that allocates loses the record exactly when the heap
+    // is what broke.
+    RfabDiag::AppendToStartupLogs(crashBuf, false);
+    // Append-only RFAB_Online_Crash.log: restarting the game never overwrites earlier records.
+    RfabDiag::AppendToCrashLogs(crashBuf);
 
     // Breadcrumbs (common/Diag/Breadcrumbs.h): the last packets, lifecycle events and hooks before
     // the fault, as continuation lines of the record above. Written second and into a static buffer:
@@ -417,28 +358,10 @@ void LogUnhandledCrashToBootFile(PEXCEPTION_POINTERS apInfo) noexcept
     // Two threads can fault at the same moment; the second one keeps its record and skips the crumbs.
     if (!s_crumbTextBusy.exchange(true))
     {
-        const uint64_t crumbNowMs = GetTickCount64();
-        size_t crumbLength = static_cast<size_t>(std::snprintf(s_crumbText, sizeof(s_crumbText),
-                                                               "    [crumbs] events=%llu packets=%llu hooks=%llu dropped=%llu (newest last; a/b: see the RFAB_*_CRUMB call sites)",
-                                                               static_cast<unsigned long long>(Diag::g_eventCrumbs.Total()),
-                                                               static_cast<unsigned long long>(Diag::g_packetCrumbs.Total()),
-                                                               static_cast<unsigned long long>(Diag::g_hookCrumbs.Total()),
-                                                               static_cast<unsigned long long>(Diag::g_eventCrumbs.Dropped() + Diag::g_packetCrumbs.Dropped() +
-                                                                                               Diag::g_hookCrumbs.Dropped())));
-        if (crumbLength < sizeof(s_crumbText))
+        if (RfabDiag::FormatCrumbs(s_crumbText, sizeof(s_crumbText)) > 0)
         {
-            // Each ring gets its own share of the buffer, so a full one cannot crowd out the next.
-            const auto share = [&crumbLength](size_t aWanted) noexcept {
-                const size_t left = sizeof(s_crumbText) - crumbLength;
-                return aWanted < left ? aWanted : left;
-            };
-            crumbLength += Diag::g_eventCrumbs.Format(s_crumbText + crumbLength, share(3584), "event", crumbNowMs, 40);
-            crumbLength += Diag::g_packetCrumbs.Format(s_crumbText + crumbLength, share(2560), "packet", crumbNowMs, 28);
-            crumbLength += Diag::g_hookCrumbs.Format(s_crumbText + crumbLength, share(sizeof(s_crumbText)), "hook", crumbNowMs, 28);
-            WriteBootTraceRaw(clientPath / L"RFAB_Online_Crash.log", s_crumbText, false);
-            if (!s_pendingGamePath.empty() && s_pendingGamePath != clientPath)
-                WriteBootTraceRaw(s_pendingGamePath / L"RFAB_Online_Crash.log", s_crumbText, false);
-            WriteBootTrace(s_crumbText, false);
+            RfabDiag::AppendToCrashLogs(s_crumbText);
+            RfabDiag::AppendToStartupLogs(s_crumbText, false);
         }
         s_crumbTextBusy.store(false);
     }
@@ -459,17 +382,34 @@ void InstallRfabBootDiagnostics(const std::filesystem::path& acGamePath, const S
     if (!aExeVersion.empty())
         s_pendingExeVersion = aExeVersion;
 
+    // File names first: everything below, and every handler later, writes through them.
+    RfabDiag::InitPaths(s_pendingGamePath);
+
     bool firstInit = false;
     std::call_once(s_crashHandlerOnce, [&]() {
         firstInit = true;
         SetUnhandledExceptionFilter(&EarlyUnhandledFilter);
         AddVectoredContinueHandler(1, &EarlyUnhandledFilter);
+        // The endings that raise no exception: std::terminate, pure call, CRT abort, and a main
+        // loop that stops turning (RfabDiag.h).
+        RfabDiag::InstallProcessEndHandlers();
+        RfabDiag::StartHangWatch();
     });
 
-    char msg[512];
-    std::snprintf(msg, sizeof(msg), "[BOOT] Checkpoint | ExeVersion='%s' | GamePathSet=%d",
-                  s_pendingExeVersion.c_str(), s_pendingGamePath.empty() ? 0 : 1);
+    char msg[768];
+    std::snprintf(msg, sizeof(msg), "[BOOT] Checkpoint | Build='%s' | PID=%lu | ExeVersion='%s' | GamePathSet=%d", BUILD_COMMIT,
+                  static_cast<unsigned long>(GetCurrentProcessId()), s_pendingExeVersion.c_str(), s_pendingGamePath.empty() ? 0 : 1);
     WriteBootTrace(msg, firstInit);
+
+    if (!s_pendingGamePath.empty())
+    {
+        // Where the logs of this start go. Written once the game folder is known.
+        char logDir[1024]{};
+        WideCharToMultiByte(CP_UTF8, 0, RfabDiag::GetLogDirectoryW(), -1, logDir, sizeof(logDir) - 1, nullptr, nullptr);
+        char where[1280];
+        std::snprintf(where, sizeof(where), "[BOOT] Logs of this start: %s", logDir);
+        WriteBootTrace(where);
+    }
 }
 
 static void ShowAddressLibraryError(const wchar_t* apGamePath)

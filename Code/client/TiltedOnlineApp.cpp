@@ -20,12 +20,27 @@
 
 #include <ScriptExtender.h>
 #include <NvidiaUtil.h>
+#include <RfabDiag.h>
+#include <common/RfabModpackCompat.h>
 
 using TiltedPhoques::Debug;
 
 namespace
 {
-std::shared_ptr<spdlog::sinks::rotating_file_sink_mt> CreateClientLogSink(const std::filesystem::path& acLogPath)
+std::string ToUtf8(const std::filesystem::path& acPath)
+{
+    const std::wstring& wide = acPath.native();
+    if (wide.empty())
+        return {};
+    const int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+    if (size <= 0)
+        return {};
+    std::string out(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), out.data(), size, nullptr, nullptr);
+    return out;
+}
+
+std::shared_ptr<spdlog::sinks::rotating_file_sink_mt> CreateClientLogSink(const std::filesystem::path& acLogPath, std::filesystem::path& aOutFile)
 {
     std::string filename = "tp_client.log";
     for (uint32_t instance = 1;; ++instance)
@@ -47,31 +62,76 @@ std::shared_ptr<spdlog::sinks::rotating_file_sink_mt> CreateClientLogSink(const 
             filename = fmt::format("tp_client_instance_{}.log", instance);
         break;
     }
-    return std::make_shared<spdlog::sinks::rotating_file_sink_mt>(acLogPath / filename, 1048576 * 10, 5);
+    aOutFile = acLogPath / filename;
+    return std::make_shared<spdlog::sinks::rotating_file_sink_mt>(aOutFile, 1048576 * 10, 5);
 }
 } // namespace
 
 extern "C" const wchar_t* GetTiltedClientDirW() noexcept;
+extern void WriteBootTrace(const char* apMsg, bool aReset);
 
 TiltedOnlineApp::TiltedOnlineApp()
 {
     // Set console code page to UTF-8 so console known how to interpret string data
     SetConsoleOutputCP(CP_UTF8);
 
+    // <game>\RFAB_Online_Logs (RfabDiag.h): the game folder is real also under Mod Organizer 2, where
+    // a file created in the client folder can land in MO2's overwrite folder. Playtest 2026-11-15:
+    // both reports came without any client log for exactly that reason.
     const wchar_t* pClientDir = GetTiltedClientDirW();
-    auto logPath = (pClientDir && *pClientDir) ? (std::filesystem::path(pClientDir) / "logs") : (TiltedPhoques::GetPath() / "logs");
+    std::error_code tempError;
+    const std::filesystem::path tempDir = std::filesystem::temp_directory_path(tempError);
+    const std::filesystem::path candidates[] = {
+        RfabDiag::GetLogDirectory(),
+        (pClientDir && *pClientDir) ? (std::filesystem::path(pClientDir) / "logs") : (TiltedPhoques::GetPath() / "logs"),
+        tempError ? std::filesystem::path{} : (tempDir / "RFAB_Online_Logs"),
+    };
 
-    std::error_code ec;
-    create_directory(logPath, ec);
+    std::shared_ptr<spdlog::sinks::rotating_file_sink_mt> rotatingLogger;
+    std::filesystem::path usedFile;
+    std::string failures;
+    for (const auto& candidate : candidates)
+    {
+        if (candidate.empty())
+            continue;
+        try
+        {
+            std::error_code ec;
+            create_directories(candidate, ec);
+            rotatingLogger = CreateClientLogSink(candidate, usedFile);
+            break;
+        }
+        catch (const std::exception& acError)
+        {
+            // A log that cannot be opened must not stop the game from starting; say so instead.
+            failures += fmt::format(" [{}: {}]", ToUtf8(candidate), acError.what());
+        }
+    }
 
-    auto rotatingLogger = CreateClientLogSink(logPath);
     // rotatingLogger->set_level(spdlog::level::debug);
     auto console = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-    auto logger = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{console, rotatingLogger});
+    std::vector<spdlog::sink_ptr> sinks{console};
+    if (rotatingLogger)
+        sinks.push_back(rotatingLogger);
+    auto logger = std::make_shared<spdlog::logger>("", sinks.begin(), sinks.end());
     logger->set_pattern("%^[%Y-%m-%d %H:%M:%S.%e] [%l] [tid %t] %$ %v");
-    logger->flush_on(spdlog::level::err);
+    // Warnings are rare and are what a report is read for: they go to disk at once.
+    logger->flush_on(spdlog::level::warn);
     spdlog::flush_every(std::chrono::seconds(1));
     set_default_logger(logger);
+
+    // The startup trace names the file, so a report can be checked against it.
+    char where[1536];
+    if (rotatingLogger)
+        std::snprintf(where, sizeof(where), "[BOOT] Client log: %s", ToUtf8(usedFile).c_str());
+    else
+        std::snprintf(where, sizeof(where), "[BOOT] WARNING: NO CLIENT LOG could be opened:%s", failures.c_str());
+    WriteBootTrace(where, false);
+
+    spdlog::info("RFAB Online client {} (build {}), pid {}, log file {}", RfabCompat::kRfabOnlineVersion, BUILD_COMMIT, GetCurrentProcessId(),
+                 rotatingLogger ? ToUtf8(usedFile) : std::string("NONE"));
+    if (!failures.empty())
+        spdlog::warn("Client log folder(s) that could not be used:{}", failures);
 }
 
 TiltedOnlineApp::~TiltedOnlineApp() = default;
