@@ -393,7 +393,11 @@ void CharacterService::ProcessNewEntity(entt::entity aEntity) const noexcept
 
         // Never steal actor ownership onto a downed party leader, from a remote player summon, or across a
         // 5x5 exterior border seam right after relinquishing (`DC568` Wolf / `105A3C` Rabbit ping-pong guard)!
+        // And never onto our own body (form 0x14): the server pins player avatars, so such a claim is always
+        // declined with NotifyRelinquishControl, which re-enters this path every re-announce and ping-pongs
+        // claim -> decline forever while freezing local movement (v4.1.3 regression).
         if (m_world.GetPartyService().IsLeader() &&
+            pActor->formID != 0x14 &&
             !m_world.GetDownedStateService().IsLocalPlayerDowned() &&
             insideSafeClaimMargin &&
             !inRelinquishCooldown &&

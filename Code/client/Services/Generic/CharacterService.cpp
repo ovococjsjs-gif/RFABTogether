@@ -1561,11 +1561,17 @@ void CharacterService::OnAssignCharacter(const AssignCharacterResponse& acMessag
         // Flush mutations that occurred during the `WaitingForAssignment` RTT window (#932),
         // silent engine InitOutfitItems / InitLeveledItems weapon populations, and unseeded
         // dormant checkpoint records whose live NPC weapons were preserved locally!
+        // NEVER for the local player avatar: its live inventory always "differs" from the server's
+        // NPC-style record, and the server pins player avatars (Authority::Claim => kDeniedPinnedEntity),
+        // so the claim would bounce back as NotifyRelinquishControl and strip LocalComponent from our
+        // own body (v4.1.3 "stuck when a party member is nearby" regression). Player inventory is
+        // synced by InventoryService/EquipmentChange events instead.
+        const bool canSyncViaOwnershipClaim = !isPlayerActor;
         const Inventory liveInventory = pActor->GetActorInventory();
         const bool serverInvEmpty = CoopInventoryDiff::IsActorInventoryEmpty(acMessage.CurrentInventory);
         const bool liveInvNonEmpty = !CoopInventoryDiff::IsActorInventoryEmpty(liveInventory);
         const bool liveInvDiffers = (liveInventory != acMessage.CurrentInventory);
-        if (CoopEquipGuard::ShouldSyncPostAssignmentInventory(
+        if (canSyncViaOwnershipClaim && CoopEquipGuard::ShouldSyncPostAssignmentInventory(
                 serverProvidedExistingState,
                 waitingSnapshot.DirtyInventory,
                 liveInvDiffers,
@@ -2135,6 +2141,22 @@ void CharacterService::OnNotifyRelinquishControl(const NotifyRelinquishControl& 
 
     const uint32_t actorFormId = pFormIdComponent->Id;
     const uint32_t serverId = acMessage.ServerId;
+
+    // Hard safety net: a player avatar is pinned server-side (Authority::Claim/Release/Reassign all
+    // deny transferring it), so no legitimate server path ever revokes it. If a relinquish for our
+    // own body arrives anyway (version skew, stale epoch machinery, a future server bug), complying
+    // would strip LocalComponent from the local player and freeze its movement entirely, so ignore
+    // it and keep simulating. The cooldown is deliberately NOT recorded: we never gave the actor up.
+    if (m_world.all_of<LocalComponent>(entity) && actorFormId == 0x14)
+    {
+        spdlog::error(
+            __FUNCTION__ ": ignored relinquish of the local player character (server id {:X}, epoch {:X}): "
+            "a player avatar is pinned to its owner and its control is never handed back",
+            serverId,
+            acMessage.OwnershipEpoch);
+        return;
+    }
+
     m_relinquishClaimCooldowns.RecordRelinquished(actorFormId, NowSteadyWorldViewMs());
 
     if (m_world.all_of<LocalComponent>(entity))

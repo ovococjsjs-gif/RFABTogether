@@ -49,8 +49,16 @@ bool SenderIsCurrent(const Lease& acCurrent, uint32_t aSenderId, uint64_t aSende
 Decision Claim(const Lease& acCurrent, const Subject& acSubject, const OwnerState& acOwnerState,
                const Candidate& acChallenger, uint64_t aNowMs, const Policy& acPolicy) noexcept
 {
+    // A pinned entity (player avatar / bound summon) can never be granted to anybody else, so the
+    // recorded owner re-claiming it is a benign state-sync / lease refresh whose only correct answer
+    // is kAlreadyOwner - even when its lease window has lapsed (a player's lease lapses on load
+    // screens, yet their body must never be evicted with NotifyRelinquishControl). Denying the
+    // owner's own claim was the v4.1.3 regression that ping-ponged claim -> decline at 2 Hz and
+    // froze a player whenever a party member came near. Non-owner challengers stay denied exactly
+    // as before.
+    const bool isSelfClaim = acCurrent.OwnerId != kNoOwner && acCurrent.OwnerId == acChallenger.PlayerId;
     if (acSubject.IsPlayerAvatar || acSubject.IsSummonPinnedToOwner)
-        return Unchanged(acCurrent, Outcome::kDeniedPinnedEntity);
+        return Unchanged(acCurrent, isSelfClaim ? Outcome::kAlreadyOwner : Outcome::kDeniedPinnedEntity);
 
     if (acChallenger.PlayerId == kNoOwner)
         return Unchanged(acCurrent, Outcome::kDeniedNoCandidate);
@@ -58,7 +66,7 @@ Decision Claim(const Lease& acCurrent, const Subject& acSubject, const OwnerStat
     if (!acChallenger.InRange)
         return Unchanged(acCurrent, Outcome::kDeniedNoCandidate);
 
-    if (acCurrent.OwnerId == acChallenger.PlayerId && !acCurrent.IsExpired(aNowMs))
+    if (isSelfClaim && !acCurrent.IsExpired(aNowMs))
         return Unchanged(acCurrent, Outcome::kAlreadyOwner);
 
     // An owner that lapsed, disconnected or left the area is not an owner any more:

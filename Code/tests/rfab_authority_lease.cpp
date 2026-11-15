@@ -126,6 +126,40 @@ TEST_CASE("Authority: player avatars and bound summons never change hands", "[rf
     CHECK_FALSE(reassign.Changed);
 }
 
+TEST_CASE("Authority: a pinned entity's own owner re-claiming it is acknowledged, not denied",
+          "[rfab][authority][pinned]")
+{
+    // v4.1.3 regression: right after assignment the client sends a benign state-sync claim for its
+    // own player avatar (inventory flush over the WaitingForAssignment RTT window). The pinned check
+    // ran before the already-owner check, so the owner's claim was denied and the server answered
+    // with NotifyRelinquishControl - stripping LocalComponent from the player's own body. The client
+    // then re-claimed every entity re-announce, the server declined every claim, and the player
+    // froze whenever a party member came near.
+
+    const Lease held = OwnedBy(kHost, 3ull, 0ull);
+
+    const auto selfAvatar = Claim(held, kPlayerAvatar, kOwnerPresent, Peer(kHost), 100'000ull);
+    CHECK(selfAvatar.Result == Outcome::kAlreadyOwner);
+    CHECK_FALSE(selfAvatar.Changed);
+    CHECK(selfAvatar.Next.Epoch == held.Epoch);
+
+    // Even a lapsed lease window must not evict the owner of a pinned entity: a player's lease can
+    // lapse across load screens, but their body is never handed to anybody else.
+    const Lease lapsed = OwnedBy(kHost, 3ull, 1000ull, 6000ull);
+    const auto lapsedSelfAvatar = Claim(lapsed, kPlayerAvatar, kOwnerPresent, Peer(kHost), 7000ull);
+    CHECK(lapsedSelfAvatar.Result == Outcome::kAlreadyOwner);
+    CHECK_FALSE(lapsedSelfAvatar.Changed);
+
+    const auto selfSummon = Claim(held, kBoundSummon, kOwnerPresent, Peer(kHost), 100'000ull);
+    CHECK(selfSummon.Result == Outcome::kAlreadyOwner);
+    CHECK_FALSE(selfSummon.Changed);
+
+    // A challenger that is not the owner is still denied exactly as before.
+    const auto stolenAvatar = Claim(held, kPlayerAvatar, kOwnerPresent, Peer(kGuest), 100'000ull);
+    CHECK(stolenAvatar.Result == Outcome::kDeniedPinnedEntity);
+    CHECK_FALSE(stolenAvatar.Changed);
+}
+
 TEST_CASE("Authority: the hold window stops ownership ping-pong", "[rfab][authority][holdwindow]")
 {
     const Policy policy{1500ull, 0ull};
