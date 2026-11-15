@@ -8,14 +8,14 @@
 
 [![Сборка Windows](https://github.com/ovococjsjs-gif/RFABTogether/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/ovococjsjs-gif/RFABTogether/actions/workflows/release.yml?query=branch%3Amain)
 [![Тесты Linux](https://github.com/ovococjsjs-gif/RFABTogether/actions/workflows/core-tests-linux.yml/badge.svg?branch=main)](https://github.com/ovococjsjs-gif/RFABTogether/actions/workflows/core-tests-linux.yml?query=branch%3Amain)
-![Версия](https://img.shields.io/badge/%D0%B2%D0%B5%D1%80%D1%81%D0%B8%D1%8F-4.1.1-2ea8a0)
+[![Релиз](https://img.shields.io/github/v/release/ovococjsjs-gif/RFABTogether?include_prereleases&label=%D1%80%D0%B5%D0%BB%D0%B8%D0%B7&color=2ea8a0)](https://github.com/ovococjsjs-gif/RFABTogether/releases)
 ![Skyrim SE](https://img.shields.io/badge/Skyrim%20SE-1.5.97-2a2a3a)
 ![SKSE64](https://img.shields.io/badge/SKSE64-2.0.20-3b6ea5)
 ![Лицензия](https://img.shields.io/badge/%D0%BB%D0%B8%D1%86%D0%B5%D0%BD%D0%B7%D0%B8%D1%8F-GPL--3.0-8a6d3b)
 
 *Проходите Requiem for a Balance вдвоём–вчетвером: общий мир и задания, личные сложность и прогресс,<br>ранение вместо мгновенной смерти и свой сервер.*
 
-[**Скачать сборку**](#-скачать-и-установить) · [**Что нового**](#-что-нового-в-411) · [**Управление**](#-управление) · [**Плейтест**](docs/PLAYTEST.md) · [**Журнал изменений**](CHANGELOG.md)
+[**Скачать сборку**](https://github.com/ovococjsjs-gif/RFABTogether/releases) · [**Установка**](#-скачать-и-установить) · [**Что нового**](#-что-нового-в-411) · [**Управление**](#-управление) · [**Плейтест**](docs/PLAYTEST.md) · [**Журнал изменений**](CHANGELOG.md)
 
 </div>
 
@@ -26,7 +26,7 @@
 
 ## 🔥 О проекте
 
-**RFAB Together** — кооперативный мультиплеер для модпака **[Requiem for a Balance (RFAB)](https://github.com/drake1ch/RFAB)** на Skyrim Special Edition `1.5.97`. Проект продолжает [`Riyozaki/RFAB_Online`](https://github.com/Riyozaki/RFAB_Online) `v4.1.0` и построен на платформе Skyrim Together Reborn (Tilted Online).
+**RFAB Together** — кооперативный мультиплеер для модпака **[Requiem for a Balance (RFAB)](https://github.com/drake1ch/RFAB)** на Skyrim Special Edition `1.5.97`. Проект построен на платформе Skyrim Together Reborn (Tilted Online).
 
 - **RFAB остаётся RFAB.** Плагины коопа не перезаписывают баланс и контент сборки: сложности, перки, алтари и скрипты работают у каждого игрока так же, как в одиночной игре.
 - **Настройки других модов не меняются.** Значения, нужные для коопа, лаунчер подставляет только своему процессу; файлы сборки остаются нетронутыми.
@@ -75,17 +75,16 @@
 
 ## 📦 Скачать и установить
 
-Готовая сборка прикладывается к каждому прогону CI на ветке `main`:
+Скачивайте сборку со страницы **[релизов](https://github.com/ovococjsjs-gif/RFABTogether/releases)**: откройте верхний релиз и возьмите нужный архив из раздела **Assets**.
 
-1. Откройте [прогоны «Build & Publish Clean Release» на `main`](https://github.com/ovococjsjs-gif/RFABTogether/actions/workflows/release.yml?query=branch%3Amain+is%3Asuccess) и выберите верхний.
-2. Внизу страницы, в разделе **Artifacts**, скачайте `RFAB_Online-build-<sha>`. Нужен вход в GitHub; архив хранится 90 дней.
-
-| Файл в архиве | Назначение |
+| Файл | Назначение |
 |---|---|
 | `RFAB_Online_v4.1.1_Full_Installer.zip` | Полная установка или чистое обновление: клиент для MO2, интерфейс, выделенный сервер |
 | `RFAB_Online_v4.1.1_Quick_Update.zip` | Быстрое обновление поверх уже установленной версии |
 | `RFAB_Online_v4.1.1_PDB_Symbols.zip` | Отладочные символы; нужны только для разбора вылета |
 | `SHA256SUMS.txt` | Контрольные суммы архивов |
+
+Сборки отдельных коммитов между релизами прикладываются к прогонам CI: как их взять, описано в [`docs/PLAYTEST.md`](docs/PLAYTEST.md), раздел 1.
 
 ### 1. Установка (одинаково для хоста и гостей)
 
@@ -199,7 +198,6 @@
 ## 🙏 Благодарности
 
 - [`drake1ch/RFAB`](https://github.com/drake1ch/RFAB) — авторам модпака Requiem for a Balance.
-- [`Riyozaki/RFAB_Online`](https://github.com/Riyozaki/RFAB_Online) — за основу, на которой построен этот проект.
 - [`rfortier/TiltedEvolution-rwf`](https://github.com/rfortier/TiltedEvolution-rwf) и команде Tilted Online — за платформу Skyrim Together Reborn.
 - Командам SKSE64 (`ianpatt/skse64`), CommonLibSSE-NG и SSE Engine Fixes (`aers/EngineFixesSkyrim64`).
 
@@ -208,9 +206,9 @@
 
 <br>
 
-RFAB Together is a co-op multiplayer mod for Skyrim Special Edition `1.5.97`, tailored to the Requiem for a Balance (RFAB) modpack. It continues `Riyozaki/RFAB_Online` `v4.1.0` and is built on Skyrim Together Reborn (Tilted Online).
+RFAB Together is a co-op multiplayer mod for Skyrim Special Edition `1.5.97`, tailored to the Requiem for a Balance (RFAB) modpack. It is built on Skyrim Together Reborn (Tilted Online).
 
-Version `4.1.1` is a playtest build: its fixes were found by code reading and on an in-process server test bench, and they have not been verified in the game yet. Builds are attached to CI runs on `main`. The documentation is in Russian.
+Version `4.1.1` is a playtest build: its fixes were found by code reading and on an in-process server test bench, and they have not been verified in the game yet. Builds are published on the Releases page. The documentation is in Russian.
 
 </details>
 

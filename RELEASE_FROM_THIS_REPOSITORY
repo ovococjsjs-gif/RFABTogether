@@ -1,0 +1,4 @@
+# This repository publishes its own GitHub releases (read by Tools/rfab/Build-CloudRelease.ps1).
+# The word on the last line marks the release as a pre-release: a build that has not been through
+# a playtest yet. Remove that line to publish ordinary releases.
+prerelease

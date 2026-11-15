@@ -46,7 +46,8 @@ if ($env:GITHUB_ACTIONS -eq "true" -and $env:GITHUB_REF) {
 # A repository other than the upstream one builds, tests and packages, but does not publish on
 # its own: the protected tags and the backup manifests below describe the upstream release history,
 # and a fork that reached this point on its main branch would try to mirror releases it never had.
-# A fork opts in by committing an empty file named RELEASE_FROM_THIS_REPOSITORY at its root.
+# A repository opts in by committing a file named RELEASE_FROM_THIS_REPOSITORY at its root; it then
+# publishes its own versions and skips the legacy mirrors (RfabMirrorsLegacyReleases below).
 $script:RfabUpstreamRepository = "Riyozaki/RFAB_Online"
 $script:RfabRepositorySlug = if ($env:GITHUB_REPOSITORY) { $env:GITHUB_REPOSITORY } else { $script:RfabUpstreamRepository }
 if ($env:GITHUB_ACTIONS -eq "true" -and ($script:RfabRepositorySlug -ne $script:RfabUpstreamRepository)) {
@@ -65,7 +66,18 @@ if ($PublishRelease -and ($VersionTag -in $ProtectedTags)) {
     throw "Release policy violation: '$VersionTag' is an immutable protected release. Bump VERSION and cut a new tag instead of overwriting it."
 }
 
-$IsPrereleaseTag = ($VersionTag.Contains("-")) -or ($env:GITHUB_REF -and $env:GITHUB_REF -ne "refs/heads/main" -and ($env:GITHUB_REF -notlike "refs/tags/v*"))
+# The legacy release mirrors (the Ensure-V*BackupRelease functions below) describe the release
+# history of $script:RfabUpstreamRepository only; every other repository skips them.
+$script:RfabMirrorsLegacyReleases = ($script:RfabRepositorySlug -eq $script:RfabUpstreamRepository)
+# The opt-in file may carry the single word "prerelease" on a line of its own: the release is
+# then published as a GitHub pre-release (a build that has not been through a playtest yet).
+$script:RfabOptInPrerelease = $false
+$rfabOptInFile = Join-Path $script:RfabRepoRoot "RELEASE_FROM_THIS_REPOSITORY"
+if (Test-Path -LiteralPath $rfabOptInFile) {
+    $rfabOptInText = [System.IO.File]::ReadAllText($rfabOptInFile)
+    if ($rfabOptInText -match '(?im)^\s*prerelease\s*$') { $script:RfabOptInPrerelease = $true }
+}
+$IsPrereleaseTag = ($VersionTag.Contains("-")) -or $script:RfabOptInPrerelease -or ($env:GITHUB_REF -and $env:GITHUB_REF -ne "refs/heads/main" -and ($env:GITHUB_REF -notlike "refs/tags/v*"))
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $env:PYTHONIOENCODING = "utf-8"
@@ -994,15 +1006,19 @@ try {
     $RepoRoot = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "..\.."))
     Set-Location -LiteralPath $RepoRoot
 
-    Ensure-V120BackupRelease -RepoRootPath $RepoRoot
-    Ensure-V202BackupRelease -RepoRootPath $RepoRoot
-    Ensure-V203BackupRelease -RepoRootPath $RepoRoot
-    Ensure-V210BackupRelease -RepoRootPath $RepoRoot
-    Ensure-V300BackupRelease -RepoRootPath $RepoRoot
-    Ensure-V310BackupRelease -RepoRootPath $RepoRoot
-    Ensure-V311BackupRelease -RepoRootPath $RepoRoot
-    Ensure-V312BackupRelease -RepoRootPath $RepoRoot
-    Ensure-V313BackupRelease -RepoRootPath $RepoRoot
+    if ($script:RfabMirrorsLegacyReleases) {
+        Ensure-V120BackupRelease -RepoRootPath $RepoRoot
+        Ensure-V202BackupRelease -RepoRootPath $RepoRoot
+        Ensure-V203BackupRelease -RepoRootPath $RepoRoot
+        Ensure-V210BackupRelease -RepoRootPath $RepoRoot
+        Ensure-V300BackupRelease -RepoRootPath $RepoRoot
+        Ensure-V310BackupRelease -RepoRootPath $RepoRoot
+        Ensure-V311BackupRelease -RepoRootPath $RepoRoot
+        Ensure-V312BackupRelease -RepoRootPath $RepoRoot
+        Ensure-V313BackupRelease -RepoRootPath $RepoRoot
+    } else {
+        Write-Host "[BACKUP] $($script:RfabRepositorySlug) keeps no legacy release mirrors; skipping them." -ForegroundColor DarkGray
+    }
 
     Invoke-LoggedCmd "[1/8] Submodules init + SE 1.5.97 Submodule Patches" "git submodule sync --recursive && git submodule update --init --force --recursive --depth=1 && python Tools\rfab\patch_submodules.py"
     Invoke-LoggedCmd "[2/8] SE 1.5.97 Port Audit + Release Invariants" "python Tools\rfab\verify_se1597_port.py && python Tools\rfab\check_release_invariants.py"
@@ -1072,7 +1088,7 @@ try {
     $QuickUpdZip  = Join-Path $RepoRoot "release_artifacts\RFAB_Online_${VersionTag}_Quick_Update.zip"
     $PdbZip       = Join-Path $RepoRoot "release_artifacts\RFAB_Online_${VersionTag}_PDB_Symbols.zip"
     $ShaFile      = Join-Path $RepoRoot "release_artifacts\SHA256SUMS.txt"
-    $RelTitle     = "RFAB Online $VersionTag - Full Clean Standalone Installer (Skyrim SE 1.5.97.0.8)"
+    $RelTitle     = if ($IsPrereleaseTag) { "RFAB Together $VersionTag - Playtest Build (Skyrim SE 1.5.97)" } else { "RFAB Together $VersionTag (Skyrim SE 1.5.97)" }
     $RelFlags     = if ($IsPrereleaseTag) { "--prerelease" } else { '"--prerelease=false" --latest' }
     $CreateFlags  = if ($IsPrereleaseTag) { "--prerelease" } else { "--latest" }
 
