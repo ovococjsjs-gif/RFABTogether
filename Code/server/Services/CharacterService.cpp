@@ -71,6 +71,17 @@ Console::Setting bEnableBodyLootAuthority{
     "(RFAB) The server's list of what a dead NPC holds is not replaced by the list of the player who takes the body over (off = 4.1.0: it is, and a taken item can reappear)",
     true};
 
+// Work plan 6.2 / defect M26. A summon cannot be handed over, and the lease model refuses the
+// request a client sends when it unloads an actor. For a summon that request is the only way the
+// server learns that it is gone, and the branch that removed it stood behind the refusal. On: the
+// summoner's request removes his summon for everybody. Off = 4.1.0: the request is refused and
+// the summon stays on the server, shown to the other players where it last stood, until its
+// summoner disconnects.
+Console::Setting bEnableSummonDismissal{
+    "Gameplay:bEnableSummonDismissal",
+    "(RFAB) A summon its summoner's game has let go is removed for the other players (off = 4.1.0: it stays where it last stood until the summoner disconnects)",
+    true};
+
 namespace
 {
 constexpr uint32_t kHealthActorValueIndex = 24;
@@ -1132,6 +1143,16 @@ void CharacterService::OnOwnershipTransferRequest(const PacketEvent<RequestOwner
         handoffSubject.IsSummonPinnedToOwner = pCharacterComponent->IsPlayerSummon();
     }
 
+    if (bEnableSummonDismissal && handoffSubject.IsSummonPinnedToOwner &&
+        Authority::MaySummonerDismiss(pCharacterOwnerComponent->GetLease(), senderId, message.OwnershipEpoch))
+    {
+        // The summoner's game let the summon go: it is gone from the only game that can run it.
+        // Anybody else asking, or a stale epoch, falls through to the refusal below.
+        spdlog::debug("[Ownership] Summon {:X} let go by its summoner (player {}): removed", message.ServerId, senderId);
+        m_world.GetDispatcher().trigger(CharacterRemoveEvent(message.ServerId));
+        return;
+    }
+
     const auto handoffDecision = Authority::Release(pCharacterOwnerComponent->GetLease(), handoffSubject, senderId,
                                                     message.OwnershipEpoch, SteadyClockMs());
 
@@ -1158,6 +1179,9 @@ void CharacterService::OnOwnershipTransferRequest(const PacketEvent<RequestOwner
         return;
     }
 
+    // Not reached for a summon since the lease model was put in front of it: Authority::Release
+    // refuses a pinned entity above. The summoner's own request is handled before the refusal
+    // (bEnableSummonDismissal, defect M26).
     if (auto* pCharacterComponent = m_world.try_get<CharacterComponent>(cEntity))
     {
         if (pCharacterComponent->IsPlayerSummon())

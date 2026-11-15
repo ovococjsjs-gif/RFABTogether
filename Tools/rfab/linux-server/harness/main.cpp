@@ -137,6 +137,7 @@ extern Console::Setting<bool> bEnableDesyncAutoRepair;
 extern Console::Setting<bool> bEnableBossLeaseRenewal;
 extern Console::Setting<bool> bEnableUnlockMemory;
 extern Console::Setting<bool> bEnableBodyLootAuthority;
+extern Console::Setting<bool> bEnableSummonDismissal;
 
 namespace
 {
@@ -4198,6 +4199,252 @@ int main(int argc, char** argv)
               "and is sent the guard in the cellar, at the place its last simulator reported");
         Check(ownerOf(guard) == pHost && grantedTo(kHostConn, guard), "the guard nobody simulated is given to him");
         Check(world.get<CharacterComponent>(entityOf(guard)).IsWeaponDrawn(), "still with its weapon drawn");
+    }
+
+    // =========================================================================
+    // Scene 19: a player's summon belongs to the summoner (work plan 6.2).
+    // =========================================================================
+    //
+    // Conjuration is a build of its own in RFAB, and no scene had a summon in it. A summon is not
+    // a world NPC: it exists in its summoner's game, follows him, and must never change hands. The
+    // scene pins every rule of NPC ownership that has an exception for summons, and what happens to
+    // a summon when its summoner lets it go or leaves.
+    {
+        std::printf("[scene 19] a player's summon belongs to the summoner\n");
+        std::filesystem::remove(SaveSnapshotService::GetDefaultCheckpointStorePath(), removeEc);
+
+        GameServer server{registry};
+        World& world = server.GetWorld();
+
+        constexpr TiltedPhoques::ConnectionId_t kHostConn = 0xF401u;
+        constexpr TiltedPhoques::ConnectionId_t kGuestConn = 0xF402u;
+        const GameId kPlayerRef{0u, 0x14u};
+        const GameId kHall{0u, 0x000F0001u};
+        const GameId kCellar{0u, 0x000F0002u};
+        const GameId kAtronachBase{0u, 0x000F1001u};
+        constexpr uint32_t kTemporary = std::numeric_limits<uint32_t>::max();
+        constexpr uint32_t kHealthIndex = ActorValuesComponent::kHealthActorValueIndex;
+
+        Player* pHost = world.GetPlayerManager().Create(kHostConn);
+        Player* pGuest = world.GetPlayerManager().Create(kGuestConn);
+        TimeModel t0{};
+        t0.Time = 12.0f;
+        t0.Day = 6;
+        t0.Month = 5;
+        t0.Year = 201;
+        world.GetDispatcher().trigger(PlayerJoinEvent{pHost, {}, {}, DateTime{t0}});
+        world.GetDispatcher().trigger(PlayerJoinEvent{pGuest, {}, {}, DateTime{t0}});
+
+        const auto walkInto = [&](Player* apPlayer, const GameId& acCell) {
+            Harness::ClearOutbox();
+            EnterInteriorCellRequest request{};
+            request.CellId = acCell;
+            return DeliverWire(world, request, apPlayer);
+        };
+        Check(walkInto(pHost, kHall) && walkInto(pGuest, kHall), "both players enter the hall");
+
+        uint32_t nextCookie = 1900u;
+        uint32_t nextTemporaryRef = 0xFF000A00u;
+        std::optional<AssignCharacterResponse> lastAssign;
+        // Registers the player's own character (acRefId == kPlayerRef) or a conjured atronach.
+        const auto assign = [&](Player* apOwner, TiltedPhoques::ConnectionId_t aConn, bool aSummon) {
+            Harness::ClearOutbox();
+            AssignCharacterRequest request{};
+            request.Cookie = nextCookie++;
+            if (aSummon)
+            {
+                request.ReferenceId = GameId{kTemporary, nextTemporaryRef++};
+                request.FormId = kAtronachBase;
+                request.IsPlayerSummon = true;
+            }
+            else
+            {
+                request.ReferenceId = kPlayerRef;
+            }
+            request.CellId = kHall;
+            request.Position = glm::vec3{200.0f, 200.0f, 0.0f};
+            request.CurrentActorData.BaseId = request.FormId;
+            request.CurrentActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 100.0f;
+            request.CurrentActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 100.0f;
+            (void)DeliverWire(world, request, apOwner);
+            const auto responses = DecodeOutboxMessagesFor<AssignCharacterResponse>(aConn);
+            lastAssign = responses.size() == 1 ? std::optional<AssignCharacterResponse>{responses[0]} : std::nullopt;
+            return responses.size() == 1 ? responses[0].ServerId : 0xFFFFFFFFu;
+        };
+        const uint32_t hostChar = assign(pHost, kHostConn, false);
+        const uint32_t guestChar = assign(pGuest, kGuestConn, false);
+        Check(hostChar != 0xFFFFFFFFu && guestChar != 0xFFFFFFFFu, "both players' characters are registered");
+
+        const auto entityOf = [](uint32_t aServerId) { return static_cast<entt::entity>(aServerId); };
+        const auto exists = [&](uint32_t aServerId) { return world.valid(entityOf(aServerId)); };
+        const auto ownerOf = [&](uint32_t aServerId) { return world.get<OwnerComponent>(entityOf(aServerId)).GetOwner(); };
+        const auto healthOf = [&](uint32_t aServerId) {
+            return world.get<ActorValuesComponent>(entityOf(aServerId)).CurrentActorValues.ActorValuesList[kHealthIndex];
+        };
+        const auto near = [](float aLhs, float aRhs) { return std::fabs(aLhs - aRhs) < 0.01f; };
+        const auto spawnedFor = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) -> std::optional<CharacterSpawnRequest> {
+            for (const auto& spawn : DecodeOutboxMessagesFor<CharacterSpawnRequest>(aConn))
+            {
+                if (spawn.ServerId == aServerId)
+                    return spawn;
+            }
+            return std::nullopt;
+        };
+        const auto removedFor = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& removal : DecodeOutboxMessagesFor<NotifyRemoveCharacter>(aConn))
+            {
+                if (removal.ServerId == aServerId)
+                    return true;
+            }
+            return false;
+        };
+        const auto grantedTo = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& grant : DecodeOutboxMessagesFor<NotifyOwnershipTransfer>(aConn))
+            {
+                if (grant.ServerId == aServerId)
+                    return true;
+            }
+            return false;
+        };
+        const auto toldToLetGo = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& notice : DecodeOutboxMessagesFor<NotifyRelinquishControl>(aConn))
+            {
+                if (notice.ServerId == aServerId)
+                    return true;
+            }
+            return false;
+        };
+        uint32_t nextHitId = 19000u;
+        const auto swing = [&](uint32_t aTarget, float aDelta) {
+            RequestHealthChangeBroadcast hit{};
+            hit.Id = aTarget;
+            hit.DeltaHealth = aDelta;
+            hit.HitId = nextHitId++;
+            return hit;
+        };
+
+        // --- 1. The guest conjures an atronach --------------------------------------------------
+        const uint32_t atronach = assign(pGuest, kGuestConn, true);
+        Check(atronach != 0xFFFFFFFFu && lastAssign.has_value() && lastAssign->Owner && lastAssign->PlayerId == pGuest->GetId() &&
+                  world.get<CharacterComponent>(entityOf(atronach)).IsPlayerSummon() && ownerOf(atronach) == pGuest,
+              "the guest's atronach is registered as his summon");
+        const auto atronachForHost = spawnedFor(kHostConn, atronach);
+        Check(atronachForHost.has_value() && atronachForHost->IsPlayerSummon && atronachForHost->PlayerId == pGuest->GetId() &&
+                  atronachForHost->BaseId == kAtronachBase && atronachForHost->FormId == GameId{},
+              "the host is sent it as the guest's summon, so his game binds it to the guest's character and not to his own");
+
+        // The host conjures the same creature on the same spot: two summons, not one shared.
+        const uint32_t hostAtronach = assign(pHost, kHostConn, true);
+        Check(hostAtronach != 0xFFFFFFFFu && hostAtronach != atronach && lastAssign.has_value() && lastAssign->Owner &&
+                  ownerOf(hostAtronach) == pHost && ownerOf(atronach) == pGuest,
+              "the same creature conjured by the host on the same spot is a second summon: summons are never merged");
+
+        // --- 2. It cannot change hands ----------------------------------------------------------
+        Harness::ClearOutbox();
+        RequestOwnershipClaim claim{};
+        claim.ServerId = atronach;
+        claim.NewActorData.InitialActorValues.ActorValuesList[kHealthIndex] = 100.0f;
+        claim.NewActorData.InitialActorValues.ActorMaxValuesList[kHealthIndex] = 100.0f;
+        Check(DeliverWire(world, claim, pHost) && ownerOf(atronach) == pGuest && toldToLetGo(kHostConn, atronach) && !grantedTo(kHostConn, atronach),
+              "the party leader's claim on it is refused");
+
+        // A calm world NPC goes to the party leader when he walks in. A summon does not.
+        Check(walkInto(pHost, kCellar) && walkInto(pHost, kHall) && ownerOf(atronach) == pGuest && !grantedTo(kHostConn, atronach) &&
+                  spawnedFor(kHostConn, atronach).has_value(),
+              "the leader walking back in is shown the atronach, and it stays with the guest");
+
+        // The guest stands in a menu for a minute while the host plays on.
+        constexpr uint64_t kLeaseNow = 9'000'000ull;
+        world.GetCharacterService().NotePlayerSimulationActivity(pGuest, kLeaseNow);
+        world.GetCharacterService().NotePlayerSimulationActivity(pHost, kLeaseNow + 59'000ull);
+        Harness::ClearOutbox();
+        world.GetCharacterService().SweepExpiredWorldNpcLeases(kLeaseNow + 60'000ull);
+        Check(ownerOf(atronach) == pGuest && !grantedTo(kHostConn, atronach) && !toldToLetGo(kGuestConn, atronach),
+              "a summoner who is silent for a minute keeps his summon: there is no lease to lose");
+
+        // --- 3. Movement and damage -------------------------------------------------------------
+        const auto movementOf = [&](uint32_t aServerId, const glm::vec3& acPosition) {
+            ClientReferencesMoveRequest request{};
+            request.Tick = 7000u;
+            ReferenceUpdate update{};
+            update.UpdatedMovement.CellId = kHall;
+            update.UpdatedMovement.Position = acPosition;
+            request.Updates[aServerId] = update;
+            return request;
+        };
+        const auto relayedTo = [&](TiltedPhoques::ConnectionId_t aConn, uint32_t aServerId) {
+            for (const auto& relay : DecodeOutboxMessagesFor<ServerReferencesMoveRequest>(aConn))
+            {
+                if (relay.Updates.find(aServerId) != relay.Updates.end())
+                    return true;
+            }
+            return false;
+        };
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(atronach, glm::vec3{260.0f, 210.0f, 0.0f}), pGuest) && relayedTo(kHostConn, atronach),
+              "the atronach's movement comes from the guest's game and is sent to the host");
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, movementOf(atronach, glm::vec3{900.0f, 900.0f, 0.0f}), pHost) && !relayedTo(kGuestConn, atronach) &&
+                  glm::distance(glm::vec3(world.get<MovementComponent>(entityOf(atronach)).Position), glm::vec3{260.0f, 210.0f, 0.0f}) < 1.0f,
+              "the host's game cannot move it");
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, swing(atronach, -40.0f), pHost) && near(healthOf(atronach), 100.0f) &&
+                  DecodeOutboxMessagesFor<NotifyHealthChangeBroadcast>(kGuestConn).empty(),
+              "a party member's stray blow does not hurt the summon");
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, swing(atronach, -30.0f), pGuest) && near(healthOf(atronach), 70.0f) &&
+                  DecodeOutboxMessagesFor<NotifyHealthChangeBroadcast>(kHostConn).size() == 1,
+              "damage an enemy does to it in the summoner's game is applied and sent to the host: 100 -> 70");
+
+        // --- 4. The summoner lets it go ---------------------------------------------------------
+        // His client hands over every actor it unloads. A world NPC goes to the player who stays;
+        // a summon is removed, because nobody else's game can run it.
+        // The summon expired, was dismissed, or was unloaded with the summoner's cell: for the server
+        // this request is the only sign of it (defect M26).
+        RequestOwnershipTransfer letGo{};
+        letGo.ServerId = atronach;
+        letGo.OwnershipEpoch = world.get<OwnerComponent>(entityOf(atronach)).GetEpoch();
+
+        Check(static_cast<bool>(bEnableSummonDismissal), "Gameplay:bEnableSummonDismissal is on by default");
+        bEnableSummonDismissal = false;
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, letGo, pGuest) && exists(atronach) && ownerOf(atronach) == pGuest && !removedFor(kHostConn, atronach) &&
+                  toldToLetGo(kGuestConn, atronach),
+              "with the switch off the request is refused, as in 4.1.0: the atronach stays for the host where it last stood");
+        bEnableSummonDismissal = true;
+
+        Harness::ClearOutbox();
+        RequestOwnershipTransfer staleLetGo = letGo;
+        staleLetGo.OwnershipEpoch = letGo.OwnershipEpoch + 5u;
+        Check(DeliverWire(world, staleLetGo, pGuest) && exists(atronach) && !removedFor(kHostConn, atronach),
+              "a request that quotes an epoch the lease never had is refused");
+
+        Harness::ClearOutbox();
+        Check(DeliverWire(world, letGo, pGuest) && !exists(atronach) && removedFor(kHostConn, atronach) && !grantedTo(kHostConn, atronach) &&
+                  !removedFor(kGuestConn, atronach),
+              "let go by the summoner, the atronach is removed for the host and given to nobody");
+        Check(exists(hostAtronach) && ownerOf(hostAtronach) == pHost, "the host's own atronach is untouched");
+        // A player who walks in later is not shown a summon that is gone.
+        Check(walkInto(pHost, kCellar) && walkInto(pHost, kHall) && !spawnedFor(kHostConn, atronach).has_value(),
+              "walking back into the hall, the host is not shown the atronach that is gone");
+
+        // A request from somebody else to let the host's summon go is refused.
+        Harness::ClearOutbox();
+        RequestOwnershipTransfer notMine{};
+        notMine.ServerId = hostAtronach;
+        Check(DeliverWire(world, notMine, pGuest) && exists(hostAtronach) && ownerOf(hostAtronach) == pHost && toldToLetGo(kGuestConn, hostAtronach),
+              "the guest cannot make the server drop the host's summon");
+
+        // --- 5. The summoner leaves the game ----------------------------------------------------
+        const uint32_t secondAtronach = assign(pGuest, kGuestConn, true);
+        Check(secondAtronach != 0xFFFFFFFFu && spawnedFor(kHostConn, secondAtronach).has_value(), "the guest conjures again and the host is shown the new atronach");
+        Harness::ClearOutbox();
+        Disconnect(server, kGuestConn);
+        Check(!exists(secondAtronach) && removedFor(kHostConn, secondAtronach) && !grantedTo(kHostConn, secondAtronach),
+              "the guest disconnects: his atronach is removed for the host, not handed to him");
+        Check(!exists(guestChar) && removedFor(kHostConn, guestChar), "so is the guest's character");
+        Check(exists(hostAtronach) && ownerOf(hostAtronach) == pHost && exists(hostChar), "the host and his atronach stay");
     }
 
     std::printf("%s (%d failure%s)\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures,

@@ -247,3 +247,51 @@ TEST_CASE("5.1: who may take over, and how often the server looks", "[rfab][auth
         CHECK_FALSE(IsPeerActivelySimulating(ActiveAt(now - 6000ull), now, sweep));
     }
 }
+
+// Work plan 6.2 / defect M26. A summon cannot be handed over, so Release refuses it. The request
+// a client sends when it unloads an actor is, for a summon, the only way the server learns that
+// the summon is gone. The server removed nothing: the refusal stood in front of the removal.
+TEST_CASE("6.2: a summon is let go by its summoner and by nobody else", "[rfab][authority][lease][summon]")
+{
+    Lease lease{};
+    lease.OwnerId = 7u;
+    lease.Epoch = 3u;
+    lease.GrantedAtMs = 1'000u;
+    lease.ExpiresAtMs = 0u;
+
+    SECTION("the lease model still refuses to hand a summon over")
+    {
+        Subject summon{};
+        summon.IsSummonPinnedToOwner = true;
+        const Decision decision = Release(lease, summon, 7u, 3u, 2'000u);
+        CHECK(decision.Result == Outcome::kDeniedPinnedEntity);
+        CHECK_FALSE(decision.Accepted());
+    }
+
+    SECTION("the summoner may dismiss it, with the lease's epoch or without one")
+    {
+        CHECK(MaySummonerDismiss(lease, 7u, 3u));
+        CHECK(MaySummonerDismiss(lease, 7u, kUnknownEpoch));
+    }
+
+    SECTION("another player may not")
+    {
+        CHECK_FALSE(MaySummonerDismiss(lease, 8u, 3u));
+        CHECK_FALSE(MaySummonerDismiss(lease, 8u, kUnknownEpoch));
+        CHECK_FALSE(MaySummonerDismiss(lease, kNoOwner, kUnknownEpoch));
+    }
+
+    SECTION("an epoch that is not the lease's is refused")
+    {
+        CHECK_FALSE(MaySummonerDismiss(lease, 7u, 2u));
+        CHECK_FALSE(MaySummonerDismiss(lease, 7u, 4u));
+    }
+
+    SECTION("a summon nobody holds cannot be dismissed by anybody")
+    {
+        Lease ownerless{};
+        ownerless.Epoch = 3u;
+        CHECK_FALSE(MaySummonerDismiss(ownerless, 7u, 3u));
+        CHECK_FALSE(MaySummonerDismiss(ownerless, kNoOwner, 3u));
+    }
+}

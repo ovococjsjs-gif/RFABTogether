@@ -308,6 +308,17 @@ struct Decision
 [[nodiscard]] Decision Release(const Lease& acCurrent, const Subject& acSubject, uint32_t aSenderId,
                                uint64_t aSenderEpoch, uint64_t aNowMs) noexcept;
 
+// A summon never changes hands, so Release refuses it. Its summoner letting it go says something
+// else: the summon is gone from the only game that can run it (it expired, was dismissed, or was
+// unloaded with its summoner's cell), and the server is to remove it for everybody. Only the peer
+// named by the lease may say so, and not with an epoch that is not the lease's.
+[[nodiscard]] constexpr bool MaySummonerDismiss(const Lease& acCurrent, uint32_t aSenderId, uint64_t aSenderEpoch) noexcept
+{
+    if (aSenderId == kNoOwner || acCurrent.OwnerId != aSenderId)
+        return false;
+    return aSenderEpoch == kUnknownEpoch || aSenderEpoch == acCurrent.Epoch;
+}
+
 // The server takes the entity away: disconnect, out of range, or a lapsed lease.
 [[nodiscard]] Decision Revoke(const Lease& acCurrent, uint64_t aNowMs) noexcept;
 
