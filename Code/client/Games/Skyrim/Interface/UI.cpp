@@ -194,11 +194,15 @@ static void Hook_UI_Register(UI* apSelf, const char* apMenuName, UI::TCreate* ap
 
 bool UI::ShouldUnpauseMenus()
 {
-    return World::Get().GetTransport().IsConnected() && s_menuPolicyDecided && s_menuPolicy.UnpauseGeneralMenus;
+    return World::Get().GetTransport().IsConnected() && s_menuPolicyDecided &&
+           s_menuPolicy.Owner == Compat::MenuPauseOwner::kTogether;
 }
 
 bool UI::IsUnpausedMenuOpen() const
 {
+    if (!s_menuPolicyDecided)
+        return false;
+
     static const BSFixedString* s_menuNames = []()
     {
         auto* pNames = new BSFixedString[kAllowListCount];
