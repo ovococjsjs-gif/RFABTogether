@@ -19,7 +19,7 @@ static TActorMagicCasterFire* RealActorMagicCasterFire = nullptr;
 
 extern "C" bool ShouldBlockRemoteMagicProjectile(MagicCaster* apCaster) noexcept
 {
-    if (!apCaster || !World::IsCreated() || !World::IsConnectedCached())
+    if (!apCaster || !World::IsCreated() || !World::Get().GetTransport().IsConnected())
         return false;
 
     const auto* pActorCaster = Cast<ActorMagicCaster>(apCaster);
@@ -64,7 +64,7 @@ BSPointerHandle<Projectile>* Projectile::Launch(BSPointerHandle<Projectile>* apR
 BSPointerHandle<Projectile>* TP_MAKE_THISCALL(HookLaunch, BSPointerHandle<Projectile>, Projectile::LaunchData& arData)
 {
     RFAB_HOOK_CRUMB("HookLaunch");
-    if (!World::IsCreated() || !World::IsConnectedCached())
+    if (!World::IsCreated() || !World::Get().GetTransport().IsConnected())
         return TiltedPhoques::ThisCall(RealLaunch, apThis, arData);
 
     // sync concentration spells through spell cast sync, the rest through projectile sync
@@ -137,7 +137,7 @@ BSPointerHandle<Projectile>* TP_MAKE_THISCALL(HookLaunch, BSPointerHandle<Projec
     if (pProjectile)
         Event.Power = pProjectile->fPower;
 
-    if (World::IsCreated() && World::IsConnectedCached())
+    if (World::IsCreated() && World::Get().GetTransport().IsConnected())
         World::Get().GetRunner().Trigger(Event);
 
     return result;

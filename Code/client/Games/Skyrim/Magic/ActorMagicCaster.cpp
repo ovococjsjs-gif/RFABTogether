@@ -1,13 +1,10 @@
 #include "ActorMagicCaster.h"
-#include <CrashBreadcrumbs.h>
 
 #include <Events/SpellCastEvent.h>
 #include <Events/InterruptCastEvent.h>
 
 #include <Games/Skyrim/Actor.h>
 #include <Games/ActorExtension.h>
-#include <Games/Overrides.h>
-#include <common/CoopWorldStabilizer.h>
 
 #include <World.h>
 
@@ -19,60 +16,42 @@ static TInterruptCast* RealInterruptCast = nullptr;
 
 void TP_MAKE_THISCALL(HookSpellCast, ActorMagicCaster, bool abSuccess, int32_t auiTargetCount, MagicItem* apSpell)
 {
-    // On a failed cast neither the game nor this hook reads apSpell, so the crumb does not
-    // either: it names the spell only on the path that hands the pointer on to the game.
-    RFAB_HOOK_CRUMB("HookSpellCast", (abSuccess && apSpell) ? apSpell->formID : 0);
     spdlog::debug("HookSpellCast, abSuccess: {}, auiTargetCount: {}, apSpell: {:X}", abSuccess, auiTargetCount, (uint64_t)apSpell);
 
     // Note: these if guards is how the game does it too
-    if (!apThis || !apThis->pCasterActor)
+    if (!apThis->pCasterActor)
         return;
     if (!abSuccess)
         return;
-
-    MagicItem* pResolvedSpell = apSpell ? apSpell : apThis->pCurrentSpell;
-    if (!pResolvedSpell)
+    if (!apSpell && !apThis->pCurrentSpell)
         return;
 
-    const ActorExtension* pExtended = apThis->pCasterActor->GetExtension();
-    if (!pExtended)
+    if (apThis->pCasterActor->GetExtension()->IsRemote())
         return;
 
-    const bool isSpellOverride = ScopedSpellCastOverride::IsOverriden();
-    if (!CoopWorldStabilizer::ShouldAllowHookSpellCastExecution(pExtended->IsRemote(), isSpellOverride))
-        return;
+    uint32_t targetFormId = 0;
 
-    if (World::IsCreated() && World::IsConnectedCached() && apThis->pCasterActor->formID != 0 &&
-        CoopWorldStabilizer::ShouldTriggerLocalSpellCastEvent(pExtended->IsLocal(), isSpellOverride, pResolvedSpell != nullptr))
+    if (apThis->hDesiredTarget)
     {
-        uint32_t targetFormId = 0;
-        if (apThis->hDesiredTarget)
+        TESObjectREFR* pDesiredTarget = TESObjectREFR::GetByHandle(apThis->hDesiredTarget.handle.iBits);
+        if (pDesiredTarget)
         {
-            if (GamePtr<TESObjectREFR> spDesiredTarget = TESObjectREFR::LookupByHandle(apThis->hDesiredTarget))
-                targetFormId = spDesiredTarget->formID;
+            targetFormId = pDesiredTarget->formID;
         }
-
-        World::Get().GetRunner().Trigger(SpellCastEvent(
-            apThis->pCasterActor->formID,
-            apThis->GetCastingSource(),
-            apThis->GetIsDualCasting(),
-            pResolvedSpell->formID,
-            targetFormId));
     }
+
+    if (apSpell)
+        World::Get().GetRunner().Trigger(SpellCastEvent(apThis, apSpell->formID, targetFormId));
 
     TiltedPhoques::ThisCall(RealSpellCast, apThis, abSuccess, auiTargetCount, apSpell);
 }
 
 void TP_MAKE_THISCALL(HookInterruptCast, ActorMagicCaster, bool abRefund)
 {
-    RFAB_HOOK_CRUMB("HookInterruptCast");
-    if (World::IsCreated() && World::IsConnectedCached() && apThis && apThis->pCasterActor && apThis->pCasterActor->formID != 0 && apThis->pCasterActor->GetNiNode())
-    {
-        if (const ActorExtension* pExtended = apThis->pCasterActor->GetExtension(); pExtended && pExtended->IsLocal())
-        {
-            World::Get().GetRunner().Trigger(InterruptCastEvent(apThis->pCasterActor->formID, apThis->eCastingSource));
-        }
-    }
+    ActorExtension* pExtended = apThis->pCasterActor->GetExtension();
+
+    if (pExtended->IsLocal())
+        World::Get().GetRunner().Trigger(InterruptCastEvent(apThis->pCasterActor->formID, apThis->eCastingSource));
 
     TiltedPhoques::ThisCall(RealInterruptCast, apThis, abRefund);
 }

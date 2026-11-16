@@ -1,8 +1,6 @@
 #pragma once
 
-#include <optional>
 #include "MagicEquipment.h"
-#include <common/CoopCraftedItems.h>
 
 using TiltedPhoques::Buffer;
 using TiltedPhoques::String;
@@ -63,17 +61,11 @@ struct Inventory
 
         bool IsExtraDataEquals(const Entry& acRhs) const noexcept
         {
-            return CoopCraftedItems::AreFloatsClose(ExtraCharge, acRhs.ExtraCharge) &&
-                   CoopCraftedItems::AreEnchantmentsStructurallyEqual(*this, acRhs) &&
-                   ExtraEnchantCharge == acRhs.ExtraEnchantCharge &&
-                   ExtraEnchantRemoveUnequip == acRhs.ExtraEnchantRemoveUnequip &&
-                   CoopCraftedItems::AreFloatsClose(ExtraHealth, acRhs.ExtraHealth) &&
-                   ExtraPoisonId == acRhs.ExtraPoisonId &&
-                   ExtraPoisonCount == acRhs.ExtraPoisonCount &&
-                   ExtraSoulLevel == acRhs.ExtraSoulLevel &&
-                   ExtraWorn == acRhs.ExtraWorn &&
-                   ExtraWornLeft == acRhs.ExtraWornLeft &&
-                   IsQuestItem == acRhs.IsQuestItem;
+            // TODO: the whole server side state thing is very flawed
+            // since many of these things can and will change, like poison id or charge
+            // or the fact that the enchant id can be temp
+            return ExtraCharge == acRhs.ExtraCharge && ExtraEnchantId == acRhs.ExtraEnchantId && ExtraEnchantCharge == acRhs.ExtraEnchantCharge && ExtraEnchantRemoveUnequip == acRhs.ExtraEnchantRemoveUnequip && ExtraHealth == acRhs.ExtraHealth && ExtraPoisonId == acRhs.ExtraPoisonId &&
+                   ExtraPoisonCount == acRhs.ExtraPoisonCount && ExtraSoulLevel == acRhs.ExtraSoulLevel && ExtraWorn == acRhs.ExtraWorn && ExtraWornLeft == acRhs.ExtraWornLeft && IsQuestItem == acRhs.IsQuestItem;
         }
 
         bool IsWorn() const noexcept { return ExtraWorn || ExtraWornLeft; }

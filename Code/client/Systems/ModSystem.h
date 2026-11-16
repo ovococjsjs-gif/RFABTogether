@@ -1,36 +1,32 @@
 #pragma once
 
-#include <common/Session/Lifecycle.h>
-#include <ThreadAffinity.h>
-
 #include <shared_mutex>
 
 struct Mods;
 struct GameId;
+struct DisconnectedEvent;
 
 /**
  * @brief Makes sure that different clients can have independent load orders and mods.
  */
-struct ModSystem final : Session::IParticipant
+struct ModSystem
 {
+    static constexpr uint32_t kRuntimeDynamicModId = 0xFFFFFFFFu;
+    static constexpr uint32_t kUnmappedServerModId = 0xFFFFFFFEu;
+
     ModSystem(entt::dispatcher& aDispatcher) noexcept;
     ~ModSystem() = default;
 
     TP_NOCOPYMOVE(ModSystem);
 
-    RFAB_ANY_THREAD bool GetServerModId(uint32_t aGameId, uint32_t& aModId, uint32_t& aBaseId) const noexcept;
-    RFAB_ANY_THREAD bool GetServerModId(uint32_t aGameId, GameId& aServerId) const noexcept;
-    RFAB_ANY_THREAD uint32_t GetGameId(uint32_t aServerId, uint32_t aFormId) const noexcept;
-    RFAB_ANY_THREAD uint32_t GetGameId(const GameId& acGameId) const noexcept;
+    bool GetServerModId(uint32_t aGameId, uint32_t& aModId, uint32_t& aBaseId) const noexcept;
+    bool GetServerModId(uint32_t aGameId, GameId& aServerId) const noexcept;
+    uint32_t GetGameId(uint32_t aServerId, uint32_t aFormId) const noexcept;
+    uint32_t GetGameId(const GameId& acGameId) const noexcept;
 
 protected:
     void HandleMods(const Mods& acMods) noexcept;
-
-public:
-    // Session::ParticipantId::kModTable. The table of a session is filled by HandleMods (the Mods
-    // packet arrives before the session begins) and dropped when the session ends - after the world
-    // model, which may still translate ids during its own teardown.
-    void OnSessionEnd(const Session::Transition& acTransition) noexcept override;
+    void HandleDisconnected(const DisconnectedEvent& acEvent) noexcept;
 
 private:
     struct GameMod
@@ -41,6 +37,7 @@ private:
 
     mutable std::shared_mutex m_mutex;
     entt::scoped_connection m_modsConnection;
+    entt::scoped_connection m_disconnectedConnection;
     Map<uint16_t, uint32_t> m_liteToServer;
     Map<uint32_t, GameMod> m_serverToGame;
     uint32_t m_standardToServer[0x100];

@@ -14,24 +14,8 @@ struct RequestHealthChangeBroadcast final : ClientMessage
     void SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept override;
     void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
 
-    bool operator==(const RequestHealthChangeBroadcast& acRhs) const noexcept
-    {
-        return Id == acRhs.Id &&
-               DeltaHealth == acRhs.DeltaHealth &&
-               SourceServerId == acRhs.SourceServerId &&
-               StaggerMagnitude == acRhs.StaggerMagnitude &&
-               StaggerDirection == acRhs.StaggerDirection &&
-               HitId == acRhs.HitId &&
-               GetOpcode() == acRhs.GetOpcode();
-    }
+    bool operator==(const RequestHealthChangeBroadcast& acRhs) const noexcept { return Id == acRhs.Id && DeltaHealth == acRhs.DeltaHealth && GetOpcode() == acRhs.GetOpcode(); }
 
-    uint32_t Id{};
-    float DeltaHealth{};
-    uint32_t SourceServerId{};
-    float StaggerMagnitude{};
-    float StaggerDirection{};
-
-    // The sender's own count of the swings it has reported, so the server can apply one
-    // swing once even when the packet arrives twice.
-    uint32_t HitId{};
+    uint32_t Id;
+    float DeltaHealth;
 };

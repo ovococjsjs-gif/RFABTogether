@@ -57,6 +57,7 @@ INCLUDES := \
   -I$(REPO_ROOT)/Code/encoding \
   -I$(REPO_ROOT)/Code/encoding/Structs/Skyrim \
   -I$(REPO_ROOT)/Code/common \
+  -I$(REPO_ROOT)/Code/client \
   -I$(REPO_ROOT)/Code/tests \
   -I$(DEPS_DIR)/tcinc \
   -I$(TILTEDCORE)/Code/core/include \
@@ -72,53 +73,12 @@ PCH := -include $(REPO_ROOT)/Code/encoding/EncodingPch.h
 PORTABLE_TESTS := \
   $(REPO_ROOT)/Code/tests/main.cpp \
   $(REPO_ROOT)/Code/tests/encoding.cpp \
+  $(REPO_ROOT)/Code/tests/playback_clock.cpp \
+  $(REPO_ROOT)/Code/client/Systems/PlaybackClock.cpp \
   $(REPO_ROOT)/Code/tests/rfab_wire_fuzz.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_string_cache_protocol.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_authority_lease.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_downed_revive.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_remote_lifecycle.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_experience_ledger.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_save_barrier.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_health_revision.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_session_sim.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_se1597_port.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_stage2_physics_ownership_anim.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_stage4_teleport_nullsafety.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v200_stabilization_audit.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v201_architectural_overhaul.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v202_root_cause_stabilization.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v203_architectural_stabilization.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v210_architectural_stabilization.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v300_phase1_clean_core.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v300_phase4_damage_movement_animation.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v310_hybrid_combat_magic_sync.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v312_racemenu_hair_color_sync.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v315_paused_pump_and_hook_hardening.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v316_adversarial_audit_hardening.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v317_full_codebase_critical_audit.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v400_protocol_and_authority.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v401_review_stability.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v410_session_features_and_resync.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v410_session_lifecycle.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v410_main_thread_queue.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v410_world_items.cpp \
   $(REPO_ROOT)/Code/tests/rfab_v410_compat_overlay.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_stabilization_tests.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_phase3_adaptation_tests.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_desync_detector.cpp \
   $(REPO_ROOT)/Code/tests/rfab_v411_breadcrumbs.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_world_scoped_work.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_safe_fs.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_load_request.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_remote_view_decisions.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_lease_timing.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_unlock_memory.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_body_loot.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_quest_xp_order.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_personal_containers.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v411_early_take_replay.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v412_npc_combat_and_display_stability.cpp \
-  $(REPO_ROOT)/Code/tests/rfab_v413_carriage_and_coop_combat_sync.cpp
+  $(REPO_ROOT)/Code/tests/rfab_v411_safe_fs.cpp
 
 CORE_SRCS     := $(filter-out %MimallocAllocator.cpp,$(wildcard $(TILTEDCORE)/Code/core/src/*.cpp)) \
                  $(TILTEDCORE)/Code/core/src/MimallocAllocator.cpp

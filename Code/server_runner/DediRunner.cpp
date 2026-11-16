@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <unordered_set>
@@ -16,14 +17,13 @@
 namespace
 {
 constexpr char kSettingsFileName[] = "STServer.ini";
+constexpr char kGenerateConfigArg[] = "--generate-config";
 
 DediRunner* s_pRunner{nullptr};
 
 void EnsureServerLoadOrderReady()
 {
     std::error_code ec;
-    // SafeFs throughout: this runs before the log exists, and an exception here closes the server
-    // window without a word (M14).
     const fs::path workDir = Compat::SafeFs::CurrentPathOr(fs::path("."));
     const fs::path dataDir = workDir / "Data";
     fs::create_directories(dataDir, ec);
@@ -38,7 +38,6 @@ void EnsureServerLoadOrderReady()
             return;
     }
 
-    // Try auto-discovering active loadorder.txt / plugins.txt from nearby MO2 installation or %LOCALAPPDATA%\Skyrim Special Edition
     std::vector<fs::path> candidateDirs;
     fs::path probe = workDir;
     for (int depth = 0; depth < 4 && !probe.empty(); ++depth)
@@ -50,7 +49,6 @@ void EnsureServerLoadOrderReady()
         probe = probe.parent_path();
     }
 #ifdef _WIN32
-    candidateDirs.emplace_back(L"G:\\RFAB Online SkyrimSE\\MO2\\profiles");
     if (const char* localAppData = std::getenv("LOCALAPPDATA"); localAppData && *localAppData)
         candidateDirs.push_back(fs::path(localAppData) / "Skyrim Special Edition");
 #endif
@@ -142,7 +140,8 @@ void EnsureServerLoadOrderReady()
 } // namespace
 
 // imports
-GS_IMPORT TiltedPhoques::UniquePtr<IGameServerInstance> CreateGameServer(Console::ConsoleRegistry& conReg, const std::function<void()>& aCallback);
+GS_IMPORT void RegisterServerSettings(Console::ConsoleRegistry& conReg);
+GS_IMPORT TiltedPhoques::UniquePtr<IGameServerInstance> CreateGameServer(Console::ConsoleRegistry& conReg);
 // needs to be global
 Console::Setting bConsole{"bConsole", "Enable the console", true};
 
@@ -160,7 +159,12 @@ DediRunner::DediRunner(int argc, char** argv)
 
     uv_loop_init(&m_loop);
 
-    m_pServerInstance = std::move(CreateGameServer(m_console, [this, argc, argv]() { LoadSettings(argc, argv); }));
+    // settings must be registered before they can be loaded
+    RegisterServerSettings(m_console);
+    if (!LoadSettings(argc, argv))
+        return;
+
+    m_pServerInstance = CreateGameServer(m_console);
 
     // it is here for now..
     m_pServerInstance->Initialize();
@@ -175,8 +179,22 @@ DediRunner::~DediRunner()
     uv_loop_close(&m_loop);
 }
 
-void DediRunner::LoadSettings(int argc, char** argv)
+bool DediRunner::LoadSettings(int argc, char** argv)
 {
+    std::error_code ec;
+    const fs::path workDir = Compat::SafeFs::CurrentPathOr(fs::path("."));
+
+    // --generate-config [path]: write the default settings and don't start the server
+    if (argc > 1 && std::strcmp(argv[1], kGenerateConfigArg) == 0)
+    {
+        const fs::path path = argc > 2 ? fs::path(argv[2]) : workDir / kConfigPathName / kSettingsFileName;
+        if (path.has_parent_path())
+            create_directories(path.parent_path(), ec);
+        SaveSettingsToIni(m_console, path);
+        spdlog::info("Generated {}", Compat::SafeFs::ToUtf8Lossy(path));
+        return false;
+    }
+
     // If we have line args load, don't use the ini
     if (argc > 1)
     {
@@ -185,8 +203,6 @@ void DediRunner::LoadSettings(int argc, char** argv)
     else
     {
         m_useIni = true;
-        std::error_code ec;
-        const fs::path workDir = Compat::SafeFs::CurrentPathOr(fs::path("."));
         m_SettingsPath = workDir / kConfigPathName / kSettingsFileName;
         bool needsFreshIni = !exists(m_SettingsPath, ec);
         if (!needsFreshIni)
@@ -201,10 +217,12 @@ void DediRunner::LoadSettings(int argc, char** argv)
         {
             create_directories(workDir / kConfigPathName, ec);
             SaveSettingsToIni(m_console, m_SettingsPath);
-            return;
+            return true;
         }
         LoadSettingsFromIni(m_console, m_SettingsPath);
     }
+
+    return true;
 }
 
 struct Context
@@ -220,22 +238,19 @@ void DediRunner::ReadStdin(uv_stream_t* apStream, ssize_t aRead, const uv_buf_t*
     if (aRead < 0)
     {
         if (aRead == UV_EOF)
-            uv_close(reinterpret_cast<uv_handle_t*>(apStream), nullptr);
+            uv_close(reinterpret_cast<uv_handle_t*>(&apStream), nullptr);
     }
     else if (aRead > 0)
     {
         for (auto i = 0; i < aRead; ++i)
         {
-            const char ch = acpBuffer->base[i];
-            if (ch == '\r')
-                continue;
-            if (ch == '\n')
+            if (acpBuffer->base[i] == '\n')
             {
                 ctx->instance->HandleConsole(ctx->data);
                 ctx->data = "";
             }
             else
-                ctx->data += ch;
+                ctx->data += acpBuffer->base[i];
         }
     }
 
@@ -251,16 +266,11 @@ void DediRunner::AllocateBuffer(uv_handle_t* apHandle, size_t aSuggestedSize, uv
 
 void DediRunner::PrintExecutorArrowHack()
 {
-    // Force:
-    // This is a hack to get the executor arrow.
-    // If you find a way to do this through the ConOut log channel
-    // please let me know (The issue is the forced formatting for that channel and the forced null termination)
-    // fmt::print(">>>");
 }
 
 void DediRunner::RunGSThread()
 {
-    while (m_pServerInstance->IsListening())
+    while (m_pServerInstance && m_pServerInstance->IsListening())
     {
         m_pServerInstance->Update();
         if (bConsole)
@@ -277,9 +287,7 @@ void DediRunner::StartTerminalIO()
     spdlog::get("ConOut")->info("Server started, type /help for a list of commands.");
     PrintExecutorArrowHack();
 
-    if (uv_guess_handle(0) != UV_TTY || uv_tty_init(&m_loop, &m_tty, 0, 1) != 0)
-        return;
-
+    uv_tty_init(&m_loop, &m_tty, 0, 1);
     uv_tty_set_mode(&m_tty, UV_TTY_MODE_NORMAL);
 
     static Context ctx;
@@ -292,12 +300,10 @@ void DediRunner::StartTerminalIO()
 
 void DediRunner::RequestKill()
 {
-    m_pServerInstance->Shutdown();
+    if (m_pServerInstance)
+        m_pServerInstance->Shutdown();
 
 #if defined(_WIN32)
-    // work around Control Handler exception (Control-C) being set
-    // https://cdn.discordapp.com/attachments/675107843573022779/941772837339930674/unknown.png
-    // being set.
     if (IsDebuggerPresent())
     {
         using namespace std::chrono_literals;
@@ -314,6 +320,6 @@ void DediRunner::HandleConsole(const TiltedPhoques::String& acCommand)
 
     PrintExecutorArrowHack();
 
-    if (r == exr::kDirty && m_useIni)
+    if (r == exr::kDirty && m_useIni && !m_SettingsPath.empty())
         SaveSettingsToIni(m_console, m_SettingsPath);
 }

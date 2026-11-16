@@ -1,5 +1,4 @@
 #include <TiltedOnlinePCH.h>
-#include <CrashBreadcrumbs.h>
 
 #include <Games/References.h>
 
@@ -27,14 +26,10 @@
 
 #include <Services/PapyrusService.h>
 #include <Services/DebugService.h>
-#include <Services/RfabAdapterService.h>
 #include <World.h>
 
 #include <AI/AITimer.h>
 #include <Combat/CombatTargetSelector.h>
-#include <RfabModpackCompat.h>
-
-#include <atomic>
 
 namespace Settings
 {
@@ -50,80 +45,6 @@ float* GetGreetDistance() noexcept
     return s_greetDistance.Get();
 }
 
-bool IsRfabModpackActive() noexcept
-{
-    // Lock-free O(1) atomic cache safe for concurrent combat & magic worker threads (`HookDamageActor`,
-    // `HookAddTarget`): once `ModManager` has loaded plugins, scan the immutable plugin list once without
-    // touching non-thread-safe `RfabFormResolver` state on worker threads.
-    static std::atomic<int8_t> s_cachedRfabActive{-1};
-    const int8_t cached = s_cachedRfabActive.load(std::memory_order_acquire);
-    if (cached >= 0)
-        return cached == 1;
-
-#ifdef _WIN32
-    if (GetModuleHandleW(L"RFAB.dll") != nullptr)
-    {
-        s_cachedRfabActive.store(1, std::memory_order_release);
-        return true;
-    }
-#endif
-
-    auto* const pModManager = ModManager::Get();
-    if (!pModManager)
-        return false;
-
-    if (pModManager->GetByName("RFAB.esp") != nullptr ||
-        pModManager->GetByName("Requiem for a Balance.esp") != nullptr ||
-        pModManager->GetByName("Requiem.esp") != nullptr)
-    {
-        s_cachedRfabActive.store(1, std::memory_order_release);
-        return true;
-    }
-
-    bool hasAnyLoadedMod = false;
-    bool detectedRfab = false;
-    for (auto* pMod : pModManager->mods)
-    {
-        if (!pMod || !pMod->IsLoaded() || pMod->filename[0] == '\0')
-            continue;
-
-        hasAnyLoadedMod = true;
-        if (RfabCompat::Detail::StartsWithIgnoreCase(pMod->filename, "rfab") ||
-            RfabCompat::Detail::StartsWithIgnoreCase(pMod->filename, "requiem"))
-        {
-            detectedRfab = true;
-            break;
-        }
-    }
-
-    if (hasAnyLoadedMod)
-        s_cachedRfabActive.store(detectedRfab ? 1 : 0, std::memory_order_release);
-
-    return detectedRfab;
-}
-
-float GetRfabOutgoingDamageMult() noexcept
-{
-    if (auto* pGmst = GameSettingCollection::Get())
-    {
-        if (auto* pSetting = pGmst->GetSetting("fDiffMultHPByPCVH"))
-            return RfabCompat::SanitizeDifficultyMultiplier(pSetting->f);
-    }
-
-    return 1.0f;
-}
-
-float GetRfabIncomingDamageMult() noexcept
-{
-    if (auto* pGmst = GameSettingCollection::Get())
-    {
-        if (auto* pSetting = pGmst->GetSetting("fDiffMultHPToPCVH"))
-            return RfabCompat::SanitizeDifficultyMultiplier(pSetting->f);
-    }
-
-    return 1.0f;
-}
-
 } // namespace Settings
 
 namespace GameplayFormulas
@@ -131,24 +52,19 @@ namespace GameplayFormulas
 
 float CalculateRealDamage(Actor* apHittee, float aDamage, bool aKillMove) noexcept
 {
-    PlayerCharacter* pPlayer = PlayerCharacter::Get();
-    bool isPlayer = pPlayer && apHittee == pPlayer;
-    float multiplier = 1.0f;
+    using TGetDifficultyMultiplier = float(int32_t, int32_t, bool);
+    POINTER_SKYRIMSE(TGetDifficultyMultiplier, s_getDifficultyMultiplier, 25920);
 
-    if (Settings::IsRfabModpackActive())
-    {
-        // RFAB.dll evaluates GMST fDiffMultHPToPCVH (player 0x14 victim) and fDiffMultHPByPCVH (player 0x14 aggressor),
-        // corresponding to Странник (x2/x0.5), Довакин (x1/x1), Легенда (x1/x2), and Проклятый (x0.5 outgoing).
-        multiplier = isPlayer ? Settings::GetRfabIncomingDamageMult() : Settings::GetRfabOutgoingDamageMult();
-    }
-    else if (pPlayer)
-    {
-        using TGetDifficultyMultiplier = float(int32_t, int32_t, bool);
-        POINTER_SKYRIMSE(TGetDifficultyMultiplier, s_getDifficultyMultiplier, 25920);
-        multiplier = s_getDifficultyMultiplier(pPlayer->difficulty, ActorValueInfo::kHealth, isPlayer);
-    }
+    bool isPlayer = apHittee == PlayerCharacter::Get();
 
-    float realDamage = aDamage * multiplier;
+    float multiplier = s_getDifficultyMultiplier(PlayerCharacter::Get()->difficulty, ActorValueInfo::kHealth, isPlayer);
+
+    float realDamage = aDamage;
+
+    // TODO(cosideci): this seems problematic? It may not register the kill for others?
+    // Disabled for now, cause this check seems to have totally broken everything, let's see what happens.
+    // if (!aKillMove || multiplier < 1.0)
+    realDamage = aDamage * multiplier;
 
     return realDamage;
 }
@@ -170,7 +86,6 @@ static TCheckForNewPackage* RealCheckForNewPackage = nullptr;
 
 bool TP_MAKE_THISCALL(HookCheckForNewPackage, void, Actor* apActor, uint64_t aUnk1)
 {
-    RFAB_HOOK_CRUMB("HookCheckForNewPackage", 0, apActor ? apActor->formID : 0);
 #if AI_SYNC
     if (apActor && apActor->GetExtension()->IsRemote())
         return false;
@@ -184,16 +99,15 @@ static TInitFromPackage* RealInitFromPackage = nullptr;
 
 void TP_MAKE_THISCALL(HookInitFromPackage, void, TESPackage* apPackage, TESObjectREFR* apTarget, Actor* arActor)
 {
-    RFAB_HOOK_CRUMB("HookInitFromPackage", 0, arActor ? arActor->formID : 0);
 #if AI_SYNC
     // This guard is here for when the client sets the package based on a remote message
     if (s_execInitPackage)
         return TiltedPhoques::ThisCall(RealInitFromPackage, apThis, apPackage, apTarget, arActor);
 
-    if (arActor && arActor->GetExtension() && arActor->GetExtension()->IsRemote())
+    if (arActor && arActor->GetExtension()->IsRemote())
         return;
 
-    if (World::IsConnectedCached() && arActor && apPackage)
+    if (arActor && apPackage)
         World::Get().GetRunner().Trigger(InitPackageEvent(arActor->formID, apPackage->formID));
 
 #endif
@@ -205,17 +119,13 @@ static TSetCurrentPickREFR* RealSetCurrentPickREFR = nullptr;
 
 void TP_MAKE_THISCALL(HookSetCurrentPickREFR, Console, BSPointerHandle<TESObjectREFR>* apRefr)
 {
-    RFAB_EXPECT_MAIN_THREAD("HookSetCurrentPickREFR");
     uint32_t formId = 0;
 
-    if (apRefr)
-    {
-        if (GamePtr<TESObjectREFR> spObject = TESObjectREFR::LookupByHandle(apRefr->handle.iBits))
-            formId = spObject->formID;
-    }
+    TESObjectREFR* pObject = TESObjectREFR::GetByHandle(apRefr->handle.iBits);
+    if (pObject)
+        formId = pObject->formID;
 
-    if (World::IsCreated())
-        World::Get().GetDebugService().SetDebugId(formId);
+    World::Get().GetDebugService().SetDebugId(formId);
 
     return TiltedPhoques::ThisCall(RealSetCurrentPickREFR, apThis, apRefr);
 }
