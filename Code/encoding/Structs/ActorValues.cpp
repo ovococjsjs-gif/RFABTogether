@@ -1,13 +1,12 @@
 #include <Structs/ActorValues.h>
 #include <TiltedCore/Serialization.hpp>
 #include <common/CoopPacketSafety.h>
-#include <algorithm>
 
 using TiltedPhoques::Serialization;
 
 bool ActorValues::operator==(const ActorValues& acRhs) const noexcept
 {
-    return ActorValuesList == acRhs.ActorValuesList && ActorMaxValuesList == acRhs.ActorMaxValuesList;
+    return ActorValuesList == acRhs.ActorValuesList;
 }
 
 bool ActorValues::operator!=(const ActorValues& acRhs) const noexcept
@@ -17,24 +16,16 @@ bool ActorValues::operator!=(const ActorValues& acRhs) const noexcept
 
 void ActorValues::Serialize(TiltedPhoques::Buffer::Writer& aWriter) const noexcept
 {
-    const size_t valCount = std::min(ActorValuesList.size(), CoopPacketSafety::kMaxActorValues);
-    Serialization::WriteVarInt(aWriter, valCount);
-    size_t written = 0;
+    Serialization::WriteVarInt(aWriter, ActorValuesList.size());
     for (auto& value : ActorValuesList)
     {
-        if (written++ >= valCount)
-            break;
         Serialization::WriteVarInt(aWriter, value.first);
         Serialization::WriteFloat(aWriter, value.second);
     }
 
-    const size_t maxValCount = std::min(ActorMaxValuesList.size(), CoopPacketSafety::kMaxActorValues);
-    Serialization::WriteVarInt(aWriter, maxValCount);
-    written = 0;
+    Serialization::WriteVarInt(aWriter, ActorMaxValuesList.size());
     for (auto& value : ActorMaxValuesList)
     {
-        if (written++ >= maxValCount)
-            break;
         Serialization::WriteVarInt(aWriter, value.first);
         Serialization::WriteFloat(aWriter, value.second);
     }

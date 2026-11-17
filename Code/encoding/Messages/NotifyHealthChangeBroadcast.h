@@ -14,23 +14,8 @@ struct NotifyHealthChangeBroadcast final : ServerMessage
     void SerializeRaw(TiltedPhoques::Buffer::Writer& aWriter) const noexcept override;
     void DeserializeRaw(TiltedPhoques::Buffer::Reader& aReader) noexcept override;
 
-    bool operator==(const NotifyHealthChangeBroadcast& acRhs) const noexcept
-    {
-        return Id == acRhs.Id &&
-               DeltaHealth == acRhs.DeltaHealth &&
-               SourceServerId == acRhs.SourceServerId &&
-               StaggerMagnitude == acRhs.StaggerMagnitude &&
-               StaggerDirection == acRhs.StaggerDirection &&
-               HealthRevision == acRhs.HealthRevision &&
-               GetOpcode() == acRhs.GetOpcode();
-    }
+    bool operator==(const NotifyHealthChangeBroadcast& acRhs) const noexcept { return Id == acRhs.Id && DeltaHealth == acRhs.DeltaHealth && GetOpcode() == acRhs.GetOpcode(); }
 
-    uint32_t Id{};
-    float DeltaHealth{};
-    uint32_t SourceServerId{};
-    float StaggerMagnitude{};
-    float StaggerDirection{};
-
-    // The actor's health version after this hit was applied.
-    uint32_t HealthRevision{};
+    uint32_t Id;
+    float DeltaHealth;
 };

@@ -55,8 +55,7 @@ void DebugService::DrawContainerDebugView()
                         uint32_t itemId = modSystem.GetGameId(entry.BaseId);
                         TESForm* pItem = TESForm::GetById(itemId);
                         Actor* pActor = Cast<Actor>(TESForm::GetById(actorId));
-                        if (pActor && pItem && EquipManager::Get())
-                            EquipManager::Get()->Equip(pActor, pItem, nullptr, entry.Count, DefaultObjectManager::Get().rightEquipSlot, false, true, false, false);
+                        EquipManager::Get()->Equip(pActor, pItem, nullptr, entry.Count, DefaultObjectManager::Get().rightEquipSlot, false, true, false, false);
                     });
             }
             if (ImGui::Button("Unequip"))
@@ -68,8 +67,7 @@ void DebugService::DrawContainerDebugView()
                         uint32_t itemId = modSystem.GetGameId(entry.BaseId);
                         TESForm* pItem = TESForm::GetById(itemId);
                         Actor* pActor = Cast<Actor>(TESForm::GetById(actorId));
-                        if (pActor && pItem && EquipManager::Get())
-                            EquipManager::Get()->UnEquip(pActor, pItem, nullptr, entry.Count, DefaultObjectManager::Get().rightEquipSlot, false, true, false, false, nullptr);
+                        EquipManager::Get()->UnEquip(pActor, pItem, nullptr, entry.Count, DefaultObjectManager::Get().rightEquipSlot, false, true, false, false, nullptr);
                     });
             }
 

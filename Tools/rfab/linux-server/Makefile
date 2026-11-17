@@ -71,7 +71,6 @@ INCLUDES := \
   -I$(REPO_ROOT)/Code/components/console \
   -I$(REPO_ROOT)/Code/components/es_loader \
   -I$(REPO_ROOT)/Code/base \
-  -I$(REPO_ROOT)/Code/admin_protocol \
   -I$(REPO_ROOT)/Libraries \
   -I$(REPO_ROOT)/Tools/rfab/linux-server/stub \
   -I$(REPO_ROOT)/Tools/rfab/linux-server/harness \
@@ -111,7 +110,6 @@ COMPONENT_SRCS := $(shell find $(REPO_ROOT)/Code/components -name '*.cpp' -not -
                     -not -path '*/imgui/*' -not -name '*_Win32.cpp')
 # `Code/base/tests` is gtest, which belongs to the Windows test target, not to the server.
 BASE_SRCS      := $(shell find $(REPO_ROOT)/Code/base -name '*.cpp' -not -path '*/base/tests/*')
-ADMIN_SRCS     := $(shell find $(REPO_ROOT)/Code/admin_protocol -name '*.cpp')
 ENCODING_SRCS  := $(shell find $(REPO_ROOT)/Code/encoding -name '*.cpp')
 COMMON_SRCS    := $(shell find $(REPO_ROOT)/Code/common -name '*.cpp')
 CORE_SRCS      := $(wildcard $(TILTEDCORE)/Code/core/src/*.cpp)
@@ -128,7 +126,6 @@ obj_of = $(OBJ_DIR)/$(1)/$(call rel_name,$(2))
 SERVER_OBJS    := $(foreach s,$(SERVER_SRCS),$(call obj_of,server,$(s)).o)
 COMPONENT_OBJS := $(foreach s,$(COMPONENT_SRCS),$(call obj_of,components,$(s)).o)
 BASE_OBJS      := $(foreach s,$(BASE_SRCS),$(call obj_of,base,$(s)).o)
-ADMIN_OBJS     := $(foreach s,$(ADMIN_SRCS),$(call obj_of,admin,$(s)).o)
 ENCODING_OBJS  := $(foreach s,$(ENCODING_SRCS),$(call obj_of,encoding,$(s)).o)
 COMMON_OBJS    := $(foreach s,$(COMMON_SRCS),$(call obj_of,common,$(s)).o)
 CORE_OBJS      := $(foreach s,$(CORE_SRCS),$(call obj_of,core,$(s)).o)
@@ -138,7 +135,7 @@ HARNESS_OBJS   := $(foreach s,$(HARNESS_SRCS),$(call obj_of,harness,$(s)).o)
 CONNECT_OBJS   := $(foreach s,$(CONNECT_SRCS),$(call obj_of,connect,$(s)).o)
 MIMALLOC_OBJ   := $(OBJ_DIR)/mimalloc.o
 
-ALL_OBJS := $(SERVER_OBJS) $(COMPONENT_OBJS) $(BASE_OBJS) $(ADMIN_OBJS) $(ENCODING_OBJS) \
+ALL_OBJS := $(SERVER_OBJS) $(COMPONENT_OBJS) $(BASE_OBJS) $(ENCODING_OBJS) \
             $(COMMON_OBJS) $(CORE_OBJS) $(LUA_OBJS) $(ZLIB_OBJS) $(HARNESS_OBJS) $(CONNECT_OBJS) $(MIMALLOC_OBJ)
 ALL_DEPS := $(ALL_OBJS:.o=.d)
 
@@ -192,7 +189,6 @@ endef
 $(foreach s,$(SERVER_SRCS),$(eval $(call compile_rule,server,$(s),$(SERVER_PCH))))
 $(foreach s,$(COMPONENT_SRCS),$(eval $(call compile_rule,components,$(s),$(COMPONENT_PCH))))
 $(foreach s,$(BASE_SRCS),$(eval $(call compile_rule,base,$(s),)))
-$(foreach s,$(ADMIN_SRCS),$(eval $(call compile_rule,admin,$(s),)))
 $(foreach s,$(ENCODING_SRCS),$(eval $(call compile_rule,encoding,$(s),$(ENCODING_PCH))))
 $(foreach s,$(COMMON_SRCS),$(eval $(call compile_rule,common,$(s),$(ENCODING_PCH))))
 $(foreach s,$(CORE_SRCS),$(eval $(call compile_rule,core,$(s),$(VENDOR_SAN))))

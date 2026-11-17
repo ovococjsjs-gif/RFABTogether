@@ -30,5 +30,5 @@ struct ImguiService
 private:
     ImGuiImpl::ImGuiDriver m_imDriver;
     entt::sigh<TCallback> m_drawSignal;
-    bool m_initialized = false;
+    bool m_initialized{false};
 };

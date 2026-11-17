@@ -72,26 +72,22 @@ GS_EXPORT bool CheckBuildTag(const char* apBuildTag)
     return std::strcmp(apBuildTag, kBuildTag) == 0;
 }
 
-// A deliberate fault inside this library (work plan 4.5). The runner's hidden switch
-// `--rfab-crash-self-test fault` calls it; the release pipeline then checks that the crash record
-// in logs/STServer_Crash.log leads back to this function through the packaged symbol table.
-// Never called while a server runs.
+// A deliberate fault inside this library, called only by `--rfab-crash-self-test fault`
+// during release packaging so the symbolizer + STServer_Crash.log chain is verified end-to-end.
 GS_EXPORT void RfabServerCrashSelfTestFault()
 {
     volatile int* volatile pNowhere = nullptr;
     *pNowhere = 0x52464142;
 }
 
-GS_EXPORT UniquePtr<IGameServerInstance> CreateGameServer(Console::ConsoleRegistry& aConReg, const std::function<void()>& aCallback)
+// Registers the server's static settings, must be called before loading any settings
+GS_EXPORT void RegisterServerSettings(Console::ConsoleRegistry& aConReg)
 {
-    BASE_ASSERT(aCallback, "CreateGameServer(): Callback was not provided");
-
-    // register static variables before they become available to the server
     aConReg.BindStaticItems();
+}
 
-    // this is a special callback to notify the runner once all settings become available
-    aCallback();
-
+GS_EXPORT UniquePtr<IGameServerInstance> CreateGameServer(Console::ConsoleRegistry& aConReg)
+{
     return TiltedPhoques::CastUnique<IGameServerInstance>(TiltedPhoques::MakeUnique<GameServerInstance>(aConReg));
 }
 

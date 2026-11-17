@@ -26,10 +26,9 @@ struct BSAnimationGraphManager : BSIntrusiveRefCounted
     uint32_t animationGraphIndex; // A8 - 5C
     uint32_t generateDepth;       // AC
 
-    SortedMap<uint32_t, String> DumpAnimationVariables(bool aPrintVariables, int aForceIndex = -1);
+    SortedMap<uint32_t, String> DumpAnimationVariables(bool aPrintVariables);
     uint64_t GetDescriptorKey(int aForceIndex = -1);
     uint64_t GetProjectKey(int aForceIndex = -1);
-    uint32_t ReSendEvent(BSFixedString* apEventName);
 };
 
 #if TP_PLATFORM_64

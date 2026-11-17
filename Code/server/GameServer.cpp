@@ -1,11 +1,7 @@
-#include <Components.h>
+﻿#include <Components.h>
 #include <GameServer.h>
 #include <Packet.hpp>
 
-#include <algorithm>
-#include <cmath>
-
-#include <Events/AdminPacketEvent.h>
 #include <Events/CharacterRemoveEvent.h>
 #include <Events/OwnershipTransferEvent.h>
 #include <Events/PacketEvent.h>
@@ -15,15 +11,11 @@
 #include <Events/UpdateEvent.h>
 #include <steam/isteamnetworkingutils.h>
 
-#include <AdminMessages/AdminSessionOpen.h>
-#include <AdminMessages/ClientAdminMessageFactory.h>
 #include <Messages/AuthenticationResponse.h>
 #include <Messages/ClientMessageFactory.h>
 #include <Messages/NotifyPlayerJoined.h>
 #include <Messages/NotifyPlayerLeft.h>
 #include <Messages/NotifySettingsChange.h>
-#include <common/CoopPacketSafety.h>
-#include <common/RfabModpackCompat.h>
 #include <console/ConsoleRegistry.h>
 #include <resources/ResourceCollection.h>
 
@@ -32,88 +24,28 @@ constexpr size_t kMaxServerNameLength = 128u;
 // -- Cvars --
 Console::Setting uServerPort{"GameServer:uPort", "Which port to host the server on", 10578u};
 Console::Setting uMaxPlayerCount{"GameServer:uMaxPlayerCount", "Maximum number of players allowed on the server (going over the default of 8 is not recommended)", 8u};
-Console::Setting bPremiumTickrate{"GameServer:bPremiumMode", "Use premium tick rate", true};
+Console::Setting bPremiumTickrate{"GameServer:bPremiumMode", "Server tick rate: 60 updates per second if true, 30 if false", true};
 
 Console::StringSetting sServerName{"GameServer:sServerName", "Name that shows up in the server list", "Dedicated Together Server"};
-Console::StringSetting sAdminPassword{"GameServer:sAdminPassword", "Admin authentication password", ""};
-Console::StringSetting sPassword{"GameServer:sPassword", "Server password", ""};
+Console::StringSetting sAdminPassword{"GameServer:sAdminPassword", "Password for server admins. Joining with it gives admin rights. Leave empty to disable", ""};
+Console::StringSetting sPassword{"GameServer:sPassword", "Password players need to join the server. Leave empty to let anyone join", ""};
+Console::Setting bAnnounceServer{"LiveServices:bAnnounceServer", "Whether to list the server on the public server list", false};
 
 // Gameplay
-// RFAB / Requiem requires Adept (2 = 1.0x dealt / 1.0x taken; DifficultyBalance.ini & RFAB.ini target Adept).
-Console::Setting uDifficulty{"Gameplay:uDifficulty", "In game difficulty (0 to 5, RFAB default 2 = Adept 1.0x)", 2u};
+// TODO: to make this easier for users, use game names for difficulty instead of int
+Console::Setting uDifficulty{"Gameplay:uDifficulty", "Difficulty for all players: 0 Novice, 1 Apprentice, 2 Adept, 3 Expert, 4 Master, 5 Legendary", 4u};
 Console::Setting bEnableGreetings{"Gameplay:bEnableGreetings", "Enables NPC greetings (disabled by default since they can be spammy with dialogue sync)", false};
 Console::Setting bEnablePvp{"Gameplay:bEnablePvp", "Enables pvp", false};
 Console::Setting bSyncPlayerHomes{"Gameplay:bSyncPlayerHomes", "Sync chests and displays in player homes and other NoResetZones", false};
-Console::Setting bEnableDeathSystem{"Gameplay:bEnableDeathSystem", "Enables the custom multiplayer death system", true};
+Console::Setting bEnableDeathSystem{"Gameplay:bEnableDeathSystem", "Enables the custom multiplayer death system. Only disable it if you use another mod that replaces death", true};
 Console::Setting uTimeScale{"Gameplay:uTimeScale", "How many seconds pass ingame for every real second (0 to 1000). Changing this can make the game unstable", 20u};
 Console::Setting bSyncPlayerCalendar{"Gameplay:bSyncPlayerCalendar", "Syncs up all player calendars to be the same day, month, and year. This uses the date of the player with the furthest ahead date at connection.", false};
 Console::Setting bAutoPartyJoin{"Gameplay:bAutoPartyJoin", "Join parties automatically, as long as there is only one party in the server", true};
-Console::Setting fHealthMultiplier{"Gameplay:fHealthMultiplier", "Base max-health multiplier for non-player enemies (0.1 to 20.0)", 1.0f};
-Console::Setting bAutoScaleEnemyHealth{"Gameplay:bAutoScaleEnemyHealth", "Automatically scales enemy HP with connected player count (1p=1x, 2p=3x, 3p=4x, N>=2 -> (N+ExtraBase)x)", true};
-Console::Setting fHealthExtraBase{"Gameplay:fHealthExtraBase", "Extra baseline term added to connected player count for HP scaling (1.0 => 2p=3x, 3p=4x)", 1.0f};
-Console::Setting bEnableDownedSystem{"Gameplay:bEnableDownedSystem", "Enables RFAB 0-HP downed-on-knee bleedout, E-revive, strict combat leash, and party wipe checkpoint reload", true};
-Console::Setting bEnableCoordinatedSaves{"Gameplay:bEnableCoordinatedSaves", "Enables host-coordinated saves/loads and automatic post-combat world checkpoints", true};
-// v4.1.0 feature switches (common/Session/Features.h): every optional coop subsystem can be turned off
-// without a new build, so a playtest problem can be bisected one feature at a time.
-Console::Setting bEnableTacticalHud{"Gameplay:bEnableTacticalHud", "Enables the RFAB tactical HUD (peer roster, downed beacons) and 3D tactical pings", true};
-Console::Setting bEnableHairColorSync{"Gameplay:bEnableHairColorSync", "Gives every remote player an isolated copy of their exact RGB hair colour (RaceMenu)", true};
-Console::Setting bEnableRfabCombatRules{"Gameplay:bEnableRfabCombatRules", "Enables RFAB coop combat rules: ally protection, standing-target selection, boss and arena barrier sync", true};
-Console::Setting bEnableSelfHealingResync{"Gameplay:bEnableSelfHealingResync", "Lets clients detect lost world state and ask the server to resend it (recommended)", true};
-Console::Setting bEnableServerOwnedWorldItems{"Gameplay:bEnableServerOwnedWorldItems",
-                                              "Dropped items get a server id: every player sees them (also after joining or reloading) and only one player can pick each up",
-                                              true};
-// Off by default, which is 4.1.0: every creature that is not on the players' side gets the
-// party health multiplier. Switched on, creatures that never start a fight (permanent Aggression 0,
-// under 800 HP, not a dragon) keep their normal health.
-Console::Setting bEnablePeacefulNpcsUnscaled{"Gameplay:bEnablePeacefulNpcsUnscaled",
-                                             "Enemy health scaling skips peaceful NPCs and animals", false};
-// The desync detector (common/Session/EntityDigest.h). On: clients report what they believe about
-// each character, the server compares it with its own state and writes every confirmed difference
-// to the log as "[RFAB Desync] ...". That alone changes nothing in the game.
-Console::Setting bEnableDesyncDetector{"Gameplay:bEnableDesyncDetector",
-                                       "Clients report what they see of each character; the server logs every confirmed difference", true};
-// Off by default, which leaves the game exactly as 4.1.0 plays it. Switched on, a confirmed
-// difference in presence or life state is also repaired by resending the character to that client
-// (at most twice per character in two minutes). Owner, health and equipment are only logged.
-Console::Setting bEnableDesyncAutoRepair{"Gameplay:bEnableDesyncAutoRepair",
-                                         "The desync detector also resends a character whose state differs on a client", false};
-// On: a gameplay event a client's engine hook produced before or during a coordinated reload is
-// dropped instead of being applied to the reloaded world (common/Session/MainThreadQueue.h).
-// Off restores 4.1.0, where such an event ran after the reload.
-Console::Setting bEnableWorldScopedHookEvents{"Gameplay:bEnableWorldScopedHookEvents",
-                                              "Clients drop gameplay events that were produced before or during a coordinated reload", true};
-// On: a quest's RFAB XP reaches each player once also when the partner's copy of the award
-// arrives before the player's own quest script pays (common/CoopExperienceLedger.h, order C).
-// Off restores 4.1.0, where that order paid the player twice.
-Console::Setting bEnableQuestXpSingleAward{"Gameplay:bEnableQuestXpSingleAward",
-                                           "A quest's RFAB XP is paid once per player, whichever copy of the award arrives first", true};
-// On: a merchant's chest, and a container a script opens from another place (RFAB's secure
-// chest), stay each player's own; the client does not register them (RfabCompat::IsPersonalContainer).
-// Off restores 4.1.0: they are shared like a chest of loot, and the server takes back from a trade
-// whatever its copy of the chest does not hold.
-Console::Setting bEnablePersonalMerchantStock{"Gameplay:bEnablePersonalMerchantStock",
-                                              "Merchants' stock and gold, and storage chests opened from another place, are each player's own and not shared", true};
-// On: outdoors the client registers, on every cell change, the containers of the cells around the
-// player that stand within reach of his cell, so a chest by a cell border has one list of contents
-// before anyone can loot it across the border (RfabCompat::ShouldScanNeighbourCells; the rest of
-// defect M11). Off restores 4.1.0: such a chest is registered by the first take, and the second
-// player to loot it the same way keeps one item of his own roll.
-Console::Setting bEnableNeighbourCellContainers{"Gameplay:bEnableNeighbourCellContainers",
-                                                "Outdoors, containers within reach of a player's cell are registered before they can be looted across a cell border", true};
-// On: a take or a put made between the client's registration of a container (by the cell scan, an
-// activation or an earlier take) and the server's answer is sent to the server when the answer
-// arrives (CoopLootLedger::ShouldReplayPendingDelta, defect M28). Off restores 4.1.0: such a
-// change is dropped, and a taken item is both in the player's pack and back in the container for
-// everybody.
-Console::Setting bEnableEarlyTakeReplay{"Gameplay:bEnableEarlyTakeReplay",
-                                        "A take made before the server answered the container's registration is sent again instead of being dropped", true};
-extern Console::Setting<bool> bEnableItemDrops;
-extern Console::Setting<bool> bEnableXpSync;
-extern Console::Setting<bool> bEnableRfabXpSync;
+Console::Setting bAllowConsoleCommands{"Gameplay:bAllowConsoleCommands", "Lets players run console commands they type while connected. Turn it off to stop console trolling such as spawning enemies or killing NPCs. The console still opens for reading ids, and mods can still run commands", true};
 // ModPolicy Stuff
-Console::Setting bEnableModCheck{"ModPolicy:bEnableModCheck", "Bypass the checking of mods on the server", false, Console::SettingsFlags::kLocked};
-Console::Setting bAllowSKSE{"ModPolicy:bAllowSKSE", "Allow clients with SKSE active to join", true, Console::SettingsFlags::kLocked};
-Console::Setting bAllowMO2{"ModPolicy:bAllowMO2", "Allow clients running Mod Organizer 2 to join", true, Console::SettingsFlags::kLocked};
+Console::Setting bEnableModCheck{"ModPolicy:bEnableModCheck", "Refuse clients whose mods do not match Data/loadorder.txt", false, Console::SettingsFlags::kLocked};
+Console::Setting bAllowSKSE{"ModPolicy:bAllowSKSE", "Allow players using SKSE to join. Applies even when bEnableModCheck is off", true, Console::SettingsFlags::kLocked};
+Console::Setting bAllowMO2{"ModPolicy:bAllowMO2", "Allow players using Mod Organizer 2 to join. Applies even when bEnableModCheck is off", true, Console::SettingsFlags::kLocked};
 
 // -- Commands --
 Console::Command<> TogglePremium(
@@ -133,32 +65,13 @@ Console::Command<> TogglePvp(
         GameServer::Get()->UpdateSettings();
     });
 
-Console::Command<> ListFeatures(
-    "ListFeatures", "Lists the coop feature switches (Gameplay:bEnable*) and whether each one is on",
+Console::Command<> ToggleConsoleCommands(
+    "ToggleConsoleCommands", "Toggle whether players can run console commands they type",
     [](Console::ArgStack&)
     {
-        const uint32_t mask = GetDisabledCoopFeatureMask();
-        auto out = spdlog::get("ConOut");
-        for (const auto& info : Session::kFeatureTable)
-            out->info("{:<20} {}", std::string(info.Name), Session::IsEnabledIn(mask, info.Bit) ? "on" : "OFF");
-        out->info("Live change: set Gameplay:bEnable<Name> false, then ReloadFeatures. STServer.ini edits apply on restart.");
-    });
-
-Console::Command<> ReloadFeatures(
-    "ReloadFeatures", "Re-sends the current server settings (including feature switches) to every client",
-    [](Console::ArgStack&)
-    {
+        bAllowConsoleCommands = !bAllowConsoleCommands;
+        spdlog::get("ConOut")->info("Typed console commands have been {}.", bAllowConsoleCommands == true ? "allowed" : "turned off");
         GameServer::Get()->UpdateSettings();
-        spdlog::get("ConOut")->info("Settings re-sent to all clients.");
-    });
-
-// A playtester can see what the server refused without a debug build: the summary
-// warnings appear by themselves during a fight, this is for asking afterwards.
-Console::Command<> ShowCombatAudit(
-    "CombatAudit", "Show what combat authority has refused since the server started",
-    [](Console::ArgStack&)
-    {
-        GameServer::Get()->GetWorld().GetActorValueService().LogCombatAudit();
     });
 
 Console::Command<int64_t> SetDifficulty(
@@ -206,31 +119,6 @@ Console::Command<> ShowMoPoStatus(
     });
 
 // -- Constants --
-constexpr float kMinHealthMultiplier = 0.1f;
-constexpr float kMaxHealthMultiplier = 20.0f;
-
-static float GetHealthMultiplier()
-{
-    const float value = fHealthMultiplier.as_float();
-    if (!std::isfinite(value))
-        return 1.0f;
-
-    return std::clamp(value, kMinHealthMultiplier, kMaxHealthMultiplier);
-}
-
-static float GetEffectiveHealthMultiplier()
-{
-    size_t playerCount = 0;
-    if (auto* pServer = GameServer::Get(); pServer && pServer->HasWorld())
-        playerCount = pServer->GetWorld().GetPlayerManager().Count();
-
-    return ServerSettings::ComputeEffectiveHealthMultiplier(
-        GetHealthMultiplier(),
-        bAutoScaleEnemyHealth,
-        fHealthExtraBase.as_float(),
-        playerCount);
-}
-
 constexpr char kBypassMoPoWarning[]{"ModCheck is disabled. This can lead to desync and other oddities. Make sure you know what you are doing. We "
                                     "may not be able to assist you if ModCheck was disabled."};
 
@@ -253,33 +141,6 @@ static bool IsMoPoActive()
     return bEnableModCheck;
 }
 
-uint32_t GetDisabledCoopFeatureMask() noexcept
-{
-    using Session::Feature;
-    uint32_t mask = Session::ComposeDisabledMask(0u, bEnableDownedSystem, bEnableCoordinatedSaves);
-    mask = Session::WithFeature(mask, Feature::kTacticalHud, bEnableTacticalHud);
-    mask = Session::WithFeature(mask, Feature::kHairColorSync, bEnableHairColorSync);
-    mask = Session::WithFeature(mask, Feature::kSharedRfabXp, bEnableRfabXpSync);
-    mask = Session::WithFeature(mask, Feature::kSharedSkillXp, bEnableXpSync);
-    mask = Session::WithFeature(mask, Feature::kRfabCombatRules, bEnableRfabCombatRules);
-    mask = Session::WithFeature(mask, Feature::kSelfHealingResync, bEnableSelfHealingResync);
-    // Without Gameplay:bEnableItemDrops no dropped item is synced at all, server-owned or not.
-    mask = Session::WithFeature(mask, Feature::kServerOwnedWorldItems, bEnableServerOwnedWorldItems && bEnableItemDrops);
-    mask = Session::WithFeature(mask, Feature::kPeacefulNpcsUnscaled, bEnablePeacefulNpcsUnscaled);
-    mask = Session::WithFeature(mask, Feature::kDesyncDetector, bEnableDesyncDetector);
-    mask = Session::WithFeature(mask, Feature::kWorldScopedHookEvents, bEnableWorldScopedHookEvents);
-    mask = Session::WithFeature(mask, Feature::kQuestXpSingleAward, bEnableQuestXpSingleAward);
-    mask = Session::WithFeature(mask, Feature::kPersonalMerchantStock, bEnablePersonalMerchantStock);
-    mask = Session::WithFeature(mask, Feature::kNeighbourCellContainers, bEnableNeighbourCellContainers);
-    mask = Session::WithFeature(mask, Feature::kEarlyTakeReplay, bEnableEarlyTakeReplay);
-    return mask;
-}
-
-bool IsCoopFeatureEnabled(Session::Feature aFeature) noexcept
-{
-    return Session::IsEnabledIn(GetDisabledCoopFeatureMask(), aFeature);
-}
-
 ServerSettings GetSettings()
 {
     ServerSettings settings{};
@@ -290,19 +151,7 @@ ServerSettings GetSettings()
     settings.DeathSystemEnabled = bEnableDeathSystem;
     settings.SyncPlayerCalendar = bSyncPlayerCalendar;
     settings.AutoPartyJoin = bAutoPartyJoin;
-    settings.HealthMultiplier = GetEffectiveHealthMultiplier();
-    settings.HealthExtraBase = std::isfinite(fHealthExtraBase.as_float()) ? std::clamp(fHealthExtraBase.as_float(), 0.0f, 10.0f) : 1.0f;
-    settings.DownedSystemEnabled = bEnableDownedSystem;
-    settings.CoordinatedSavesEnabled = bEnableCoordinatedSaves;
-    settings.DisabledFeatureMask = GetDisabledCoopFeatureMask();
-    if (auto* pServer = GameServer::Get(); pServer && pServer->HasWorld())
-    {
-        const auto& encCfg = pServer->GetWorld().GetEncounterService().GetCoordinator().GetConfig();
-        settings.ReviveDurationSec = encCfg.ReviveDurationSec;
-        settings.ReviveHealthFraction = encCfg.ReviveHealthFraction;
-        settings.PostReviveGraceSec = encCfg.PostReviveGraceSec;
-        settings.CombatLeashRadiusMeters = encCfg.LeashRadiusMeters;
-    }
+    settings.ConsoleCommandsAllowed = bAllowConsoleCommands;
     return settings;
 }
 
@@ -314,14 +163,6 @@ GameServer::GameServer(Console::ConsoleRegistry& aConsole) noexcept
 {
     BASE_ASSERT(s_pInstance == nullptr, "Server instance already exists?");
     s_pInstance = this;
-
-    // Phase 3 (`WorldReloadBarrier`): keep connected peers alive across heavy 600-plugin RFAB
-    // `.ess` world reloads (up to 60s blocking main-thread load) without socket timeout or buffer drop.
-    if (auto* pUtils = SteamNetworkingUtils())
-    {
-        pUtils->SetGlobalConfigValueInt32(k_ESteamNetworkingConfig_TimeoutConnected, 60000);
-        pUtils->SetGlobalConfigValueInt32(k_ESteamNetworkingConfig_SendBufferSize, 4 * 1024 * 1024);
-    }
 
     auto port = uServerPort.value_as<uint16_t>();
     while (!Host(port, GetUserTickRate()))
@@ -338,18 +179,6 @@ GameServer::GameServer(Console::ConsoleRegistry& aConsole) noexcept
             uDifficulty.value_as<uint8_t>());
 
         uDifficulty = 4;
-    }
-
-    const float healthMultiplier = fHealthMultiplier.as_float();
-    if (!std::isfinite(healthMultiplier) || healthMultiplier < kMinHealthMultiplier || healthMultiplier > kMaxHealthMultiplier)
-    {
-        spdlog::warn(
-            "Health multiplier is invalid (should be from {} to {}, current value is {}), setting it to 1.0.",
-            kMinHealthMultiplier,
-            kMaxHealthMultiplier,
-            healthMultiplier);
-
-        fHealthMultiplier = 1.0f;
     }
 
     if (!bEnableDeathSystem)
@@ -381,6 +210,16 @@ GameServer::~GameServer()
 GameServer* GameServer::Get() noexcept
 {
     return s_pInstance;
+}
+
+bool GameServer::IsPublicServer() const noexcept
+{
+    return bAnnounceServer;
+}
+
+bool GameServer::AllowsAutoPartyJoin() const noexcept
+{
+    return bAutoPartyJoin && !IsPublicServer();
 }
 
 void GameServer::Initialize()
@@ -453,57 +292,10 @@ void GameServer::BindMessageHandlers()
         const auto pRealMessage = CastUnique<AuthenticationRequest>(std::move(apMessage));
         HandleAuthenticationRequest(aConnectionId, pRealMessage);
     };
-
-    auto adminHandlerGenerator = [this](auto& x)
-    {
-        using T = typename std::remove_reference_t<decltype(x)>::Type;
-
-        m_adminMessageHandlers[T::Opcode] = [this](UniquePtr<ClientAdminMessage>& apMessage, ConnectionId_t aConnectionId)
-        {
-            const auto pRealMessage = CastUnique<T>(std::move(apMessage));
-            m_pWorld->GetDispatcher().trigger(AdminPacketEvent<T>(pRealMessage.get(), aConnectionId));
-        };
-
-        return false;
-    };
-
-    ClientAdminMessageFactory::Visit(adminHandlerGenerator);
 }
 
 void GameServer::BindServerCommands()
 {
-    m_commands.RegisterCommand<>(
-        "rfab_save", "Trigger a two-phase coordinated save checkpoint across all connected players",
-        [this](Console::ArgStack&)
-        {
-            const bool started = m_pWorld->GetSaveSnapshotService().TriggerCoordinatedSave(false, nullptr);
-            spdlog::get("ConOut")->info("[RFAB] Coordinated save {}", started ? "started" : "skipped (no players or save already in flight)");
-        });
-
-    m_commands.RegisterCommand<>(
-        "rfab_load", "Roll back server world snapshot and synchronously load latest checkpoint on all clients",
-        [this](Console::ArgStack&)
-        {
-            const bool started = m_pWorld->GetSaveSnapshotService().TriggerRollbackToLatest(false);
-            spdlog::get("ConOut")->info("[RFAB] Coordinated checkpoint load {}", started ? "dispatched" : "failed");
-        });
-
-    m_commands.RegisterCommand<>(
-        "rfab_snapshots", "Show current RFAB checkpoint epoch, slot name, and shared XP ledger",
-        [this](Console::ArgStack&)
-        {
-            const auto& snaps = m_pWorld->GetSaveSnapshotService();
-            const auto& ledger = m_pWorld->GetRfabProgressionService().GetLedger();
-            spdlog::get("ConOut")->info(
-                "[RFAB] Snapshots={} LastEpoch={} LastSlot='{}' SharedXP={} ReadBooks={} SyncedGlobals={}",
-                snaps.GetSnapshotCount(),
-                snaps.GetLastCommittedEpoch(),
-                snaps.GetLastCommittedSlot(),
-                ledger.GetTotalSharedXp(),
-                ledger.GetReadBooks().size(),
-                ledger.GetSyncedGlobals().size());
-        });
-
     m_commands.RegisterCommand<>(
         "uptime", "Show how long the server has been running for",
         [this](Console::ArgStack&)
@@ -717,60 +509,6 @@ void GameServer::BindServerCommands()
 
             out->info("{}", output.c_str());
         });
-
-    m_commands.RegisterCommand<>(
-        "savecheckpoint", "Trigger a two-phase coordinated RFAB multiplayer checkpoint across all connected players",
-        [&](Console::ArgStack&)
-        {
-            auto out = spdlog::get("ConOut");
-            if (!m_pWorld)
-                return;
-            const bool started = m_pWorld->GetSaveSnapshotService().TriggerCoordinatedSave(false, nullptr);
-            out->info("[RFAB] savecheckpoint started={}", started);
-        });
-
-    m_commands.RegisterCommand<>(
-        "rollbackcheckpoint", "Synchronously roll back server state & all connected clients to the latest checkpoint",
-        [&](Console::ArgStack&)
-        {
-            auto out = spdlog::get("ConOut");
-            if (!m_pWorld)
-                return;
-            const bool ok = m_pWorld->GetSaveSnapshotService().TriggerRollbackToLatest(false);
-            out->info("[RFAB] rollbackcheckpoint triggered={}", ok);
-        });
-
-    m_commands.RegisterCommand<>(
-        "dumpflightstate", "Dump RFAB co-op WorldEpoch, 256-bucket state digest, and recent flight recorder events",
-        [&](Console::ArgStack&)
-        {
-            auto out = spdlog::get("ConOut");
-            if (!m_pWorld)
-                return;
-            const auto& snapSvc = m_pWorld->GetSaveSnapshotService();
-            const auto digest = snapSvc.BuildLiveWorldDigest();
-            const auto recent = snapSvc.GetCoordinator().GetFlightRing().SnapshotRecent(12);
-            out->info(
-                "[RFAB Flight] WorldEpoch={} LastSaveEpoch={} Slot='{}' Snapshots={} Keys={} Digest={} FlightRecords={}",
-                snapSvc.GetCurrentWorldEpoch(),
-                snapSvc.GetLastCommittedEpoch(),
-                snapSvc.GetLastCommittedSlot().empty() ? "none" : snapSvc.GetLastCommittedSlot().c_str(),
-                snapSvc.GetSnapshotCount(),
-                digest.Size(),
-                digest.ComputeHexDigest().c_str(),
-                snapSvc.GetCoordinator().GetFlightRing().TotalRecorded());
-            for (const auto& rec : recent)
-            {
-                out->info(
-                    "  #{} ts={}ms worldEpoch={} kind={} subj={:X} aux={}",
-                    rec.Sequence,
-                    rec.TimestampMs,
-                    rec.WorldEpoch,
-                    static_cast<uint32_t>(rec.Kind),
-                    rec.SubjectId,
-                    rec.AuxValue);
-            }
-        });
 }
 
 /* Update Info fields from user facing CVARS.*/
@@ -829,21 +567,6 @@ void GameServer::OnConsume(const void* apData, const uint32_t aSize, const Conne
     ViewBuffer buf((uint8_t*)apData, aSize);
     Buffer::Reader reader(&buf);
 
-    // TODO: ClientAdminMessageFactory
-    /*if (m_adminSessions.contains(aConnectionId)) [[unlikely]]
-    {
-        const ClientAdminMessageFactory factory;
-        auto pMessage = factory.Extract(reader);
-        if (!pMessage)
-        {
-            spdlog::error("Couldn't parse packet from {:x}", aConnectionId);
-            return;
-        }
-
-        m_adminMessageHandlers[pMessage->GetOpcode()](pMessage, aConnectionId);
-    }
-    else
-    {*/
     const ClientMessageFactory factory;
     auto pMessage = factory.Extract(reader);
     if (!pMessage)
@@ -852,15 +575,7 @@ void GameServer::OnConsume(const void* apData, const uint32_t aSize, const Conne
         return;
     }
 
-    const auto opcode = pMessage->GetOpcode();
-    if (opcode >= std::size(m_messageHandlers) || !m_messageHandlers[opcode])
-    {
-        spdlog::error("Unhandled or out-of-bounds opcode {} from {:x}", opcode, aConnectionId);
-        return;
-    }
-
-    m_messageHandlers[opcode](pMessage, aConnectionId);
-    //}
+    m_messageHandlers[pMessage->GetOpcode()](pMessage, aConnectionId);
 }
 
 void GameServer::OnConnection(const ConnectionId_t aHandle)
@@ -910,22 +625,13 @@ void GameServer::OnDisconnection(const ConnectionId_t aConnectionId, EDisconnect
             const auto& [ownerComponent] = ownerView.get(entity);
             if (ownerComponent.GetOwner() == pPlayer)
             {
-                const auto* pCharComp = m_pWorld->try_get<CharacterComponent>(entity);
-                if (pCharComp && (pCharComp->IsPlayer() || pCharComp->IsPlayerSummon()))
-                {
-                    m_pWorld->GetDispatcher().enqueue(CharacterRemoveEvent(World::ToInteger(entity)));
-                }
-                else
-                {
-                    m_pWorld->GetDispatcher().enqueue(OwnershipTransferEvent(entity));
-                }
+                m_pWorld->GetDispatcher().enqueue(OwnershipTransferEvent(entity));
             }
         }
 
         m_pWorld->GetDispatcher().update();
 
         m_pWorld->GetPlayerManager().Remove(pPlayer);
-        UpdateSettings();
     }
 
     UpdateTitle();
@@ -933,11 +639,7 @@ void GameServer::OnDisconnection(const ConnectionId_t aConnectionId, EDisconnect
 
 void GameServer::Send(const ConnectionId_t aConnectionId, const ServerMessage& acServerMessage, const TiltedPhoques::EPacketFlags aPacketFlags) const
 {
-    static thread_local TiltedPhoques::ScratchAllocator s_allocator{1 << 22};
-    static thread_local uint32_t s_sendDepth = 0;
-
-    CoopPacketSafety::ScopedScratchFrame allocatorGuard(s_allocator, s_sendDepth);
-    ScopedAllocator _{s_allocator};
+    static thread_local TiltedPhoques::ScratchAllocator s_allocator{1 << 18};
 
     Buffer buffer(1 << 20);
     Buffer::Writer writer(&buffer);
@@ -947,24 +649,8 @@ void GameServer::Send(const ConnectionId_t aConnectionId, const ServerMessage& a
 
     TiltedPhoques::PacketView packet(reinterpret_cast<char*>(buffer.GetWriteData()), static_cast<uint32_t>(writer.Size()));
     Server::Send(aConnectionId, &packet, aPacketFlags);
-}
 
-void GameServer::Send(ConnectionId_t aConnectionId, const ServerAdminMessage& acServerMessage) const
-{
-    static thread_local TiltedPhoques::ScratchAllocator s_allocator{1 << 22};
-    static thread_local uint32_t s_sendDepth = 0;
-
-    CoopPacketSafety::ScopedScratchFrame allocatorGuard(s_allocator, s_sendDepth);
-    ScopedAllocator _{s_allocator};
-
-    Buffer buffer(1 << 20);
-    Buffer::Writer writer(&buffer);
-    writer.WriteBits(0, 8); // Skip the first byte as it is used by packet
-
-    acServerMessage.Serialize(writer);
-
-    TiltedPhoques::PacketView packet(reinterpret_cast<char*>(buffer.GetWriteData()), static_cast<uint32_t>(writer.Size()));
-    Server::Send(aConnectionId, &packet);
+    s_allocator.Reset();
 }
 
 void GameServer::SendToLoaded(const ServerMessage& acServerMessage) const
@@ -1016,23 +702,6 @@ bool GameServer::SendToPlayersInRange(const ServerMessage& acServerMessage, cons
     }
 
     return true;
-}
-
-void GameServer::SendToLeader(const ServerMessage& acServerMessage, const PartyComponent& acPartyComponent, const Player* apLeader) const
-{
-    if (!acPartyComponent.JoinedPartyId.has_value())
-    {
-        spdlog::warn("Party does not exist, canceling broadcast.");
-        return;
-    }
-
-    if (const_cast<Player*>(apLeader)->GetParty().JoinedPartyId != acPartyComponent.JoinedPartyId)
-    {
-        spdlog::warn("Specified party leader belongs to different party? Canceling send");
-        return;
-    }
-
-    apLeader->Send(acServerMessage);
 }
 
 void GameServer::SendToParty(const ServerMessage& acServerMessage, const PartyComponent& acPartyComponent, const Player* apExcludeSender) const
@@ -1110,13 +779,6 @@ bool GameServer::ValidateAuthParams(ConnectionId_t aConnectionId, const UniquePt
 
 void GameServer::HandleAuthenticationRequest(const ConnectionId_t aConnectionId, const UniquePtr<AuthenticationRequest>& acRequest)
 {
-    if (m_pWorld->GetPlayerManager().GetByConnectionId(aConnectionId) != nullptr)
-    {
-        spdlog::warn("Duplicate AuthenticationRequest from already authenticated connection {:x}; kicking.", aConnectionId);
-        Kick(aConnectionId);
-        return;
-    }
-
     const auto info = GetConnectionInfo(aConnectionId);
 
     char remoteAddress[48]{};
@@ -1134,19 +796,12 @@ void GameServer::HandleAuthenticationRequest(const ConnectionId_t aConnectionId,
         Kick(aConnectionId);
     };
 #if 1
-    // Accept exact commit matches AND any builds within the same vMAJOR.MINOR protocol family
-    // (e.g. v1.0.0-6-g383738a6 <-> v1.0.0-8-g..., preventing client hotfixes from breaking co-op connections).
-    if (!RfabCompat::AreBuildVersionsProtocolCompatible(BUILD_COMMIT, acRequest->Version.c_str()))
-    {
-        spdlog::info("New player {:x} '{}' tried to connect with incompatible protocol version {} (server {})",
-                     aConnectionId, remoteAddress, acRequest->Version.c_str(), BUILD_COMMIT);
-        sendKick(RT::kWrongVersion);
-        return;
-    }
+    // to make our testing life a bit easier.
     if (acRequest->Version != BUILD_COMMIT)
     {
-        spdlog::info("Player {:x} '{}' connected with protocol-compatible build {} (server {})",
-                     aConnectionId, remoteAddress, acRequest->Version.c_str(), BUILD_COMMIT);
+        spdlog::info("New player {:x} '{}' tried to connect with client {} - Version mismatch", aConnectionId, remoteAddress, acRequest->Version.c_str());
+        sendKick(RT::kWrongVersion);
+        return;
     }
 #endif
 
@@ -1211,29 +866,9 @@ void GameServer::HandleAuthenticationRequest(const ConnectionId_t aConnectionId,
             // but requires essential mods?
 
             // mods that may exist on the server, but not on the client
-            auto equalsAsciiIgnoreCase = [](const String& aLhs, const String& aRhs) noexcept
-            {
-                if (aLhs.size() != aRhs.size())
-                    return false;
-                for (size_t idx = 0; idx < aLhs.size(); ++idx)
-                {
-                    char c1 = aLhs[idx];
-                    char c2 = aRhs[idx];
-                    if (c1 >= 'A' && c1 <= 'Z')
-                        c1 = static_cast<char>(c1 - 'A' + 'a');
-                    if (c2 >= 'A' && c2 <= 'Z')
-                        c2 = static_cast<char>(c2 - 'A' + 'a');
-                    if (c1 != c2)
-                        return false;
-                }
-                return true;
-            };
-
             for (const auto& entry : modsComponent.GetServerMods())
             {
-                const auto it = std::find_if(userMods.begin(), userMods.end(), [&](const Mods::Entry& it) {
-                    return equalsAsciiIgnoreCase(it.Filename, entry.first);
-                });
+                const auto it = std::find_if(userMods.begin(), userMods.end(), [&](const Mods::Entry& it) { return it.Filename == entry.first; });
 
                 if (it == userMods.end())
                 {
@@ -1305,17 +940,6 @@ void GameServer::HandleAuthenticationRequest(const ConnectionId_t aConnectionId,
         serverResponse.Type = AuthenticationResponse::ResponseType::kAccepted;
         Send(aConnectionId, serverResponse);
 
-        // Broadcast updated player-count health scaling to all already-connected peers as well
-        for (auto* pExisting : m_pWorld->GetPlayerManager())
-        {
-            if (pExisting != pPlayer)
-            {
-                NotifySettingsChange settingsNotify{};
-                settingsNotify.Settings = serverResponse.Settings;
-                pExisting->Send(settingsNotify);
-            }
-        }
-
         uint32_t startId = 0;
         auto initStringCache = StringCache::Get().Serialize(startId);
 
@@ -1345,14 +969,6 @@ void GameServer::HandleAuthenticationRequest(const ConnectionId_t aConnectionId,
 
         m_pWorld->GetDispatcher().trigger(PlayerJoinEvent(pPlayer, acRequest->WorldSpaceId, acRequest->CellId, acRequest->PlayerTime));
     }
-    /*else if (acRequest->Token == sAdminPassword.value() && !sAdminPassword.empty())
-    {
-        AdminSessionOpen response;
-        Send(aConnectionId, response);
-
-        m_adminSessions.insert(aConnectionId);
-        spdlog::warn("New admin session for {:x} '{}'", aConnectionId, remoteAddress);
-    } */
     else
     {
         spdlog::info("New player {:x} '{}' has a bad password, kicking.", aConnectionId, remoteAddress);

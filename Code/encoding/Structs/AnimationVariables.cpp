@@ -29,12 +29,7 @@ void AnimationVariables::VectorBool_to_String(const Vector<bool>& bools, TiltedP
             *citer |= *biter++ ? mask : 0;
 }
 
-// Unpacks a bitstream into bools. The two sizes are independent: the counts come from
-// one part of the packet and the packed bytes from another, so a sender can declare more
-// values than it paid bytes for. The loop used to walk the output and read the input in
-// lockstep without ever checking the input end - a remote read past the string, which
-// AddressSanitizer reports as a stack-buffer-overflow on a short (SSO) string.
-// Bits the packet did not carry stay false.
+// The Vector<bool> must be the correct size when called.
 //
 void AnimationVariables::String_to_VectorBool(const TiltedPhoques::String& chars, Vector<bool>& bools)
 {
@@ -131,7 +126,6 @@ void AnimationVariables::ApplyDiff(TiltedPhoques::Buffer::Reader& aReader)
     const size_t floatsSize = CoopPacketSafety::ClampCollectionCount(
         TiltedPhoques::Serialization::ReadVarInt(aReader),
         CoopPacketSafety::kMaxAnimVars);
-
     if (Integers.size() != integersSize)
         Integers.assign(integersSize, 0);
     if (Floats.size() != floatsSize)

@@ -1,81 +1,54 @@
 {
-  "_comment": "Known wire-contract violations (Tools/rfab/check_wire_contract.py). Every entry needs a reason. The check fails on a violation that is not listed here and on an entry that no longer occurs, so this list can only shrink. The \"reserved\" list names enumerators that keep their number on the wire and must be referenced by neither side.",
+  "_comment": "Known wire-contract violations (Tools/rfab/check_wire_contract.py) for clean upstream TiltedEvolution (13ff0b5a) in Phase 0. Every entry needs a reason. The check fails on a violation that is not listed here and on an entry that no longer occurs.",
   "known": [
     {
-      "rule": "W3",
-      "subject": "ReviveActionRequest::ActionType::CancelChannel",
-      "detail": "never referenced by the receiver (Code/server)",
-      "reason": "Not a defect: handled by the final else of EncounterService::OnReviveActionRequest, which this rule cannot see."
-    },
-    {
-      "rule": "W3",
-      "subject": "RequestQuestUpdate::StatusCode::SceneUpdate",
-      "detail": "never referenced by the sender (Code/client)",
-      "reason": "Not a defect: never travels in this message. QuestService uses the value as a dedup-history key for RequestQuestSceneUpdate, which is its own message."
+      "rule": "W1",
+      "subject": "NotifyDrawWeapon",
+      "detail": "ServerMessage is never constructed under Code/server",
+      "reason": "Dead type inherited from upstream TiltedEvolution (13ff0b5a); kept verbatim in Phase 0 so the wire format matches upstream."
     },
     {
       "rule": "W2",
-      "subject": "CancelAssignmentRequest",
-      "detail": "ClientMessage has no handler under Code/server",
-      "reason": "The client sends it from two places in CharacterService.cpp and the server drops it; the client compensates with m_cancelledCookies when the late AssignCharacterResponse arrives. Whether the server entity created in between can leak is checked in WORK_PLAN package 5.1."
+      "subject": "NotifyDrawWeapon",
+      "detail": "ServerMessage has no handler under Code/client",
+      "reason": "Dead type inherited from upstream TiltedEvolution (13ff0b5a); kept verbatim in Phase 0 so the wire format matches upstream."
     },
     {
       "rule": "W2",
       "subject": "NotifySetTimeResult",
       "detail": "ServerMessage has no handler under Code/client",
-      "reason": "The result of the set-time command is dropped, so a player without permission gets no feedback. Cosmetic; WORK_PLAN stage 7."
+      "reason": "Inherited from upstream TiltedEvolution: the result of the set-time command is currently ignored on the client."
     },
     {
       "rule": "W1",
       "subject": "NotifyPlayerDialogue",
       "detail": "ServerMessage is never constructed under Code/server",
-      "reason": "Dead type: the server relays dialogue as NotifyChatMessageBroadcast{kPlayerDialogue}, so OverlayService::OnPlayerDialogue on the client never runs. Removed with the other dead protocol surface in WORK_PLAN package 2.4."
+      "reason": "Inherited from upstream TiltedEvolution: the server relays dialogue via NotifyChatMessageBroadcast instead."
     },
     {
       "rule": "W1",
       "subject": "NotifyObjectInventoryChanges",
       "detail": "ServerMessage is never constructed under Code/server",
-      "reason": "Dead type inherited from TiltedEvolution: only forward declarations remain on both sides. Removed in WORK_PLAN package 2.4."
+      "reason": "Dead type inherited from upstream TiltedEvolution: only forward declarations remain on both sides."
     },
     {
       "rule": "W2",
       "subject": "NotifyObjectInventoryChanges",
       "detail": "ServerMessage has no handler under Code/client",
-      "reason": "Dead type inherited from TiltedEvolution: only forward declarations remain on both sides. Removed in WORK_PLAN package 2.4."
+      "reason": "Dead type inherited from upstream TiltedEvolution: only forward declarations remain on both sides."
     },
     {
       "rule": "W1",
       "subject": "RequestObjectInventoryChanges",
       "detail": "ClientMessage is never constructed under Code/client",
-      "reason": "Dead type inherited from TiltedEvolution: only forward declarations remain on both sides. Removed in WORK_PLAN package 2.4."
+      "reason": "Dead type inherited from upstream TiltedEvolution: only forward declarations remain on both sides."
     },
     {
       "rule": "W2",
       "subject": "RequestObjectInventoryChanges",
       "detail": "ClientMessage has no handler under Code/server",
-      "reason": "Dead type inherited from TiltedEvolution: only forward declarations remain on both sides. Removed in WORK_PLAN package 2.4."
+      "reason": "Dead type inherited from upstream TiltedEvolution: only forward declarations remain on both sides."
     }
   ],
-  "reserved": [
-    {
-      "subject": "SyncRfabProgressionEvent::EventKind::LedgerXpGrant",
-      "reason": "The zero default of the message. No client has ever sent a keyed XP grant (DEFECT_REGISTRY M17): RFAB XP is shared by SyncRfabExperienceRequest."
-    },
-    {
-      "subject": "SyncRfabProgressionEvent::EventKind::DragonSoulSync",
-      "reason": "A 4.1.0 client reports dead dragons with it; since M2 the server takes a dragon's death from its own alive-to-dead transition and the 4.1.1 client sends nothing."
-    },
-    {
-      "subject": "SyncRfabProgressionEvent::EventKind::WordWallSync",
-      "reason": "Shared Words of Power were never wired to a client (DEFECT_REGISTRY M4); removed in WORK_PLAN package 2.4. If the mechanic is built in stage 6 it gets both ends at once."
-    },
-    {
-      "subject": "NotifyRfabProgressionEvent::EventKind::WordWallSync",
-      "reason": "The server-to-client half of the same mechanic (M4)."
-    },
-    {
-      "subject": "NotifyRfabProgressionEvent::EventKind::FullLedgerResync",
-      "reason": "Declared for a full ledger resend that was never implemented on either side."
-    }
-  ]
+  "reserved": []
 }

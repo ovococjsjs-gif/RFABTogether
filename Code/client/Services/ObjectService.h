@@ -2,11 +2,9 @@
 
 #include <Events/EventDispatcher.h>
 #include <Games/Events.h>
-#include <Structs/Inventory.h>
-#include <common/CoopLootLedger.h>
-#include <common/Session/Lifecycle.h>
 
 struct ServerTimeSettings;
+struct DisconnectedEvent;
 struct World;
 struct ActivateEvent;
 struct TransportService;
@@ -17,40 +15,18 @@ struct CellChangeEvent;
 struct ScriptAnimationEvent;
 struct AssignObjectsResponse;
 struct NotifyScriptAnimation;
-struct TESObjectREFR;
 
 /**
  * @brief Handles objects in the environment.
  */
-class ObjectService final : public BSTEventSink<TESActivateEvent>, public Session::IParticipant
+class ObjectService final : public BSTEventSink<TESActivateEvent>
 {
 public:
     ObjectService(World&, entt::dispatcher&, TransportService&);
-    [[nodiscard]] static bool IsFactionCrimeContainer(uint32_t aFormId) noexcept;
-    // The chest a vendor faction's merchants trade from (VENC). Compares pointers only.
-    [[nodiscard]] static bool IsFactionMerchantContainer(const TESObjectREFR* apContainer) noexcept;
-    void RefreshCurrentCellObjectsAfterRollback() noexcept;
-    // On-demand registration for containers looted via QuickLootIE (`LootMenu`) or RFAB AutoLoot
-    // before `Activate` or initial cell scan registered them with the server.
-    // aChangeSequence: InventoryChangeEvent::Sequence of the change (defect M28).
-    bool RequestContainerSyncForLoot(
-        TESObjectREFR* apContainer,
-        const Inventory::Entry& acItem,
-        bool aDrop,
-        bool aUpdateClients,
-        uint64_t aChangeSequence) noexcept;
-
-    // Session::ParticipantId::kObjects: object entities are server assignments for one world.
-    void OnSessionEnd(const Session::Transition& acTransition) noexcept override;
-    void OnWorldLoadBegin(const Session::Transition& acTransition) noexcept override;
 
 private:
-    void DestroyObjectEntities() noexcept;
+    void OnDisconnected(const DisconnectedEvent&) noexcept;
     void OnCellChange(const CellChangeEvent&) noexcept;
-    // Outdoors: registers the containers around the player's cell that stand within reach of it
-    // and that this client does not hold yet (Gameplay:bEnableNeighbourCellContainers, the rest
-    // of defect M11).
-    void RegisterNeighbourCellContainers() noexcept;
     void OnAssignObjectsResponse(const AssignObjectsResponse&) noexcept;
     void OnActivate(const ActivateEvent&) noexcept;
     void OnActivateNotify(const NotifyActivate&) noexcept;
@@ -66,6 +42,7 @@ private:
     World& m_world;
     TransportService& m_transport;
 
+    entt::scoped_connection m_disconnectedConnection;
     entt::scoped_connection m_cellChangeConnection;
     entt::scoped_connection m_onActivateConnection;
     entt::scoped_connection m_activateConnection;
@@ -74,7 +51,4 @@ private:
     entt::scoped_connection m_assignObjectConnection;
     entt::scoped_connection m_scriptAnimationConnection;
     entt::scoped_connection m_scriptAnimationNotifyConnection;
-    CoopLootLedger::PendingContainerLootQueue<Inventory::Entry> m_pendingContainerLoot{};
-    // Containers this client sent a registration for whose answer has not arrived (defect M28).
-    CoopLootLedger::RegistrationTracker m_registrationsInFlight{};
 };
